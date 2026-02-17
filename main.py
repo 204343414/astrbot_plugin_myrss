@@ -713,3 +713,4 @@ class MyRssPlugin(Star):
             yield event.chain_result([Comp.Node(uin=0, name="Astrbot", content=comps)]).use_t2i(self.t2i)
         else:
             yield event.chain_result(comps).use_t2i(self.t2i)
+MAINEOF
