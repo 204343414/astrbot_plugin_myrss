@@ -347,16 +347,46 @@ class MyRssPlugin(Star):
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
         conn = aiohttp.TCPConnector(ssl=False)
         to = aiohttp.ClientTimeout(total=30, connect=10)
-        try:
-            async with aiohttp.ClientSession(trust_env=True, connector=conn, timeout=to, headers=headers) as s:
-                async with s.get(url) as r:
-                    if r.status != 200:
-                        self.logger.error("rss: 站点返回 %d: %s", r.status, url)
-                        return None
-                    return await r.read()
-        except Exception as e:
-            self.logger.error("rss: 请求失败 %s: %s", url, e)
+
+        async def _try(u: str):
+            try:
+                async with aiohttp.ClientSession(trust_env=True, connector=conn, timeout=to, headers=headers) as s:
+                    async with s.get(u) as r:
+                        if r.status != 200:
+                            return None
+                        return await r.read()
+            except Exception:
+                return None
+
+        # 1) 先尝试原始 URL
+        data = await _try(url)
+        if data is not None:
+            return data
+
+        # 2) 如果失败：尝试切换到其它 RSSHub 端点（同一路由 path）
+        eps = self.dh.data.get("rsshub_endpoints", [])
+        if not eps:
             return None
+
+        parsed = urlparse(url)
+        path = parsed.path + (("?" + parsed.query) if parsed.query else "")
+
+        # 当前 URL 的根
+        cur_root = f"{parsed.scheme}://{parsed.netloc}"
+
+        # 规范化端点：去掉末尾 /
+        norm_eps = [(e[:-1] if e.endswith("/") else e) for e in eps]
+
+        for ep in norm_eps:
+            if ep == cur_root:
+                continue
+            alt = ep + path
+            data = await _try(alt)
+            if data is not None:
+                self.logger.warning("rss: 端点不可用，已自动切换 %s -> %s", url, alt)
+                return data
+
+        return None
 
     async def _poll(self, url: str, num: int = -1, after_ts: int = 0, after_link: str = "") -> List[RSSItem]:
         text = await self._fetch(url)
