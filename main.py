@@ -97,7 +97,7 @@ class PicHandler:
                         img = Image.open(raw).convert("RGB")
                         w, h = img.size
                         px = img.load()
-                        cx, cy = random.choice([(0,0),(w-1,0),(0,h-1),(w-1,h-1)])
+                        cx, cy = random.choice([(0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1)])
                         px[cx, cy] = (255, 255, 255)
                         buf = BytesIO()
                         img.save(buf, format="JPEG")
@@ -149,7 +149,7 @@ class URLMapper:
             "  热搜: /bilibili/hot-search\n"
             "  番剧: /bilibili/bangumi/media/{mediaid}\n"
             "  直播: /bilibili/live/room/{roomID}\n"
-            "  搜索: /bilibili/vsearch/{关键字}"
+            "  搜索: /bilibili/vsearch/{keyword}"
         ),
         "youtube": "YouTube路由:\n  频道: /youtube/channel/{id}\n  用户: /youtube/user/@{name}\n  播放列表: /youtube/playlist/{id}",
         "twitter": "Twitter/X路由:\n  用户: /twitter/user/{name}\n  媒体: /twitter/media/{name}\n  搜索: /twitter/keyword/{kw}",
@@ -222,7 +222,7 @@ class CardGen:
             buf = ""
             for ch in para:
                 t = buf + ch
-                if draw.textbbox((0,0), t, font=font)[2] > mw and buf:
+                if draw.textbbox((0, 0), t, font=font)[2] > mw and buf:
                     lines.append(buf)
                     buf = ch
                 else:
@@ -233,35 +233,35 @@ class CardGen:
 
     def make(self, channel="", title="", desc="", link="", ts="", thumb=None):
         pad = self.pad
-        cw = self.w - 2*pad
+        cw = self.w - 2 * pad
         fc = self._f(13)
         ft = self._f(18)
         fd = self._f(13)
         ff = self._f(11)
-        tmp = Image.new("RGB",(1,1))
+        tmp = Image.new("RGB", (1, 1))
         d = ImageDraw.Draw(tmp)
         tl = self._wrap(title, ft, cw, d)
         dl = self._wrap((desc or "")[:300], fd, cw, d)
         if len(dl) > 5:
             dl = dl[:5]
-            dl[-1] = dl[-1][:-2]+"..."
+            dl[-1] = dl[-1][:-2] + "..."
 
         th = None
         th_h = 0
         if thumb:
             try:
                 th = Image.open(BytesIO(thumb)).convert("RGB")
-                r = cw/th.width
-                th_h = min(int(th.height*r), 280)
+                r = cw / th.width
+                th_h = min(int(th.height * r), 280)
                 th = th.resize((cw, th_h), Image.LANCZOS)
             except Exception:
                 th = None
 
-        y = 5 + pad + 18 + 14 + len(tl)*26 + 14
+        y = 5 + pad + 18 + 14 + len(tl) * 26 + 14
         if th:
             y += th_h + 14
         if dl:
-            y += len(dl)*20 + 14
+            y += len(dl) * 20 + 14
         y += 11
         if link:
             y += 20
@@ -270,35 +270,35 @@ class CardGen:
         y += pad
         h = y
 
-        img = Image.new("RGB", (self.w, h), (255,255,255))
+        img = Image.new("RGB", (self.w, h), (255, 255, 255))
         dr = ImageDraw.Draw(img)
-        dr.rectangle([(0,0),(self.w,5)], fill=(66,133,244))
+        dr.rectangle([(0, 0), (self.w, 5)], fill=(66, 133, 244))
 
         y = 5 + pad
-        dr.text((pad, y), f"📡 {channel}", font=fc, fill=(66,133,244))
+        dr.text((pad, y), "📡 " + channel, font=fc, fill=(66, 133, 244))
         y += 32
         for ln in tl:
-            dr.text((pad, y), ln, font=ft, fill=(26,26,46))
+            dr.text((pad, y), ln, font=ft, fill=(26, 26, 46))
             y += 26
         y += 14
         if th:
-            dr.rectangle([(pad-1,y-1),(pad+cw,y+th_h)], outline=(224,224,224))
+            dr.rectangle([(pad - 1, y - 1), (pad + cw, y + th_h)], outline=(224, 224, 224))
             img.paste(th, (pad, y))
             y += th_h + 14
         if dl:
             for ln in dl:
-                dr.text((pad, y), ln, font=fd, fill=(85,85,85))
+                dr.text((pad, y), ln, font=fd, fill=(85, 85, 85))
                 y += 20
             y += 14
-        dr.line([(pad,y),(self.w-pad,y)], fill=(230,230,230))
+        dr.line([(pad, y), (self.w - pad, y)], fill=(230, 230, 230))
         y += 11
         if link:
-            lk = link if len(link)<=48 else link[:48]+"..."
-            dr.text((pad, y), f"🔗 {lk}", font=ff, fill=(153,153,153))
+            lk = link if len(link) <= 48 else link[:48] + "..."
+            dr.text((pad, y), "🔗 " + lk, font=ff, fill=(153, 153, 153))
             y += 20
         if ts:
-            dr.text((pad, y), f"🕐 {ts}", font=ff, fill=(153,153,153))
-        dr.rectangle([(0,0),(self.w-1,h-1)], outline=(224,224,224))
+            dr.text((pad, y), "🕐 " + ts, font=ff, fill=(153, 153, 153))
+        dr.rectangle([(0, 0), (self.w - 1, h - 1)], outline=(224, 224, 224))
 
         buf = BytesIO()
         img.save(buf, format="PNG")
@@ -331,19 +331,19 @@ class MyRssPlugin(Star):
         self.sched.start()
         self._reload_jobs()
 
-    def _cron(self, expr):
+    def _cron(self, expr: str) -> dict:
         f = expr.split(" ")
-        return {"minute":f[0],"hour":f[1],"day":f[2],"month":f[3],"day_of_week":f[4]}
+        return {"minute": f[0], "hour": f[1], "day": f[2], "month": f[3], "day_of_week": f[4]}
 
-    def _reload_jobs(self):
+    def _reload_jobs(self) -> None:
         self.sched.remove_all_jobs()
         for url, info in self.dh.data.items():
-            if url in ("rsshub_endpoints","settings"):
+            if url in ("rsshub_endpoints", "settings"):
                 continue
-            for user, si in info.get("subscribers",{}).items():
+            for user, si in info.get("subscribers", {}).items():
                 self.sched.add_job(self._cron_cb, "cron", **self._cron(si["cron_expr"]), args=[url, user])
 
-    async def _fetch(self, url):
+    async def _fetch(self, url: str):
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
         conn = aiohttp.TCPConnector(ssl=False)
         to = aiohttp.ClientTimeout(total=30, connect=10)
@@ -351,14 +351,14 @@ class MyRssPlugin(Star):
             async with aiohttp.ClientSession(trust_env=True, connector=conn, timeout=to, headers=headers) as s:
                 async with s.get(url) as r:
                     if r.status != 200:
-                        self.logger.error(f"rss: 站点返回 {r.status}: {url}")
+                        self.logger.error("rss: 站点返回 %d: %s", r.status, url)
                         return None
                     return await r.read()
         except Exception as e:
-            self.logger.error(f"rss: 请求失败 {url}: {e}")
+            self.logger.error("rss: 请求失败 %s: %s", url, e)
             return None
 
-    async def _poll(self, url, num=-1, after_ts=0, after_link=""):
+    async def _poll(self, url: str, num: int = -1, after_ts: int = 0, after_link: str = "") -> List[RSSItem]:
         text = await self._fetch(url)
         if text is None:
             return []
@@ -366,12 +366,12 @@ class MyRssPlugin(Star):
             root = etree.fromstring(text)
         except ValueError:
             try:
-                root = etree.fromstring(text.replace(b'encoding="gb2312"',b'').replace(b'encoding="GB2312"',b''))
+                root = etree.fromstring(text.replace(b'encoding="gb2312"', b'').replace(b'encoding="GB2312"', b''))
             except Exception:
                 return []
 
         items = root.xpath("//item")
-        ns = {"media":"http://search.yahoo.com/mrss/"}
+        ns = {"media": "http://search.yahoo.com/mrss/"}
         result = []
         cnt = 0
 
@@ -382,7 +382,7 @@ class MyRssPlugin(Star):
                 tn = it.xpath("title")
                 title = tn[0].text if tn else "无标题"
                 if len(title) > self.title_max:
-                    title = title[:self.title_max]+"..."
+                    title = title[:self.title_max] + "..."
 
                 ln = it.xpath("link")
                 link = ln[0].text if ln else ""
@@ -394,7 +394,7 @@ class MyRssPlugin(Star):
                 pics = self.dh.strip_html_pic(raw) if raw else []
                 desc = self.dh.strip_html(raw) if raw else ""
                 if len(desc) > self.desc_max:
-                    desc = desc[:self.desc_max]+"..."
+                    desc = desc[:self.desc_max] + "..."
 
                 for u in it.xpath("media:thumbnail/@url", namespaces=ns) + it.xpath(".//*[local-name()='thumbnail']/@url") + it.xpath("enclosure[contains(@type,'image')]/@url"):
                     if u not in pics:
@@ -404,9 +404,9 @@ class MyRssPlugin(Star):
                     pd = it.xpath("pubDate")[0].text
                     try:
                         if "GMT" in pd:
-                            pts = int(time.mktime(time.strptime(pd.replace("GMT","+0000"),"%a, %d %b %Y %H:%M:%S %z")))
+                            pts = int(time.mktime(time.strptime(pd.replace("GMT", "+0000"), "%a, %d %b %Y %H:%M:%S %z")))
                         else:
-                            pts = int(time.mktime(time.strptime(pd,"%a, %d %b %Y %H:%M:%S %z")))
+                            pts = int(time.mktime(time.strptime(pd, "%a, %d %b %Y %H:%M:%S %z")))
                     except Exception:
                         pts = int(time.time())
                     if pts > after_ts:
@@ -425,11 +425,11 @@ class MyRssPlugin(Star):
                     else:
                         break
             except Exception as e:
-                self.logger.error(f"rss: 解析条目失败 {url}: {e}")
+                self.logger.error("rss: 解析条目失败 %s: %s", url, e)
                 break
         return result
 
-    async def _add(self, url, cron_expr, event):
+    async def _add(self, url: str, cron_expr: str, event: AstrMessageEvent):
         user = event.unified_msg_origin
         if url in self.dh.data:
             items = await self._poll(url)
@@ -443,11 +443,11 @@ class MyRssPlugin(Star):
         else:
             text = await self._fetch(url)
             if text is None:
-                return event.plain_result(f"无法访问: {url}\n请检查RSSHub端点是否可用。")
+                return event.plain_result("无法访问: " + url + "\n请检查RSSHub端点是否可用。")
             try:
                 title, desc = self.dh.parse_channel_info(text)
             except Exception as e:
-                return event.plain_result(f"解析失败: {e}")
+                return event.plain_result("解析失败: " + str(e))
             items = await self._poll(url)
             if not items:
                 return event.plain_result("源可访问但无内容条目。")
@@ -464,7 +464,7 @@ class MyRssPlugin(Star):
         self.dh.save()
         return self.dh.data[url]["info"]
 
-    async def _make_comps(self, item):
+    async def _make_comps(self, item: RSSItem) -> list:
         comps = []
         tb = None
         if self.read_pic and item.pic_urls:
@@ -483,8 +483,8 @@ class MyRssPlugin(Star):
             )
             comps.append(Comp.Image.fromBase64(b64))
         except Exception as e:
-            self.logger.error(f"卡片生成失败: {e}")
-            comps.append(Comp.Plain(f"📡 {item.chan_title}\n📝 {item.title}\n{item.description}"))
+            self.logger.error("卡片生成失败: %s", e)
+            comps.append(Comp.Plain("📡 " + item.chan_title + "\n📝 " + item.title + "\n" + item.description))
 
         if self.read_pic and item.pic_urls:
             mx = len(item.pic_urls) if self.max_pic == -1 else self.max_pic
@@ -497,10 +497,10 @@ class MyRssPlugin(Star):
                     pass
         return comps
 
-    async def _cron_cb(self, url, user):
-        if url not in self.dh.data or user not in self.dh.data[url].get("subscribers",{}):
+    async def _cron_cb(self, url: str, user: str) -> None:
+        if url not in self.dh.data or user not in self.dh.data[url].get("subscribers", {}):
             return
-        self.logger.info(f"RSS定时触发: {url} -> {user}")
+        self.logger.info("RSS定时触发: %s -> %s", url, user)
         si = self.dh.data[url]["subscribers"][user]
         items = await self._poll(url, num=self.max_poll, after_ts=si["last_update"], after_link=si["latest_link"])
         if not items:
@@ -523,55 +523,55 @@ class MyRssPlugin(Star):
         self.dh.data[url]["subscribers"][user]["last_update"] = max_ts
         self.dh.data[url]["subscribers"][user]["latest_link"] = items[0].link
         self.dh.save()
-        self.logger.info(f"RSS推送完成: {url} -> {user}")
+        self.logger.info("RSS推送完成: %s -> %s", url, user)
 
     # ============================================================
     #  LLM 工具
     # ============================================================
 
-    @filter.llm_tool(name="rss_subscribe")
-    async def tool_sub(self, event: AstrMessageEvent, feed_input: str = "", hours: int = 1):
-        """当用户想订阅、关注、追踪某个网站或博主的更新时调用。支持B站/YouTube/Twitter(X)/微博/知乎等链接自动识别，也接受RSSHub路由。
+    @filter.llm_tool(name="myrss_subscribe")
+    async def tool_sub(self, event: AstrMessageEvent, url: str = "https://example.com", interval: int = 1):
+        """当用户想订阅、关注、追踪某个网站或博主的更新时调用此工具。支持B站、YouTube、Twitter(X)、微博、知乎等链接自动识别，也接受RSSHub路由路径。
 
         Args:
-            feed_input: 网页链接(http开头)或RSSHub路由(/开头)
-            hours: 检查间隔小时数，默认1
+            url(string): 用户提供的网页链接(http开头)或RSSHub路由路径(/开头)。例如 https://space.bilibili.com/2267573 或 /bilibili/weekly
+            interval(int): 检查更新的间隔小时数，默认1小时
         """
-        if not feed_input:
+        if not url or url == "https://example.com":
             yield event.plain_result("请提供要订阅的链接或路由。")
             return
         eps = self.dh.data.get("rsshub_endpoints", [])
         if not eps:
-            yield event.plain_result("尚未配置RSSHub端点，请先执行：/myrss rsshub add https://rsshub.rssforever.com")
+            yield event.plain_result("尚未配置RSSHub端点，请让用户先执行命令：/myrss rsshub add https://rsshub.rssforever.com")
             return
-        if feed_input.startswith("/"):
-            furl = eps[0] + feed_input
-        elif feed_input.startswith("http"):
-            r = URLMapper.match(feed_input)
+        if url.startswith("/"):
+            furl = eps[0] + url
+        elif url.startswith("http"):
+            r = URLMapper.match(url)
             if r:
                 route, pn = r
                 furl = eps[0] + route
             else:
-                yield event.plain_result(f"无法自动识别该链接。\n\n{URLMapper.suggest(feed_input)}\n\n请选择路由后用/开头再次调用。")
+                yield event.plain_result("无法自动识别该链接。\n\n" + URLMapper.suggest(url) + "\n\n请选择路由后用/开头再次调用。")
                 return
         else:
             yield event.plain_result("请提供http开头的链接或/开头的路由。")
             return
-        if hours < 1:
-            hours = 1
-        ret = await self._add(furl, f"0 */{hours} * * *", event)
+        if interval < 1:
+            interval = 1
+        ret = await self._add(furl, "0 */" + str(interval) + " * * *", event)
         if isinstance(ret, MessageEventResult):
             yield ret
             return
         self._reload_jobs()
-        yield event.plain_result(f"✅ 订阅成功！\n📡 {ret['title']}\n📝 {ret['description']}\n⏰ 每{hours}小时\n🔗 {furl}")
+        yield event.plain_result("✅ 订阅成功！\n📡 " + ret["title"] + "\n📝 " + ret["description"] + "\n⏰ 每" + str(interval) + "小时\n🔗 " + furl)
 
-    @filter.llm_tool(name="rss_list")
-    async def tool_list(self, event: AstrMessageEvent, dummy: str = ""):
-        """查看当前已订阅的RSS源。用户问"我订阅了什么"时调用。
+    @filter.llm_tool(name="myrss_list")
+    async def tool_list(self, event: AstrMessageEvent, query: str = "all"):
+        """查看当前会话已订阅的所有RSS源列表。当用户问我订阅了什么、有哪些订阅时调用。
 
         Args:
-            dummy: 无用参数，忽略即可
+            query(string): 固定传入all即可
         """
         user = event.unified_msg_origin
         urls = self.dh.get_subs(user)
@@ -582,27 +582,27 @@ class MyRssPlugin(Star):
         for i, u in enumerate(urls):
             info = self.dh.data[u]["info"]
             cr = self.dh.data[u]["subscribers"][user]["cron_expr"]
-            txt += f"  {i}. {info['title']} [{cr}]\n"
+            txt += "  " + str(i) + ". " + info["title"] + " [" + cr + "]\n"
         yield event.plain_result(txt)
 
-    @filter.llm_tool(name="rss_unsubscribe")
+    @filter.llm_tool(name="myrss_unsubscribe")
     async def tool_unsub(self, event: AstrMessageEvent, idx: int = 0):
-        """取消RSS订阅。先调用rss_list看编号，再传入编号取消。
+        """取消一个RSS订阅。需要先调用myrss_list获取编号，再传入编号来取消。用户说取消订阅、不要了时使用。
 
         Args:
-            idx: 订阅编号
+            idx(int): 要取消的订阅编号，从myrss_list的结果中获取
         """
         user = event.unified_msg_origin
         urls = self.dh.get_subs(user)
         if idx < 0 or idx >= len(urls):
-            yield event.plain_result(f"编号{idx}不存在，范围0~{len(urls)-1}")
+            yield event.plain_result("编号" + str(idx) + "不存在，有效范围0~" + str(len(urls) - 1))
             return
         u = urls[idx]
         t = self.dh.data[u]["info"]["title"]
         self.dh.data[u]["subscribers"].pop(user)
         self.dh.save()
         self._reload_jobs()
-        yield event.plain_result(f"✅ 已取消: {t}")
+        yield event.plain_result("✅ 已取消: " + t)
 
     # ============================================================
     #  手动命令
@@ -623,7 +623,7 @@ class MyRssPlugin(Star):
         """添加RSSHub端点
 
         Args:
-            url: 端点地址，如 https://rsshub.rssforever.com
+            url: 端点地址
         """
         if url.endswith("/"):
             url = url[:-1]
@@ -632,7 +632,7 @@ class MyRssPlugin(Star):
             return
         self.dh.data["rsshub_endpoints"].append(url)
         self.dh.save()
-        yield event.plain_result(f"✅ 已添加: {url}")
+        yield event.plain_result("✅ 已添加: " + url)
 
     @rsshub.command("list")
     async def rsshub_list(self, event: AstrMessageEvent):
@@ -641,7 +641,10 @@ class MyRssPlugin(Star):
         if not eps:
             yield event.plain_result("暂无端点，请先 /myrss rsshub add <url>")
             return
-        yield event.plain_result("RSSHub端点：\n" + "\n".join(f"  {i}: {x}" for i, x in enumerate(eps)))
+        txt = "RSSHub端点：\n"
+        for i, x in enumerate(eps):
+            txt += "  " + str(i) + ": " + x + "\n"
+        yield event.plain_result(txt)
 
     @rsshub.command("remove")
     async def rsshub_rm(self, event: AstrMessageEvent, idx: int):
@@ -656,7 +659,7 @@ class MyRssPlugin(Star):
             return
         removed = eps.pop(idx)
         self.dh.save()
-        yield event.plain_result(f"✅ 已删除: {removed}")
+        yield event.plain_result("✅ 已删除: " + removed)
 
     @myrss.command("list")
     async def cmd_list(self, event: AstrMessageEvent):
@@ -669,7 +672,7 @@ class MyRssPlugin(Star):
         txt = "订阅列表：\n"
         for i, u in enumerate(urls):
             info = self.dh.data[u]["info"]
-            txt += f"  {i}. {info['title']}\n"
+            txt += "  " + str(i) + ". " + info["title"] + "\n"
         yield event.plain_result(txt)
 
     @myrss.command("remove")
@@ -689,7 +692,7 @@ class MyRssPlugin(Star):
         self.dh.data[u]["subscribers"].pop(user)
         self.dh.save()
         self._reload_jobs()
-        yield event.plain_result(f"✅ 已取消: {t}")
+        yield event.plain_result("✅ 已取消: " + t)
 
     @myrss.command("get")
     async def cmd_get(self, event: AstrMessageEvent, idx: int):
@@ -713,4 +716,3 @@ class MyRssPlugin(Star):
             yield event.chain_result([Comp.Node(uin=0, name="Astrbot", content=comps)]).use_t2i(self.t2i)
         else:
             yield event.chain_result(comps).use_t2i(self.t2i)
-MAINEOF
