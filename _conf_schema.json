@@ -1,0 +1,56 @@
+[
+  {
+    "name": "title_max_length",
+    "description": "标题最大长度",
+    "type": "int",
+    "default": 60
+  },
+  {
+    "name": "description_max_length",
+    "description": "描述最大长度",
+    "type": "int",
+    "default": 200
+  },
+  {
+    "name": "max_items_per_poll",
+    "description": "每次轮询最大条目数",
+    "type": "int",
+    "default": 5
+  },
+  {
+    "name": "t2i",
+    "description": "是否使用文字转图片",
+    "type": "bool",
+    "default": false
+  },
+  {
+    "name": "is_hide_url",
+    "description": "是否隐藏链接",
+    "type": "bool",
+    "default": false
+  },
+  {
+    "name": "is_read_pic",
+    "description": "是否读取文章中的图片",
+    "type": "bool",
+    "default": true
+  },
+  {
+    "name": "is_adjust_pic",
+    "description": "是否修改图片防和谐",
+    "type": "bool",
+    "default": false
+  },
+  {
+    "name": "max_pic_item",
+    "description": "最大图片数量(-1为不限)",
+    "type": "int",
+    "default": 3
+  },
+  {
+    "name": "compose",
+    "description": "QQ平台是否合并转发",
+    "type": "bool",
+    "default": true
+  }
+]
