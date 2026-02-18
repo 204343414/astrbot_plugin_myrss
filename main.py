@@ -790,18 +790,29 @@ class MyRssPlugin(Star):
 
     @filter.llm_tool(name="myrss_subscribe")
     async def tool_sub(self, event: AstrMessageEvent, url: str = "https://example.com", interval: int = 1):
-        """当用户想订阅、关注、追踪某个网站或博主的更新时调用此工具。支持B站、YouTube、Twitter(X)、微博、知乎等链接自动识别，也接受RSSHub路由路径。
-
+        """用户想订阅、关注、追踪某个网站或博主更新时调用。传入用户给的链接即可。
+    
         Args:
-            url(string): 用户提供的网页链接(http开头)或RSSHub路由路径(/开头)。例如 https://space.bilibili.com/2267573 或 /bilibili/weekly
-            interval(int): 检查更新的间隔小时数，默认1小时
+            url(string): 用户提供的链接或路径
+            interval(int): 检查间隔(小时)，默认1
         """
         if not url or url == "https://example.com":
-            yield event.plain_result("请提供要订阅的链接或路由。")
+            yield event.plain_result(
+                "请让用户提供具体链接。支持以下平台自动识别：\n"
+                "B站(space.bilibili.com/UID)、YouTube、Twitter/X、微博、知乎、"
+                "小红书、GitHub、Telegram、抖音、Instagram、Pixiv等。\n"
+                "也可使用 /开头的RSSHub路由路径，如 /bilibili/weekly\n"
+                "详见 https://docs.rsshub.app"
+            )
             return
         eps = self.dh.data.get("rsshub_endpoints", [])
         if not eps:
-            yield event.plain_result("尚未配置RSSHub端点，请让用户先执行命令：/myrss rsshub add https://rsshub.rssforever.com")
+            yield event.plain_result(
+                "尚未配置RSSHub端点，请告诉用户执行以下命令之一：\n"
+                "/myrss rsshub add https://rsshub.rssforever.com\n"
+                "/myrss rsshub add https://rsshub.app\n"
+                "配置后即可订阅。"
+            )
             return
         if url.startswith("/"):
             furl = eps[0] + url
@@ -839,11 +850,11 @@ class MyRssPlugin(Star):
         yield event.plain_result("✅ 订阅成功！\n📡 " + ret["title"] + "\n📝 " + ret["description"] + "\n⏰ 每" + str(interval) + "小时\n🔗 " + furl)
 
     @filter.llm_tool(name="myrss_list")
-    async def tool_list(self, event: AstrMessageEvent, query: str = "all"):
-        """查看当前会话已订阅的所有RSS源列表。当用户问我订阅了什么、有哪些订阅时调用。
-
+        async def tool_list(self, event: AstrMessageEvent, query: str = "all"):
+        """用户问订阅了什么时调用。
+    
         Args:
-            query(string): 固定传入all即可
+            query(string): 固定传all
         """
         user = event.unified_msg_origin
         urls = self.dh.get_subs(user)
@@ -859,10 +870,10 @@ class MyRssPlugin(Star):
 
     @filter.llm_tool(name="myrss_unsubscribe")
     async def tool_unsub(self, event: AstrMessageEvent, idx: int = 0):
-        """取消一个RSS订阅。需要先调用myrss_list获取编号，再传入编号来取消。用户说取消订阅、不要了时使用。
-
+        """取消订阅，先调用myrss_list获取编号。
+    
         Args:
-            idx(int): 要取消的订阅编号，从myrss_list的结果中获取
+            idx(int): 订阅编号
         """
         user = event.unified_msg_origin
         urls = self.dh.get_subs(user)
