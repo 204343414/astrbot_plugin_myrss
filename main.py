@@ -1,360 +1,4 @@
-import os
-import json
-import re
-import time
-import random
-import base64
-import logging
-import asyncio
-import aiohttp
-from io import BytesIO
-from dataclasses import dataclass
-from urllib.parse import urlparse
-
-from lxml import etree
-from bs4 import BeautifulSoup
-from PIL import Image, ImageDraw, ImageFont
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-
-from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult, MessageChain
-from astrbot.api.star import Context, Star, register
-from astrbot.api import AstrBotConfig
-import astrbot.api.message_components as Comp
-from typing import List
-
-
-@dataclass
-class RSSItem:
-    chan_title: str
-    title: str
-    link: str
-    description: str
-    pubDate: str
-    pubDate_timestamp: int
-    pic_urls: list
-
-
-class DataHandler:
-    def __init__(self, config_path="data/astrbot_plugin_myrss_data.json"):
-        self.config_path = config_path
-        self.data = self._load()
-
-    def _load(self):
-        if not os.path.exists(self.config_path):
-            d = {"rsshub_endpoints": []}
-            with open(self.config_path, "w", encoding="utf-8") as f:
-                json.dump(d, f, indent=2, ensure_ascii=False)
-            return d
-        with open(self.config_path, "r", encoding="utf-8") as f:
-            return json.load(f)
-
-    def save(self):
-        with open(self.config_path, "w", encoding="utf-8") as f:
-            json.dump(self.data, f, indent=2, ensure_ascii=False)
-
-    def get_subs(self, user_id):
-        urls = []
-        for url, info in self.data.items():
-            if url in ("rsshub_endpoints", "settings"):
-                continue
-            if user_id in info.get("subscribers", {}):
-                urls.append(url)
-        return urls
-
-    def parse_channel_info(self, text):
-        root = etree.fromstring(text)
-        title = root.xpath("//title")[0].text
-        desc_nodes = root.xpath("//description")
-        desc = desc_nodes[0].text if desc_nodes else ""
-        return title, desc or ""
-
-    def strip_html_pic(self, html):
-        soup = BeautifulSoup(html, "html.parser")
-        return [img.get("src") for img in soup.find_all("img") if img.get("src")]
-
-    def strip_html(self, html):
-        soup = BeautifulSoup(html, "html.parser")
-        return re.sub(r"\n+", "\n", soup.get_text())
-
-    def get_root_url(self, url):
-        p = urlparse(url)
-        return f"{p.scheme}://{p.netloc}"
-
-
-class PicHandler:
-    def __init__(self, adjust=False):
-        self.adjust = adjust
-
-    async def to_base64(self, image_url):
-        try:
-            conn = aiohttp.TCPConnector(ssl=False)
-            async with aiohttp.ClientSession(trust_env=True, connector=conn) as s:
-                async with s.get(image_url, timeout=aiohttp.ClientTimeout(total=15)) as r:
-                    if r.status != 200:
-                        return None
-                    raw = BytesIO(await r.read())
-                    if self.adjust:
-                        img = Image.open(raw).convert("RGB")
-                        w, h = img.size
-                        px = img.load()
-                        cx, cy = random.choice([(0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1)])
-                        px[cx, cy] = (255, 255, 255)
-                        buf = BytesIO()
-                        img.save(buf, format="JPEG")
-                        buf.seek(0)
-                        return base64.b64encode(buf.read()).decode()
-                    else:
-                        return base64.b64encode(raw.getvalue()).decode()
-        except Exception:
-            return None
-
-
-class URLMapper:
-    RULES = [
-        (r"space\.bilibili\.com/(\d+)", "/bilibili/user/video/{0}", "B站UP主视频"),
-        (r"bilibili\.com/bangumi/media/md(\d+)", "/bilibili/bangumi/media/{0}", "B站番剧"),
-        (r"live\.bilibili\.com/(\d+)", "/bilibili/live/room/{0}", "B站直播间"),
-        (r"manga\.bilibili\.com/detail/mc(\d+)", "/bilibili/manga/update/{0}", "B站漫画"),
-        (r"youtube\.com/channel/([\w-]+)", "/youtube/channel/{0}", "YouTube频道"),
-        (r"youtube\.com/@([\w.-]+)", "/youtube/user/@{0}", "YouTube用户"),
-        (r"youtube\.com/playlist\?list=([\w-]+)", "/youtube/playlist/{0}", "YouTube播放列表"),
-        (r"(?:twitter|x)\.com/(?!home|explore|search|settings|i/)([\w]+)", "/twitter/user/{0}", "Twitter/X"),
-        (r"weibo\.com/u/(\d+)", "/weibo/user/{0}", "微博"),
-        (r"zhihu\.com/people/([\w-]+)", "/zhihu/people/activities/{0}", "知乎"),
-        (r"zhihu\.com/column/([\w-]+)", "/zhihu/zhuanlan/{0}", "知乎专栏"),
-        (r"xiaohongshu\.com/user/profile/([\w]+)", "/xiaohongshu/user/{0}/notes", "小红书"),
-        (r"github\.com/([\w.-]+)/([\w.-]+)/releases", "/github/release/{0}/{1}", "GitHub Release"),
-        (r"github\.com/([\w.-]+)/([\w.-]+)(?:$|[/?#])", "/github/commits/{0}/{1}", "GitHub仓库"),
-        (r"github\.com/([\w.-]+)(?:$|[/?#])", "/github/repos/{0}", "GitHub用户"),
-        (r"t\.me/s?/?([\w]+)", "/telegram/channel/{0}", "Telegram"),
-        (r"douyin\.com/user/([\w]+)", "/douyin/user/{0}", "抖音"),
-        (r"instagram\.com/([\w.]+)(?:$|[/?#])", "/instagram/user/{0}", "Instagram"),
-        (r"pixiv\.net/users/(\d+)", "/pixiv/user/{0}", "Pixiv"),
-        (r"sspai\.com/u/([\w]+)", "/sspai/author/{0}", "少数派"),
-        (r"okjike\.com/u/([\w-]+)", "/jike/user/{0}", "即刻"),
-        (r"podcasts\.apple\.com/.*/id(\d+)", "/apple/podcast/{0}", "Apple Podcast"),
-    ]
-
-    HINTS = {
-        "bilibili": (
-            "B站可用路由(uid在space.bilibili.com/{uid}找):\n"
-            "  UP主视频: /bilibili/user/video/{uid}\n"
-            "  UP主动态: /bilibili/user/dynamic/{uid}\n"
-            "  所有视频: /bilibili/user/video-all/{uid}\n"
-            "  UP主图文: /bilibili/user/article/{uid}\n"
-            "  UP主合集: /bilibili/user/collection/{uid}/{sid}\n"
-            "  综合热门: /bilibili/popular/all\n"
-            "  每周必看: /bilibili/weekly\n"
-            "  排行榜: /bilibili/ranking/all\n"
-            "  热搜: /bilibili/hot-search\n"
-            "  番剧: /bilibili/bangumi/media/{mediaid}\n"
-            "  直播: /bilibili/live/room/{roomID}\n"
-            "  搜索: /bilibili/vsearch/{keyword}"
-        ),
-        "youtube": "YouTube路由:\n  频道: /youtube/channel/{id}\n  用户: /youtube/user/@{name}\n  播放列表: /youtube/playlist/{id}",
-        "twitter": "Twitter/X路由:\n  用户: /twitter/user/{name}\n  媒体: /twitter/media/{name}\n  搜索: /twitter/keyword/{kw}",
-        "x.com": "Twitter/X路由:\n  用户: /twitter/user/{name}\n  媒体: /twitter/media/{name}",
-        "weibo": "微博路由:\n  用户: /weibo/user/{uid}\n  热搜: /weibo/search/hot",
-        "zhihu": "知乎路由:\n  用户: /zhihu/people/activities/{id}\n  专栏: /zhihu/zhuanlan/{id}\n  热榜: /zhihu/hot",
-        "github": "GitHub路由:\n  Release: /github/release/{owner}/{repo}\n  Commits: /github/commits/{owner}/{repo}",
-        "xiaohongshu": "小红书路由:\n  用户笔记: /xiaohongshu/user/{id}/notes",
-        "douyin": "抖音路由:\n  用户: /douyin/user/{uid}",
-        "instagram": "Instagram路由:\n  用户: /instagram/user/{name}",
-        "telegram": "Telegram路由:\n  频道: /telegram/channel/{name}",
-        "pixiv": "Pixiv路由:\n  用户: /pixiv/user/{uid}\n  排行: /pixiv/ranking/{mode}",
-    }
-
-    @classmethod
-    def match(cls, url):
-        for pat, tpl, name in cls.RULES:
-            m = re.search(pat, url)
-            if m:
-                return tpl.format(*m.groups()), name
-        return None
-
-    @classmethod
-    def suggest(cls, url):
-        try:
-            netloc = urlparse(url).netloc.lower()
-        except Exception:
-            return "无法解析，请提供http开头的链接或/开头的路由。"
-        for kw, hint in cls.HINTS.items():
-            if kw in netloc:
-                return hint
-        return "未收录此平台。请到 https://docs.rsshub.app 查找路由后用/开头调用。"
-
-
-class CardGen:
-    def __init__(self, width=480):
-        self.w = width
-        self.pad = 22
-        self.font_path = self._find()
-
-
-    
-    def _find(self):
-        # 0) 也扫描插件根目录的字体（兼容用户把ttf直接放这里）
-        base_dir = os.path.dirname(__file__)
-        root_fonts = []
-        for fn in os.listdir(base_dir):
-            lower = fn.lower()
-            if lower.endswith((".ttf", ".otf", ".ttc")):
-                root_fonts.append(os.path.join(base_dir, fn))
-        if root_fonts:
-            return root_fonts[0]
-        # 1) 优先使用插件目录 fonts/ 下的字体（最推荐）
-        fonts_dir = os.path.join(os.path.dirname(__file__), "fonts")
-        if os.path.isdir(fonts_dir):
-            files = []
-            for fn in os.listdir(fonts_dir):
-                lower = fn.lower()
-                if lower.endswith((".ttf", ".otf", ".ttc")):
-                    files.append(fn)
-
-            # 按优先级排序：尽量选覆盖中日英的字体，其次你自带的字体
-            def score(name: str) -> int:
-                n = name.lower()
-                s = 0
-                # 覆盖更全的 CJK 字体优先
-                if "notosanscjk" in n or "noto sans cjk" in n:
-                    s += 100
-                if "notosansjp" in n or "noto sans jp" in n:
-                    s += 90
-                if "notosanssc" in n or "noto sans sc" in n:
-                    s += 80
-                if "cjk" in n:
-                    s += 70
-                if "jp" in n or "japan" in n:
-                    s += 60
-                if "sc" in n or "chinese" in n:
-                    s += 50
-                # 你这种“支持中文”的也给高权重
-                if "minecraft" in n:
-                    s += 40
-                if "中文" in name:
-                    s += 30
-                return -s  # 分数越高越靠前
-
-            files.sort(key=score)
-
-            if files:
-                return os.path.join(fonts_dir, files[0])
-
-        # 2) 找不到再退回系统字体
-        for p in [
-            "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
-            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-            "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
-            "/System/Library/Fonts/PingFang.ttc",
-            "C:\\Windows\\Fonts\\msyh.ttc",
-        ]:
-            if os.path.exists(p):
-                return p
-
-        return None
-
-    def _f(self, sz):
-        if self.font_path:
-            try:
-                return ImageFont.truetype(self.font_path, sz)
-            except Exception:
-                pass
-        return ImageFont.load_default()
-
-    def _wrap(self, txt, font, mw, draw):
-        if not txt:
-            return []
-        lines = []
-        for para in txt.split("\n"):
-            if not para.strip():
-                lines.append("")
-                continue
-            buf = ""
-            for ch in para:
-                t = buf + ch
-                if draw.textbbox((0, 0), t, font=font)[2] > mw and buf:
-                    lines.append(buf)
-                    buf = ch
-                else:
-                    buf = t
-            if buf:
-                lines.append(buf)
-        return lines
-
-    def make(self, channel="", title="", desc="", link="", ts="", thumb=None):
-        pad = self.pad
-        cw = self.w - 2 * pad
-        fc = self._f(13)
-        ft = self._f(18)
-        fd = self._f(13)
-        ff = self._f(11)
-        tmp = Image.new("RGB", (1, 1))
-        d = ImageDraw.Draw(tmp)
-        tl = self._wrap(title, ft, cw, d)
-        dl = self._wrap((desc or "")[:300], fd, cw, d)
-        if len(dl) > 5:
-            dl = dl[:5]
-            dl[-1] = dl[-1][:-2] + "..."
-
-        th = None
-        th_h = 0
-        if thumb:
-            try:
-                th = Image.open(BytesIO(thumb)).convert("RGB")
-                r = cw / th.width
-                th_h = min(int(th.height * r), 280)
-                th = th.resize((cw, th_h), Image.LANCZOS)
-            except Exception:
-                th = None
-
-        y = 5 + pad + 18 + 14 + len(tl) * 26 + 14
-        if th:
-            y += th_h + 14
-        if dl:
-            y += len(dl) * 20 + 14
-        y += 11
-        if link:
-            y += 20
-        if ts:
-            y += 16
-        y += pad
-        h = y
-
-        img = Image.new("RGB", (self.w, h), (255, 255, 255))
-        dr = ImageDraw.Draw(img)
-        dr.rectangle([(0, 0), (self.w, 5)], fill=(66, 133, 244))
-
-        y = 5 + pad
-        dr.text((pad, y), "📡 " + channel, font=fc, fill=(66, 133, 244))
-        y += 32
-        for ln in tl:
-            dr.text((pad, y), ln, font=ft, fill=(26, 26, 46))
-            y += 26
-        y += 14
-        if th:
-            dr.rectangle([(pad - 1, y - 1), (pad + cw, y + th_h)], outline=(224, 224, 224))
-            img.paste(th, (pad, y))
-            y += th_h + 14
-        if dl:
-            for ln in dl:
-                dr.text((pad, y), ln, font=fd, fill=(85, 85, 85))
-                y += 20
-            y += 14
-        dr.line([(pad, y), (self.w - pad, y)], fill=(230, 230, 230))
-        y += 11
-        if link:
-            lk = link if len(link) <= 48 else link[:48] + "..."
-            dr.text((pad, y), "🔗 " + lk, font=ff, fill=(153, 153, 153))
-            y += 20
-        if ts:
-            dr.text((pad, y), "🕐 " + ts, font=ff, fill=(153, 153, 153))
-        dr.rectangle([(0, 0), (self.w - 1, h - 1)], outline=(224, 224, 224))
-
-        buf = BytesIO()
-        img.save(buf, format="PNG")
-        buf.seek(0)
-        return base64.b64encode(buf.read()).decode()
-
+import asyncio  # 已有，确认引入
 
 @register("astrbot_plugin_myrss", "MyRSS", "RSS订阅插件(LLM增强版)", "1.0.0", "")
 class MyRssPlugin(Star):
@@ -377,68 +21,30 @@ class MyRssPlugin(Star):
 
         self.pic = PicHandler(self.adjust_pic)
         self.card = CardGen()
+
+        # 用于防止并发重复推送的锁，key = (url, user)
+        self._locks: dict[tuple, asyncio.Lock] = {}
+
         self.sched = AsyncIOScheduler()
         self.sched.start()
         self._reload_jobs()
 
-    def _cron(self, expr: str) -> dict:
-        f = expr.split(" ")
-        return {"minute": f[0], "hour": f[1], "day": f[2], "month": f[3], "day_of_week": f[4]}
+    async def destroy(self):
+        """AstrBot 卸载/禁用插件时调用"""
+        try:
+            if self.sched.running:
+                self.sched.shutdown(wait=False)
+                self.logger.info("MyRSS: 调度器已停止")
+        except Exception as e:
+            self.logger.error("MyRSS: 停止调度器失败: %s", e)
 
-    def _reload_jobs(self) -> None:
-        self.sched.remove_all_jobs()
-        for url, info in self.dh.data.items():
-            if url in ("rsshub_endpoints", "settings"):
-                continue
-            for user, si in info.get("subscribers", {}).items():
-                self.sched.add_job(self._cron_cb, "cron", **self._cron(si["cron_expr"]), args=[url, user])
+    def _get_lock(self, url: str, user: str) -> asyncio.Lock:
+        key = (url, user)
+        if key not in self._locks:
+            self._locks[key] = asyncio.Lock()
+        return self._locks[key]
 
-    async def _fetch(self, url: str):
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-        conn = aiohttp.TCPConnector(ssl=False)
-        to = aiohttp.ClientTimeout(total=30, connect=10)
-
-        async def _try(u: str):
-            try:
-                async with aiohttp.ClientSession(trust_env=True, connector=conn, timeout=to, headers=headers) as s:
-                    async with s.get(u) as r:
-                        if r.status != 200:
-                            return None
-                        return await r.read()
-            except Exception:
-                return None
-
-        # 1) 先尝试原始 URL
-        data = await _try(url)
-        if data is not None:
-            return data
-
-        # 2) 如果失败：尝试切换到其它 RSSHub 端点（同一路由 path）
-        eps = self.dh.data.get("rsshub_endpoints", [])
-        if not eps:
-            return None
-
-        parsed = urlparse(url)
-        path = parsed.path + (("?" + parsed.query) if parsed.query else "")
-
-        # 当前 URL 的根
-        cur_root = f"{parsed.scheme}://{parsed.netloc}"
-
-        # 规范化端点：去掉末尾 /
-        norm_eps = [(e[:-1] if e.endswith("/") else e) for e in eps]
-
-        for ep in norm_eps:
-            if ep == cur_root:
-                continue
-            alt = ep + path
-            data = await _try(alt)
-            if data is not None:
-                self.logger.warning("rss: 端点不可用，已自动切换 %s -> %s", url, alt)
-                return data
-
-        return None
-
-    async def _poll(self, url: str, num: int = -1, after_ts: int = 0, after_link: str = "") -> List[RSSItem]:
+    async def _poll(self, url: str, num: int = -1, after_ts: int = 0, after_link: str = "") -> list:
         text = await self._fetch(url)
         if text is None:
             return []
@@ -446,7 +52,10 @@ class MyRssPlugin(Star):
             root = etree.fromstring(text)
         except ValueError:
             try:
-                root = etree.fromstring(text.replace(b'encoding="gb2312"', b'').replace(b'encoding="GB2312"', b''))
+                root = etree.fromstring(
+                    text.replace(b'encoding="gb2312"', b'')
+                        .replace(b'encoding="GB2312"', b'')
+                )
             except Exception:
                 return []
 
@@ -465,7 +74,7 @@ class MyRssPlugin(Star):
                     title = title[:self.title_max] + "..."
 
                 ln = it.xpath("link")
-                link = ln[0].text if ln else ""
+                link = (ln[0].text or "").strip() if ln else ""
                 if link and not re.match(r"^https?://", link):
                     link = self.dh.get_root_url(url) + link
 
@@ -476,200 +85,121 @@ class MyRssPlugin(Star):
                 if len(desc) > self.desc_max:
                     desc = desc[:self.desc_max] + "..."
 
-                for u in it.xpath("media:thumbnail/@url", namespaces=ns) + it.xpath(".//*[local-name()='thumbnail']/@url") + it.xpath("enclosure[contains(@type,'image')]/@url"):
+                for u in (
+                    it.xpath("media:thumbnail/@url", namespaces=ns)
+                    + it.xpath(".//*[local-name()='thumbnail']/@url")
+                    + it.xpath("enclosure[contains(@type,'image')]/@url")
+                ):
                     if u not in pics:
                         pics.append(u)
 
-                if it.xpath("pubDate"):
-                    pd = it.xpath("pubDate")[0].text
-                    try:
-                        if "GMT" in pd:
-                            pts = int(time.mktime(time.strptime(pd.replace("GMT", "+0000"), "%a, %d %b %Y %H:%M:%S %z")))
-                        else:
-                            pts = int(time.mktime(time.strptime(pd, "%a, %d %b %Y %H:%M:%S %z")))
-                    except Exception:
-                        pts = int(time.time())
-                    if pts > after_ts:
+                pub_nodes = it.xpath("pubDate")
+                if pub_nodes:
+                    pd = pub_nodes[0].text or ""
+                    pts = self._parse_pubdate(pd)
+
+                    # 修复：用 >= 改为严格 > ，且时间戳解析失败时跳过而非 fallback
+                    if pts is None:
+                        # 解析失败，用 link 去重兜底
+                        if link and link != after_link:
+                            result.append(RSSItem(ch, title, link, desc, pd, 0, pics))
+                            cnt += 1
+                        # 不 break，继续处理后续条目
+                    elif pts > after_ts:
                         result.append(RSSItem(ch, title, link, desc, pd, pts, pics))
                         cnt += 1
-                        if num != -1 and cnt >= num:
-                            break
                     else:
+                        # 遇到已处理过的时间戳，后续条目更旧，直接停止
                         break
                 else:
-                    if link != after_link:
+                    # 无 pubDate，用 link 去重
+                    if link and link != after_link:
                         result.append(RSSItem(ch, title, link, desc, "", 0, pics))
                         cnt += 1
-                        if num != -1 and cnt >= num:
-                            break
                     else:
                         break
+
+                if num != -1 and cnt >= num:
+                    break
+
             except Exception as e:
                 self.logger.error("rss: 解析条目失败 %s: %s", url, e)
                 break
+
         return result
 
-    async def _add(self, url: str, cron_expr: str, event: AstrMessageEvent):
-        user = event.unified_msg_origin
-        if url in self.dh.data:
-            items = await self._poll(url)
-            if not items:
-                return event.plain_result("无法从该源获取内容，请检查链接。")
-            self.dh.data[url]["subscribers"][user] = {
-                "cron_expr": cron_expr,
-                "last_update": items[0].pubDate_timestamp,
-                "latest_link": items[0].link,
-                "seen_links": [items[0].link] if items[0].link else [],
-            }
-        else:
-            text = await self._fetch(url)
-            if text is None:
-                return event.plain_result("无法访问: " + url + "\n请检查RSSHub端点是否可用。")
+    def _parse_pubdate(self, pd: str):
+        """
+        解析 pubDate 字符串为 Unix 时间戳。
+        解析失败返回 None（而非 fallback 到当前时间）。
+        """
+        if not pd:
+            return None
+        formats = [
+            "%a, %d %b %Y %H:%M:%S %z",
+            "%a, %d %b %Y %H:%M:%S GMT",
+        ]
+        pd_clean = pd.strip().replace("GMT", "+0000")
+        for fmt in formats:
             try:
-                title, desc = self.dh.parse_channel_info(text)
-            except Exception as e:
-                return event.plain_result("解析失败: " + str(e))
-            items = await self._poll(url)
-            if not items:
-                return event.plain_result("源可访问但无内容条目。")
-            self.dh.data[url] = {
-                "subscribers": {
-                    user: {
-                        "cron_expr": cron_expr,
-                        "last_update": items[0].pubDate_timestamp,
-                        "latest_link": items[0].link,
-                        "seen_links": [items[0].link] if items[0].link else [],
-                    }
-                },
-                "info": {"title": title, "description": desc},
-            }
-        self.dh.save()
-        return self.dh.data[url]["info"]
-
-    async def _make_card_b64(self, item: RSSItem) -> str:
-        """只生成单条卡片(base64 PNG)，用于合并长图"""
-        tb = None
-        if self.read_pic and item.pic_urls:
-            try:
-                conn = aiohttp.TCPConnector(ssl=False)
-                async with aiohttp.ClientSession(trust_env=True, connector=conn) as s:
-                    async with s.get(item.pic_urls[0], timeout=aiohttp.ClientTimeout(total=15)) as r:
-                        if r.status == 200:
-                            tb = await r.read()
+                import calendar
+                t = time.strptime(pd_clean, fmt)
+                # mktime 会用本地时区，这里直接用 calendar.timegm 处理 UTC
+                # 但 %z 已经含时区，用 datetime 更准确
+                from datetime import datetime
+                dt = datetime.strptime(pd_clean, fmt)
+                return int(dt.timestamp())
             except Exception:
-                pass
-
-        return self.card.make(
-            channel=item.chan_title,
-            title=item.title,
-            desc=item.description,
-            link="" if self.hide_url else item.link,
-            ts=item.pubDate or "",
-            thumb=tb,
-        )
-
-    def _merge_cards_b64(self, cards_b64: list[str]) -> str:
-        """把多张卡片PNG(base64)竖向拼成一张长图(base64)"""
-        imgs = []
-        for b64 in cards_b64:
-            raw = base64.b64decode(b64)
-            imgs.append(Image.open(BytesIO(raw)).convert("RGB"))
-
-        if not imgs:
-            return ""
-
-        width = max(im.width for im in imgs)
-        pad = 12
-
-        resized = []
-        total_h = pad
-        for im in imgs:
-            if im.width != width:
-                nh = int(im.height * (width / im.width))
-                im = im.resize((width, nh), Image.LANCZOS)
-            resized.append(im)
-            total_h += im.height + pad
-
-        canvas = Image.new("RGB", (width, total_h), (255, 255, 255))
-        y = pad
-        for im in resized:
-            canvas.paste(im, (0, y))
-            y += im.height + pad
-
-        out = BytesIO()
-        canvas.save(out, format="PNG")
-        out.seek(0)
-        return base64.b64encode(out.read()).decode("utf-8")
-    
-    async def _make_comps(self, item: RSSItem) -> list:
-        comps = []
-        tb = None
-        if self.read_pic and item.pic_urls:
-            try:
-                conn = aiohttp.TCPConnector(ssl=False)
-                async with aiohttp.ClientSession(trust_env=True, connector=conn) as s:
-                    async with s.get(item.pic_urls[0], timeout=aiohttp.ClientTimeout(total=15)) as r:
-                        if r.status == 200:
-                            tb = await r.read()
-            except Exception:
-                pass
-        try:
-            b64 = self.card.make(
-                channel=item.chan_title, title=item.title, desc=item.description,
-                link="" if self.hide_url else item.link, ts=item.pubDate or "", thumb=tb,
-            )
-            comps.append(Comp.Image.fromBase64(b64))
-        except Exception as e:
-            self.logger.error("卡片生成失败: %s", e)
-            comps.append(Comp.Plain("📡 " + item.chan_title + "\n📝 " + item.title + "\n" + item.description))
-
-        if self.read_pic and item.pic_urls:
-            mx = len(item.pic_urls) if self.max_pic == -1 else self.max_pic
-            for pu in item.pic_urls[1:mx]:
-                try:
-                    b = await self.pic.to_base64(pu)
-                    if b:
-                        comps.append(Comp.Image.fromBase64(b))
-                except Exception:
-                    pass
-        return comps
+                continue
+        return None
 
     async def _cron_cb(self, url: str, user: str) -> None:
+        # 用锁防止同一 (url, user) 并发执行
+        lock = self._get_lock(url, user)
+        async with lock:
+            await self._cron_cb_inner(url, user)
+
+    async def _cron_cb_inner(self, url: str, user: str) -> None:
         if url not in self.dh.data or user not in self.dh.data[url].get("subscribers", {}):
             return
 
         self.logger.info("RSS定时触发: %s -> %s", url, user)
         si = self.dh.data[url]["subscribers"][user]
 
-        items = await self._poll(url, num=self.max_poll, after_ts=si["last_update"], after_link=si["latest_link"])
+        items = await self._poll(
+            url,
+            num=self.max_poll,
+            after_ts=si["last_update"],
+            after_link=si["latest_link"],
+        )
         if not items:
             return
 
         def item_key(it: RSSItem) -> str:
-            if it.link:
-                return it.link
-            return f"{it.title}|{it.pubDate_timestamp}"
+            return it.link if it.link else f"{it.title}|{it.pubDate_timestamp}"
 
-        # ===== 去重：已经发过的就不再发 =====
+        # 去重
         seen = set(si.get("seen_links", []))
-        new_items = []
-        for it in items:
-            k = item_key(it)
-            if k in seen:
-                continue
-            new_items.append(it)
+        new_items = [it for it in items if item_key(it) not in seen]
 
         if not new_items:
-            # 即便都重复，也推进 latest_link，避免无 pubDate 的源卡住
+            # 全部重复，仅推进指针
             si["latest_link"] = items[0].link
+            # 注意：不要更新 last_update，防止时间跳变
             self.dh.save()
             return
 
-        # ===== 合并策略：>1 条则合并成一张长图只发一次 =====
-        pn = user.split(":")[0]
-        max_ts = si["last_update"]
+        # 先更新 seen_links（在发送前），防止并发重复
+        new_keys = [item_key(it) for it in new_items]
+        si["seen_links"] = (new_keys + si.get("seen_links", []))[:200]
+        si["latest_link"] = items[0].link
+        # 只更新时间戳不为 0 的条目的最大值
+        ts_candidates = [it.pubDate_timestamp for it in new_items if it.pubDate_timestamp > 0]
+        if ts_candidates:
+            si["last_update"] = max(ts_candidates)
+        self.dh.save()   # ← 先保存，再发送，避免发送失败后数据不一致
 
-        # 控制合并条数，避免图片过长（可按需调大/调小）
+        pn = user.split(":")[0]
         merge_limit = 5
         batch = new_items[:merge_limit]
 
@@ -677,11 +207,9 @@ class MyRssPlugin(Star):
             cards = [await self._make_card_b64(it) for it in batch]
             merged = self._merge_cards_b64(cards)
             if not merged:
-                # 合并失败则退回单条发送（最多发 merge_limit 条）
                 for it in batch:
                     comps = await self._make_comps(it)
                     await self.ctx.send_message(user, MessageChain(chain=comps, use_t2i_=self.t2i))
-                    max_ts = max(max_ts, it.pubDate_timestamp)
             else:
                 comps = [Comp.Image.fromBase64(merged)]
                 if pn == "aiocqhttp" and self.compose:
@@ -689,221 +217,13 @@ class MyRssPlugin(Star):
                     await self.ctx.send_message(user, MessageChain(chain=[node], use_t2i_=self.t2i))
                 else:
                     await self.ctx.send_message(user, MessageChain(chain=comps, use_t2i_=self.t2i))
-
-                max_ts = max(max_ts, max(it.pubDate_timestamp for it in batch))
-
-            # 更新去重列表
-            sent_keys = [item_key(it) for it in batch]
-            si["seen_links"] = (sent_keys + si.get("seen_links", []))[:200]
         else:
-            # 单条：保持原先卡片 + 附图的效果
             it = batch[0]
             comps = await self._make_comps(it)
-
             if pn == "aiocqhttp" and self.compose:
                 node = Comp.Node(uin=0, name="Astrbot", content=comps)
                 await self.ctx.send_message(user, MessageChain(chain=[node], use_t2i_=self.t2i))
             else:
                 await self.ctx.send_message(user, MessageChain(chain=comps, use_t2i_=self.t2i))
 
-            max_ts = max(max_ts, it.pubDate_timestamp)
-            k = item_key(it)
-            si["seen_links"] = ([k] + si.get("seen_links", []))[:200]
-
-        # 推进断点（很重要，避免下一轮又把这批当“新”）
-        si["last_update"] = max_ts
-        si["latest_link"] = items[0].link
-        self.dh.save()
-        self.logger.info("RSS推送完成: %s -> %s", url, user)
-
-    # ============================================================
-    #  LLM 工具
-    # ============================================================
-
-    @filter.llm_tool(name="myrss_subscribe")
-    async def tool_sub(self, event: AstrMessageEvent, url: str = "https://example.com", interval: int = 1):
-        """当用户想订阅、关注、追踪某个网站或博主的更新时调用此工具。支持B站、YouTube、Twitter(X)、微博、知乎等链接自动识别，也接受RSSHub路由路径。
-
-        Args:
-            url(string): 用户提供的网页链接(http开头)或RSSHub路由路径(/开头)。例如 https://space.bilibili.com/2267573 或 /bilibili/weekly
-            interval(int): 检查更新的间隔小时数，默认1小时
-        """
-        if not url or url == "https://example.com":
-            yield event.plain_result("请提供要订阅的链接或路由。")
-            return
-        eps = self.dh.data.get("rsshub_endpoints", [])
-        if not eps:
-            yield event.plain_result("尚未配置RSSHub端点，请让用户先执行命令：/myrss rsshub add https://rsshub.rssforever.com")
-            return
-        if url.startswith("/"):
-            furl = eps[0] + url
-        elif url.startswith("http"):
-            r = URLMapper.match(url)
-            if r:
-                route, pn = r
-                furl = eps[0] + route
-            else:
-                yield event.plain_result("无法自动识别该链接。\n\n" + URLMapper.suggest(url) + "\n\n请选择路由后用/开头再次调用。")
-                return
-        else:
-            yield event.plain_result("请提供http开头的链接或/开头的路由。")
-            return
-        if interval < 1:
-            interval = 1
-        ret = await self._add(furl, "0 */" + str(interval) + " * * *", event)
-        if isinstance(ret, MessageEventResult):
-            yield ret
-            return
-        self._reload_jobs()
-        yield event.plain_result("✅ 订阅成功！\n📡 " + ret["title"] + "\n📝 " + ret["description"] + "\n⏰ 每" + str(interval) + "小时\n🔗 " + furl)
-
-    @filter.llm_tool(name="myrss_list")
-    async def tool_list(self, event: AstrMessageEvent, query: str = "all"):
-        """查看当前会话已订阅的所有RSS源列表。当用户问我订阅了什么、有哪些订阅时调用。
-
-        Args:
-            query(string): 固定传入all即可
-        """
-        user = event.unified_msg_origin
-        urls = self.dh.get_subs(user)
-        if not urls:
-            yield event.plain_result("当前没有任何订阅。")
-            return
-        txt = "📋 订阅列表：\n"
-        for i, u in enumerate(urls):
-            info = self.dh.data[u]["info"]
-            cr = self.dh.data[u]["subscribers"][user]["cron_expr"]
-            txt += "  " + str(i) + ". " + info["title"] + " [" + cr + "]\n"
-        yield event.plain_result(txt)
-
-    @filter.llm_tool(name="myrss_unsubscribe")
-    async def tool_unsub(self, event: AstrMessageEvent, idx: int = 0):
-        """取消一个RSS订阅。需要先调用myrss_list获取编号，再传入编号来取消。用户说取消订阅、不要了时使用。
-
-        Args:
-            idx(int): 要取消的订阅编号，从myrss_list的结果中获取
-        """
-        user = event.unified_msg_origin
-        urls = self.dh.get_subs(user)
-        if idx < 0 or idx >= len(urls):
-            yield event.plain_result("编号" + str(idx) + "不存在，有效范围0~" + str(len(urls) - 1))
-            return
-        u = urls[idx]
-        t = self.dh.data[u]["info"]["title"]
-        self.dh.data[u]["subscribers"].pop(user)
-        self.dh.save()
-        self._reload_jobs()
-        yield event.plain_result("✅ 已取消: " + t)
-
-    # ============================================================
-    #  手动命令
-    # ============================================================
-
-    @filter.command_group("myrss")
-    def myrss(self):
-        """RSS订阅管理"""
-        pass
-
-    @myrss.group("rsshub")
-    def rsshub(self, event: AstrMessageEvent):
-        """RSSHub端点管理"""
-        pass
-
-    @rsshub.command("add")
-    async def rsshub_add(self, event: AstrMessageEvent, url: str):
-        """添加RSSHub端点
-
-        Args:
-            url: 端点地址
-        """
-        if url.endswith("/"):
-            url = url[:-1]
-        if url in self.dh.data["rsshub_endpoints"]:
-            yield event.plain_result("已存在")
-            return
-        self.dh.data["rsshub_endpoints"].append(url)
-        self.dh.save()
-        yield event.plain_result("✅ 已添加: " + url)
-
-    @rsshub.command("list")
-    async def rsshub_list(self, event: AstrMessageEvent):
-        """列出所有RSSHub端点"""
-        eps = self.dh.data["rsshub_endpoints"]
-        if not eps:
-            yield event.plain_result("暂无端点，请先 /myrss rsshub add <url>")
-            return
-        txt = "RSSHub端点：\n"
-        for i, x in enumerate(eps):
-            txt += "  " + str(i) + ": " + x + "\n"
-        yield event.plain_result(txt)
-
-    @rsshub.command("remove")
-    async def rsshub_rm(self, event: AstrMessageEvent, idx: int):
-        """删除RSSHub端点
-
-        Args:
-            idx: 端点编号
-        """
-        eps = self.dh.data["rsshub_endpoints"]
-        if idx < 0 or idx >= len(eps):
-            yield event.plain_result("编号越界")
-            return
-        removed = eps.pop(idx)
-        self.dh.save()
-        yield event.plain_result("✅ 已删除: " + removed)
-
-    @myrss.command("list")
-    async def cmd_list(self, event: AstrMessageEvent):
-        """列出当前订阅"""
-        user = event.unified_msg_origin
-        urls = self.dh.get_subs(user)
-        if not urls:
-            yield event.plain_result("暂无订阅")
-            return
-        txt = "订阅列表：\n"
-        for i, u in enumerate(urls):
-            info = self.dh.data[u]["info"]
-            txt += "  " + str(i) + ". " + info["title"] + "\n"
-        yield event.plain_result(txt)
-
-    @myrss.command("remove")
-    async def cmd_rm(self, event: AstrMessageEvent, idx: int):
-        """取消订阅
-
-        Args:
-            idx: 订阅编号
-        """
-        user = event.unified_msg_origin
-        urls = self.dh.get_subs(user)
-        if idx < 0 or idx >= len(urls):
-            yield event.plain_result("编号越界")
-            return
-        u = urls[idx]
-        t = self.dh.data[u]["info"]["title"]
-        self.dh.data[u]["subscribers"].pop(user)
-        self.dh.save()
-        self._reload_jobs()
-        yield event.plain_result("✅ 已取消: " + t)
-
-    @myrss.command("get")
-    async def cmd_get(self, event: AstrMessageEvent, idx: int):
-        """获取最新内容
-
-        Args:
-            idx: 订阅编号
-        """
-        user = event.unified_msg_origin
-        urls = self.dh.get_subs(user)
-        if idx < 0 or idx >= len(urls):
-            yield event.plain_result("编号越界")
-            return
-        items = await self._poll(urls[idx])
-        if not items:
-            yield event.plain_result("暂无内容")
-            return
-        comps = await self._make_comps(items[0])
-        pn = user.split(":")[0]
-        if pn == "aiocqhttp" and self.compose:
-            yield event.chain_result([Comp.Node(uin=0, name="Astrbot", content=comps)]).use_t2i(self.t2i)
-        else:
-            yield event.chain_result(comps).use_t2i(self.t2i)
+        self.logger.info("RSS推送完成: %s -> %s (%d条)", url, user, len(batch))
