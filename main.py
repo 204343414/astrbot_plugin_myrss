@@ -402,12 +402,26 @@ class MyRssPlugin(Star):
         for url, info in self.dh.data.items():
             if url in ("rsshub_endpoints", "settings"):
                 continue
-            for user, si in info.get("subscribers", {}).items():
-                self.sched.add_job(
-                    self._cron_cb, "cron",
-                    **self._cron(si["cron_expr"]),
-                    args=[url, user]
-                )
+            subs = info.get("subscribers", {})
+            if not subs:
+                continue
+            # 取所有订阅者中间隔最大的cron（最保守，减少拉取频率）
+            def cron_to_hours(expr: str) -> int:
+                """从 '0 */N * * *' 提取N，失败返回1"""
+                try:
+                    return int(expr.split(" ")[1].replace("*/", ""))
+                except Exception:
+                    return 1
+
+            max_hours = max(cron_to_hours(si["cron_expr"]) for si in subs.values())
+            merged_cron = f"0 */{max_hours} * * *"
+            # 每个URL只注册一个job，拉取后分发给所有订阅者
+            self.sched.add_job(
+                self._cron_cb_url, "cron",
+                **self._cron(merged_cron),
+                args=[url]
+            )
+            self.logger.info("RSS调度: %s 每%d小时拉取，%d个订阅者", url, max_hours, len(subs))
 
     async def _fetch(self, url: str):
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
@@ -666,25 +680,57 @@ class MyRssPlugin(Star):
                     pass
         return comps
 
+    async def _cron_cb_url(self, url: str) -> None:
+        """每个URL只拉取一次，结果分发给所有订阅者"""
+        if url not in self.dh.data:
+            return
+        subs = self.dh.data[url].get("subscribers", {})
+        if not subs:
+            return
+
+        self.logger.info("RSS公共拉取: %s -> %d个订阅者", url, len(subs))
+
+        # 所有订阅者中最早的 last_update（拉最多内容，再各自过滤）
+        min_ts = min(si.get("last_update", 0) for si in subs.values())
+        min_link = ""  # 公共拉取不用after_link过滤，靠seen_links去重
+
+        items = await self._poll(url, num=self.max_poll, after_ts=min_ts, after_link=min_link)
+        if not items:
+            return
+
+        # 分发给每个订阅者（各自独立去重）
+        for user in list(subs.keys()):
+            lock = self._get_lock(url, user)
+            async with lock:
+                await self._cron_cb_inner(url, user, prefetched_items=items)
+
     async def _cron_cb(self, url: str, user: str) -> None:
         """带锁的定时回调入口，防止同一订阅并发执行"""
         lock = self._get_lock(url, user)
         async with lock:
             await self._cron_cb_inner(url, user)
 
-    async def _cron_cb_inner(self, url: str, user: str) -> None:
+    async def _cron_cb_inner(self, url: str, user: str, prefetched_items=None) -> None:
         if url not in self.dh.data or user not in self.dh.data[url].get("subscribers", {}):
             return
 
         self.logger.info("RSS定时触发: %s -> %s", url, user)
         si = self.dh.data[url]["subscribers"][user]
 
-        items = await self._poll(
-            url,
-            num=self.max_poll,
-            after_ts=si["last_update"],
-            after_link=si["latest_link"],
-        )
+        if prefetched_items is not None:
+            # 使用公共拉取的结果，再按该用户的断点过滤一次
+            items = [
+                it for it in prefetched_items
+                if it.pubDate_timestamp > si.get("last_update", 0)
+                or (it.pubDate_timestamp == 0 and it.link != si.get("latest_link", ""))
+            ]
+        else:
+            items = await self._poll(
+                url,
+                num=self.max_poll,
+                after_ts=si["last_update"],
+                after_link=si["latest_link"],
+            )
         if not items:
             return
 
@@ -772,6 +818,19 @@ class MyRssPlugin(Star):
             return
         if interval < 1:
             interval = 1
+        # 如果已有订阅者，间隔只能取更大值（保护公共源）
+        if furl in self.dh.data:
+            existing_subs = self.dh.data[furl].get("subscribers", {})
+            if existing_subs:
+                def cron_to_hours(expr: str) -> int:
+                    try:
+                        return int(expr.split(" ")[1].replace("*/", ""))
+                    except Exception:
+                        return 1
+                max_existing = max(cron_to_hours(si["cron_expr"]) for si in existing_subs.values())
+                if interval < max_existing:
+                    interval = max_existing
+                    yield event.plain_result(f"⚠️ 已有订阅者使用{max_existing}小时间隔，为保护公共源已自动调整为{max_existing}小时。")
         ret = await self._add(furl, "0 */" + str(interval) + " * * *", event)
         if isinstance(ret, MessageEventResult):
             yield ret
