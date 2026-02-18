@@ -850,7 +850,7 @@ class MyRssPlugin(Star):
         yield event.plain_result("✅ 订阅成功！\n📡 " + ret["title"] + "\n📝 " + ret["description"] + "\n⏰ 每" + str(interval) + "小时\n🔗 " + furl)
 
     @filter.llm_tool(name="myrss_list")
-        async def tool_list(self, event: AstrMessageEvent, query: str = "all"):
+    async def tool_list(self, event: AstrMessageEvent, query: str = "all"):
         """用户问订阅了什么时调用。
     
         Args:
