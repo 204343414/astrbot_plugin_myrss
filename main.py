@@ -519,6 +519,7 @@ class MyRssPlugin(Star):
                 "cron_expr": cron_expr,
                 "last_update": items[0].pubDate_timestamp,
                 "latest_link": items[0].link,
+                "seen_links": [items[0].link] if items[0].link else [],
             }
         else:
             text = await self._fetch(url)
@@ -537,6 +538,7 @@ class MyRssPlugin(Star):
                         "cron_expr": cron_expr,
                         "last_update": items[0].pubDate_timestamp,
                         "latest_link": items[0].link,
+                        "seen_links": [items[0].link] if items[0].link else [],
                     }
                 },
                 "info": {"title": title, "description": desc},
@@ -544,6 +546,61 @@ class MyRssPlugin(Star):
         self.dh.save()
         return self.dh.data[url]["info"]
 
+    async def _make_card_b64(self, item: RSSItem) -> str:
+        """只生成单条卡片(base64 PNG)，用于合并长图"""
+        tb = None
+        if self.read_pic and item.pic_urls:
+            try:
+                conn = aiohttp.TCPConnector(ssl=False)
+                async with aiohttp.ClientSession(trust_env=True, connector=conn) as s:
+                    async with s.get(item.pic_urls[0], timeout=aiohttp.ClientTimeout(total=15)) as r:
+                        if r.status == 200:
+                            tb = await r.read()
+            except Exception:
+                pass
+
+        return self.card.make(
+            channel=item.chan_title,
+            title=item.title,
+            desc=item.description,
+            link="" if self.hide_url else item.link,
+            ts=item.pubDate or "",
+            thumb=tb,
+        )
+
+    def _merge_cards_b64(self, cards_b64: list[str]) -> str:
+        """把多张卡片PNG(base64)竖向拼成一张长图(base64)"""
+        imgs = []
+        for b64 in cards_b64:
+            raw = base64.b64decode(b64)
+            imgs.append(Image.open(BytesIO(raw)).convert("RGB"))
+
+        if not imgs:
+            return ""
+
+        width = max(im.width for im in imgs)
+        pad = 12
+
+        resized = []
+        total_h = pad
+        for im in imgs:
+            if im.width != width:
+                nh = int(im.height * (width / im.width))
+                im = im.resize((width, nh), Image.LANCZOS)
+            resized.append(im)
+            total_h += im.height + pad
+
+        canvas = Image.new("RGB", (width, total_h), (255, 255, 255))
+        y = pad
+        for im in resized:
+            canvas.paste(im, (0, y))
+            y += im.height + pad
+
+        out = BytesIO()
+        canvas.save(out, format="PNG")
+        out.seek(0)
+        return base64.b64encode(out.read()).decode("utf-8")
+    
     async def _make_comps(self, item: RSSItem) -> list:
         comps = []
         tb = None
@@ -580,28 +637,82 @@ class MyRssPlugin(Star):
     async def _cron_cb(self, url: str, user: str) -> None:
         if url not in self.dh.data or user not in self.dh.data[url].get("subscribers", {}):
             return
+
         self.logger.info("RSS定时触发: %s -> %s", url, user)
         si = self.dh.data[url]["subscribers"][user]
+
         items = await self._poll(url, num=self.max_poll, after_ts=si["last_update"], after_link=si["latest_link"])
         if not items:
             return
-        max_ts = si["last_update"]
+
+        def item_key(it: RSSItem) -> str:
+            if it.link:
+                return it.link
+            return f"{it.title}|{it.pubDate_timestamp}"
+
+        # ===== 去重：已经发过的就不再发 =====
+        seen = set(si.get("seen_links", []))
+        new_items = []
+        for it in items:
+            k = item_key(it)
+            if k in seen:
+                continue
+            new_items.append(it)
+
+        if not new_items:
+            # 即便都重复，也推进 latest_link，避免无 pubDate 的源卡住
+            si["latest_link"] = items[0].link
+            self.dh.save()
+            return
+
+        # ===== 合并策略：>1 条则合并成一张长图只发一次 =====
         pn = user.split(":")[0]
-        if pn == "aiocqhttp" and self.compose:
-            nodes = []
-            for it in items:
-                c = await self._make_comps(it)
-                nodes.append(Comp.Node(uin=0, name="Astrbot", content=c))
-                max_ts = max(max_ts, it.pubDate_timestamp)
-            if nodes:
-                await self.ctx.send_message(user, MessageChain(chain=nodes, use_t2i_=self.t2i))
+        max_ts = si["last_update"]
+
+        # 控制合并条数，避免图片过长（可按需调大/调小）
+        merge_limit = 5
+        batch = new_items[:merge_limit]
+
+        if len(batch) > 1:
+            cards = [await self._make_card_b64(it) for it in batch]
+            merged = self._merge_cards_b64(cards)
+            if not merged:
+                # 合并失败则退回单条发送（最多发 merge_limit 条）
+                for it in batch:
+                    comps = await self._make_comps(it)
+                    await self.ctx.send_message(user, MessageChain(chain=comps, use_t2i_=self.t2i))
+                    max_ts = max(max_ts, it.pubDate_timestamp)
+            else:
+                comps = [Comp.Image.fromBase64(merged)]
+                if pn == "aiocqhttp" and self.compose:
+                    node = Comp.Node(uin=0, name="Astrbot", content=comps)
+                    await self.ctx.send_message(user, MessageChain(chain=[node], use_t2i_=self.t2i))
+                else:
+                    await self.ctx.send_message(user, MessageChain(chain=comps, use_t2i_=self.t2i))
+
+                max_ts = max(max_ts, max(it.pubDate_timestamp for it in batch))
+
+            # 更新去重列表
+            sent_keys = [item_key(it) for it in batch]
+            si["seen_links"] = (sent_keys + si.get("seen_links", []))[:200]
         else:
-            for it in items:
-                c = await self._make_comps(it)
-                await self.ctx.send_message(user, MessageChain(chain=c, use_t2i_=self.t2i))
-                max_ts = max(max_ts, it.pubDate_timestamp)
-        self.dh.data[url]["subscribers"][user]["last_update"] = max_ts
-        self.dh.data[url]["subscribers"][user]["latest_link"] = items[0].link
+            # 单条：保持原先卡片 + 附图的效果
+            it = batch[0]
+            comps = await self._make_comps(it)
+
+            if pn == "aiocqhttp" and self.compose:
+                node = Comp.Node(uin=0, name="Astrbot", content=comps)
+                await self.ctx.send_message(user, MessageChain(chain=[node], use_t2i_=self.t2i))
+            else:
+                await self.ctx.send_message(user, MessageChain(chain=comps, use_t2i_=self.t2i))
+
+            max_ts = max(max_ts, it.pubDate_timestamp)
+            k = item_key(it)
+            si["seen_links"] = ([k] + si.get("seen_links", []))[:200]
+
+        # 推进断点（很重要，避免下一轮又把这批当“新”）
+        si["last_update"] = max_ts
+        si["latest_link"] = items[0].link
         self.dh.save()
         self.logger.info("RSS推送完成: %s -> %s", url, user)
 
