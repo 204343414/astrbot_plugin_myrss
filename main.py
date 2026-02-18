@@ -463,15 +463,28 @@ class MyRssPlugin(Star):
         return None
 
     def _parse_pubdate(self, pd: str):
-        """解析 pubDate，失败返回 None 而非 fallback 到当前时间"""
+        """解析各种日期格式，失败返回None"""
         if not pd:
             return None
-        pd_clean = pd.strip().replace("GMT", "+0000")
-        formats = [
+        pd = pd.strip()
+
+        # 优先用标准库的RFC2822解析器（最稳，不受locale影响）
+        try:
+            from email.utils import parsedate_to_datetime
+            dt = parsedate_to_datetime(pd)
+            return int(dt.timestamp())
+        except Exception:
+            pass
+
+        # 补充ISO8601等格式
+        pd_clean = pd.replace("GMT", "+0000").replace("Z", "+0000")
+        for fmt in [
             "%a, %d %b %Y %H:%M:%S %z",
-            "%a, %d %b %Y %H:%M:%S +0000",
-        ]
-        for fmt in formats:
+            "%Y-%m-%dT%H:%M:%S%z",
+            "%Y-%m-%dT%H:%M:%S.%f%z",
+            "%Y-%m-%d %H:%M:%S%z",
+            "%Y-%m-%d %H:%M:%S",
+        ]:
             try:
                 dt = datetime.strptime(pd_clean, fmt)
                 return int(dt.timestamp())
@@ -569,7 +582,7 @@ class MyRssPlugin(Star):
                 "cron_expr": cron_expr,
                 "last_update": items[0].pubDate_timestamp,
                 "latest_link": items[0].link,
-                "seen_links": [items[0].link] if items[0].link else [],
+                "seen_links": [it.link for it in items if it.link][:200],
             }
         else:
             text = await self._fetch(url)
@@ -588,10 +601,10 @@ class MyRssPlugin(Star):
                         "cron_expr": cron_expr,
                         "last_update": items[0].pubDate_timestamp,
                         "latest_link": items[0].link,
-                        "seen_links": [items[0].link] if items[0].link else [],
-                    }
-                },
-                "info": {"title": title, "description": desc},
+                    "seen_links": [it.link for it in items if it.link][:200],
+                }
+            },
+            "info": {"title": title, "description": desc},
             }
         self.dh.save()
         return self.dh.data[url]["info"]
