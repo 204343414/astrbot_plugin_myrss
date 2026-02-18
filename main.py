@@ -191,8 +191,46 @@ class CardGen:
         self.font_path = self._find()
 
     def _find(self):
+        # 1) 优先使用插件目录 fonts/ 下的字体（最推荐）
+        fonts_dir = os.path.join(os.path.dirname(__file__), "fonts")
+        if os.path.isdir(fonts_dir):
+            files = []
+            for fn in os.listdir(fonts_dir):
+                lower = fn.lower()
+                if lower.endswith((".ttf", ".otf", ".ttc")):
+                    files.append(fn)
+
+            # 按优先级排序：尽量选覆盖中日英的字体，其次你自带的字体
+            def score(name: str) -> int:
+                n = name.lower()
+                s = 0
+                # 覆盖更全的 CJK 字体优先
+                if "notosanscjk" in n or "noto sans cjk" in n:
+                    s += 100
+                if "notosansjp" in n or "noto sans jp" in n:
+                    s += 90
+                if "notosanssc" in n or "noto sans sc" in n:
+                    s += 80
+                if "cjk" in n:
+                    s += 70
+                if "jp" in n or "japan" in n:
+                    s += 60
+                if "sc" in n or "chinese" in n:
+                    s += 50
+                # 你这种“支持中文”的也给高权重
+                if "minecraft" in n:
+                    s += 40
+                if "中文" in name:
+                    s += 30
+                return -s  # 分数越高越靠前
+
+            files.sort(key=score)
+
+            if files:
+                return os.path.join(fonts_dir, files[0])
+
+        # 2) 找不到再退回系统字体
         for p in [
-            os.path.join(os.path.dirname(__file__), "fonts", "NotoSansSC-Regular.ttf"),
             "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
             "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
             "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
@@ -201,6 +239,7 @@ class CardGen:
         ]:
             if os.path.exists(p):
                 return p
+
         return None
 
     def _f(self, sz):
