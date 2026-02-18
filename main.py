@@ -190,7 +190,18 @@ class CardGen:
         self.pad = 22
         self.font_path = self._find()
 
+
+    
     def _find(self):
+        # 0) 也扫描插件根目录的字体（兼容用户把ttf直接放这里）
+        base_dir = os.path.dirname(__file__)
+        root_fonts = []
+        for fn in os.listdir(base_dir):
+            lower = fn.lower()
+            if lower.endswith((".ttf", ".otf", ".ttc")):
+                root_fonts.append(os.path.join(base_dir, fn))
+        if root_fonts:
+            return root_fonts[0]
         # 1) 优先使用插件目录 fonts/ 下的字体（最推荐）
         fonts_dir = os.path.join(os.path.dirname(__file__), "fonts")
         if os.path.isdir(fonts_dir):
