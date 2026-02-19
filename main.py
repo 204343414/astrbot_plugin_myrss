@@ -118,6 +118,12 @@ class URLMapper:
         (r"live\.bilibili\.com/(\d+)", "/bilibili/live/room/{0}", "B站直播间"),
         (r"manga\.bilibili\.com/detail/mc(\d+)", "/bilibili/manga/update/{0}", "B站漫画"),
         (r"youtube\.com/channel/([\w-]+)", "/youtube/channel/{0}", "YouTube频道"),
+        # [修复] 优先匹配 YouTube 的动态(community/posts)、Shorts、直播等特定页面
+        # 必须放在通用的 @user 规则之前，否则会被通用规则拦截
+        (r"youtube\.com/@([\w.-]+)/(?:posts|community)", "/youtube/community/@{0}", "YouTube动态"),
+        (r"youtube\.com/@([\w.-]+)/shorts", "/youtube/user/@{0}/shorts", "YouTube Shorts"),
+        (r"youtube\.com/@([\w.-]+)/streams", "/youtube/user/@{0}/live", "YouTube直播记录"),
+        # [原规则] 通用用户规则放在最后作为兜底
         (r"youtube\.com/@([\w.-]+)", "/youtube/user/@{0}", "YouTube用户"),
         (r"youtube\.com/playlist\?list=([\w-]+)", "/youtube/playlist/{0}", "YouTube播放列表"),
         (r"(?:twitter|x)\.com/(?!home|explore|search|settings|i/)([\w]+)", "/twitter/user/{0}", "Twitter/X"),
@@ -274,79 +280,143 @@ class CardGen:
                 lines.append(buf)
         return lines
 
-    def make(self, channel="", title="", desc="", link="", ts="", thumb=None):
-        pad = self.pad
-        cw = self.w - 2 * pad
-        fc = self._f(13)
-        ft = self._f(18)
-        fd = self._f(13)
-        ff = self._f(11)
-        tmp = Image.new("RGB", (1, 1))
-        d = ImageDraw.Draw(tmp)
-        tl = self._wrap(title, ft, cw, d)
-        dl = self._wrap((desc or "")[:300], fd, cw, d)
-        if len(dl) > 5:
-            dl = dl[:5]
-            dl[-1] = dl[-1][:-2] + "..."
+def make(self, channel="", title="", desc="", link="", ts="", thumb=None):
+    # [美化] 调整了整体布局，使其看起来像社交媒体的信息流卡片
+    pad = 30  # 增加边距，让画面呼吸感更强
+    cw = self.w - 2 * pad
+    
+    # 字体配置：标题大且重，正文适中，元数据（来源/时间）小且灰
+    # 注意：这里沿用了你原本的 _f 方法获取字体
+    font_source = self._f(16) 
+    font_title = self._f(22)
+    font_desc = self._f(15)
+    font_meta = self._f(12)
 
-        th = None
-        th_h = 0
-        if thumb:
-            try:
-                th = Image.open(BytesIO(thumb)).convert("RGB")
-                r = cw / th.width
-                th_h = min(int(th.height * r), 280)
+    # 1. 预计算高度
+    tmp = Image.new("RGB", (1, 1))
+    d = ImageDraw.Draw(tmp)
+    
+    # 自动换行处理
+    tl = self._wrap(title, font_title, cw, d)
+    
+    # 限制描述文字长度，太长了做成长图不好看，限制约10行
+    dl = self._wrap((desc or "").strip(), font_desc, cw, d)
+    if len(dl) > 10:
+        dl = dl[:10]
+        dl[-1] = dl[-1].rstrip() + "..."
+
+    # 处理图片缩放
+    th = None
+    th_h = 0
+    if thumb:
+        try:
+            th = Image.open(BytesIO(thumb)).convert("RGB")
+            # 限制图片最大高度，防止竖长图占满屏幕
+            max_img_h = 600
+            r = cw / th.width
+            th_h = int(th.height * r)
+            if th_h > max_img_h:
+                # 如果太长，就进行裁剪或缩放，这里选择缩放限制高度
+                th_h = max_img_h
                 th = th.resize((cw, th_h), Image.LANCZOS)
-            except Exception:
-                th = None
+            else:
+                th = th.resize((cw, th_h), Image.LANCZOS)
+        except Exception:
+            th = None
+            th_h = 0
 
-        y = 5 + pad + 18 + 14 + len(tl) * 26 + 14
-        if th:
-            y += th_h + 14
-        if dl:
-            y += len(dl) * 20 + 14
-        y += 11
-        if link:
-            y += 20
-        if ts:
-            y += 16
-        y += pad
-        h = y
+    # 布局计算 Y 轴坐标
+    # 结构：[来源 | 时间] -> [标题] -> [图片] -> [正文] -> [底部链接]
+    current_h = pad
+    
+    # Header (Source + Time)
+    header_h = 20
+    current_h += header_h + 15 # 头部 + 间距
 
-        img = Image.new("RGB", (self.w, h), (255, 255, 255))
-        dr = ImageDraw.Draw(img)
-        dr.rectangle([(0, 0), (self.w, 5)], fill=(66, 133, 244))
+    # Title
+    title_h = len(tl) * 30  # 行高
+    current_h += title_h + 15
 
-        y = 5 + pad
-        dr.text((pad, y), "📡 " + channel, font=fc, fill=(66, 133, 244))
-        y += 32
-        for ln in tl:
-            dr.text((pad, y), ln, font=ft, fill=(26, 26, 46))
-            y += 26
-        y += 14
-        if th:
-            dr.rectangle([(pad - 1, y - 1), (pad + cw, y + th_h)], outline=(224, 224, 224))
-            img.paste(th, (pad, y))
-            y += th_h + 14
-        if dl:
-            for ln in dl:
-                dr.text((pad, y), ln, font=fd, fill=(85, 85, 85))
-                y += 20
-            y += 14
-        dr.line([(pad, y), (self.w - pad, y)], fill=(230, 230, 230))
-        y += 11
-        if link:
-            lk = link if len(link) <= 48 else link[:48] + "..."
-            dr.text((pad, y), "🔗 " + lk, font=ff, fill=(153, 153, 153))
-            y += 20
-        if ts:
-            dr.text((pad, y), "🕐 " + ts, font=ff, fill=(153, 153, 153))
-        dr.rectangle([(0, 0), (self.w - 1, h - 1)], outline=(224, 224, 224))
+    # Image
+    if th:
+        current_h += th_h + 15
+    
+    # Desc
+    desc_h = len(dl) * 24
+    if dl:
+        current_h += desc_h + 15
+        
+    # Footer (Link)
+    if link:
+        current_h += 20
+        
+    current_h += pad # 底部padding
 
-        buf = BytesIO()
-        img.save(buf, format="PNG")
-        buf.seek(0)
-        return base64.b64encode(buf.read()).decode()
+    h = current_h
+    
+    # 2. 开始绘制
+    # 背景色改为非常淡的灰白色，比纯白护眼，显得更有质感
+    bg_color = (250, 250, 250)
+    img = Image.new("RGB", (self.w, h), bg_color)
+    dr = ImageDraw.Draw(img)
+
+    y = pad
+    
+    # 绘制头部：来源（蓝色突出） 和 时间（灰色）
+    # 将时间戳格式化一下，如果不是时间戳则直接显示
+    time_str = ts
+    if isinstance(ts, int) and ts > 0:
+        # 你原本的代码逻辑里 ts 传进来可能是字符串也可能是解析后的
+        # 这里保持原样，假设 ts 是字符串。如果是时间戳整数，建议在外面转好
+        pass
+        
+    dr.text((pad, y), f"@{channel}", font=font_source, fill=(0, 122, 255)) # 蓝色高亮频道名
+    # 把时间画在右侧
+    if time_str:
+        time_w = d.textlength(str(time_str), font=font_meta)
+        dr.text((self.w - pad - time_w, y + 2), str(time_str), font=font_meta, fill=(150, 150, 150))
+        
+    y += header_h + 15
+
+    # 绘制标题 (深黑色，加重)
+    for line in tl:
+        dr.text((pad, y), line, font=font_title, fill=(30, 30, 30))
+        y += 30
+    y += 15
+
+    # 绘制图片
+    if th:
+        # 简单的圆角矩形遮罩效果太麻烦，这里直接画个边框装饰
+        img.paste(th, (pad, y))
+        # 给图片加一个极细的边框
+        dr.rectangle([(pad, y), (pad + cw, y + th_h)], outline=(220, 220, 220), width=1)
+        y += th_h + 15
+
+    # 绘制正文 (深灰色)
+    if dl:
+        for line in dl:
+            dr.text((pad, y), line, font=font_desc, fill=(60, 60, 60))
+            y += 24
+        y += 15
+
+    # 绘制底部链接
+    if link:
+        # 绘制一条分割线
+        dr.line([(pad, y), (self.w - pad, y)], fill=(230, 230, 230), width=1)
+        y += 10
+        # 截断过长的链接
+        disp_link = link
+        if len(disp_link) > 50:
+            disp_link = disp_link[:50] + "..."
+        dr.text((pad, y), "🔗 " + disp_link, font=font_meta, fill=(150, 150, 150))
+
+    # 绘制最外层边框 (卡片感)
+    dr.rectangle([(0, 0), (self.w - 1, h - 1)], outline=(220, 220, 220), width=2)
+
+    buf = BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
+    return base64.b64encode(buf.read()).decode()
 
 
 @register("astrbot_plugin_myrss", "MyRSS", "RSS订阅插件(LLM增强版)", "1.0.0", "")
