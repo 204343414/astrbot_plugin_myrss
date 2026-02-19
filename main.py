@@ -71,8 +71,34 @@ class DataHandler:
         return title, desc or ""
 
     def strip_html_pic(self, html):
+        """从HTML中提取所有图片URL
+        除了常规<img>，还会提取：
+        - <video poster="..."> 视频封面海报
+        - YouTube视频链接 → 自动构造 i.ytimg.com 缩略图URL
+        这样社区帖子里分享的视频也能显示封面
+        """
         soup = BeautifulSoup(html, "html.parser")
-        return [img.get("src") for img in soup.find_all("img") if img.get("src")]
+        urls = []
+        # 1. 常规 <img src="...">
+        for img in soup.find_all("img"):
+            src = img.get("src")
+            if src and src not in urls:
+                urls.append(src)
+        # 2. <video poster="..."> 视频封面
+        for vid in soup.find_all("video"):
+            poster = vid.get("poster")
+            if poster and poster not in urls:
+                urls.append(poster)
+        # 3. 从YouTube视频链接自动构造缩略图
+        #    社区帖子分享视频时，HTML里往往只有<a>链接没有<img>
+        #    但YouTube缩略图URL格式固定：i.ytimg.com/vi/{ID}/hqdefault.jpg
+        for a in soup.find_all("a", href=True):
+            m = re.search(r'(?:youtube\.com/watch\?v=|youtu\.be/)([\w-]{11})', a["href"])
+            if m:
+                yt_thumb = f"https://i.ytimg.com/vi/{m.group(1)}/hqdefault.jpg"
+                if yt_thumb not in urls:
+                    urls.append(yt_thumb)
+        return urls
 
     def strip_html(self, html):
         soup = BeautifulSoup(html, "html.parser")
@@ -386,8 +412,10 @@ class CardGen:
         CW  = W - CX - PX               # 内容区可用宽度
 
         # ============ 字体 ============
-        fn = self._f(15)                 # 频道名
-        ft = self._f(13)                 # 时间
+        # fn: 频道名  ft: 时间  fh: 标题(大)  fb: 正文  fm: 底部链接
+        fn = self._f(16)                 # 频道名
+        ft = self._f(12)                 # 时间
+        fh = self._f(18)                 # 标题（比正文大，视觉层次分明）
         fb = self._f(15)                 # 正文
         fm = self._f(12)                 # 底部链接
 
@@ -395,24 +423,25 @@ class CardGen:
         tmp = Image.new("RGB", (1, 1))
         d0 = ImageDraw.Draw(tmp)
 
-        # Twitter 没有标题/正文之分，合并成一段
-        body = ""
-        if title and title not in ("无标题", ""):
-            body = title
-            # 如果描述和标题不同，追加描述
-            if desc and desc.strip() and desc.strip() != title.strip():
-                body += "\n\n" + desc.strip()
-        elif desc:
-            body = desc.strip()
+        # 标题和正文分开处理（而不是合并成一段）
+        # 这样标题可以用大字体，正文用小字体，有层次感
+        # 如果标题和正文内容重复，则只显示标题
+        show_title = title and title not in ("无标题", "")
+        title_lines = self._wrap(title, fh, CW, d0) if show_title else []
+        if len(title_lines) > 4:
+            title_lines = title_lines[:4]
+            title_lines[-1] = title_lines[-1].rstrip() + "..."
+        TITLE_LH = 30  # 标题行高(px)：18px字体 × 1.67倍 ≈ 30
 
-        body_lines = self._wrap(body, fb, CW, d0)
-        # 限制最大行数，防止超长刷屏
-        MAX_LINES = 25
-        if len(body_lines) > MAX_LINES:
-            body_lines = body_lines[:MAX_LINES]
-            body_lines.append("……")
-
-        LINE_H = 22  # 正文行高(px)
+        # 正文：如果和标题完全相同就不重复显示
+        desc_text = (desc or "").strip()
+        if show_title and desc_text == title.strip():
+            desc_text = ""
+        desc_lines = self._wrap(desc_text, fb, CW, d0) if desc_text else []
+        if len(desc_lines) > 15:
+            desc_lines = desc_lines[:15]
+            desc_lines[-1] = desc_lines[-1].rstrip() + "..."
+        DESC_LH = 26   # 正文行高(px)：15px字体 × 1.73倍 ≈ 26，不再挤
 
         # ============ 2. 处理缩略图 ============
         pic = None
@@ -449,17 +478,19 @@ class CardGen:
         time_str = self._format_time(ts)
 
         # ============ 3. 计算总高度 ============
-        H = PY                                   # 上边距
-        H += max(AVT, 24)                        # 头部区(头像高度或名字行高)
-        H += 10                                  # 头部→正文间距
-        if body_lines:
-            H += len(body_lines) * LINE_H + 12   # 正文 + 底部间距
+        # 逐块累加：上边距 → 头像区 → 标题 → 正文 → 图片 → 分割线 → 链接 → 下边距
+        H = PY                                                 # 上边距
+        H += max(AVT, 24) + 10                                 # 头像/名字区 + 间距
+        if title_lines:
+            H += len(title_lines) * TITLE_LH + 8              # 标题块 + 底部间距
+        if desc_lines:
+            H += len(desc_lines) * DESC_LH + 10               # 正文块 + 底部间距
         if pic:
-            H += pic_h + 14                      # 图片 + 底部间距
-        H += 1 + 10                              # 分割线 + 间距
+            H += pic_h + 14                                    # 图片 + 底部间距
+        H += 1 + 10                                            # 分割线 + 间距
         if link:
-            H += 18 + 4                          # 链接行
-        H += PY                                  # 下边距
+            H += 18 + 4                                        # 链接行
+        H += PY                                                # 下边距                          # 下边距
 
         # ============ 4. 绘制画布 ============
         im = Image.new("RGB", (W, H), BG)
@@ -493,12 +524,19 @@ class CardGen:
 
         cy += max(AVT, 24) + 10
 
-        # ---- 正文 ----
-        if body_lines:
-            for line in body_lines:
-                dr.text((CX, cy), line, font=fb, fill=C_BODY)
-                cy += LINE_H
-            cy += 12
+        # ---- 标题（大字，深黑） ----
+        if title_lines:
+            for line in title_lines:
+                dr.text((CX, cy), line, font=fh, fill=C_NAME)
+                cy += TITLE_LH
+            cy += 8
+
+        # ---- 正文（小字，深灰，和标题形成对比） ----
+        if desc_lines:
+            for line in desc_lines:
+                dr.text((CX, cy), line, font=fb, fill=C_GRAY)
+                cy += DESC_LH
+            cy += 10
 
         # ---- 图片（圆角） ----
         if pic:
@@ -712,13 +750,25 @@ class MyRssPlugin(Star):
                 if len(desc) > self.desc_max:
                     desc = desc[:self.desc_max] + "..."
 
+                # [增强] 从多种XML标签提取图片URL
+                # media:thumbnail  → RSS标准缩略图（视频路由常用）
+                # media:content    → 有些源把封面图放这里（YouTube等）
+                # enclosure        → RSS附件
+                # local-name()通配 → 兼容不同命名空间写法
                 for u in (
                     it.xpath("media:thumbnail/@url", namespaces=ns)
+                    + it.xpath("media:content/@url", namespaces=ns)
+                    + it.xpath("media:content/media:thumbnail/@url", namespaces=ns)
                     + it.xpath(".//*[local-name()='thumbnail']/@url")
+                    + it.xpath(".//*[local-name()='content']/@url")
                     + it.xpath("enclosure[contains(@type,'image')]/@url")
+                    + it.xpath("enclosure/@url")
                 ):
-                    if u not in pics:
-                        pics.append(u)
+                    if u and u not in pics:
+                        # 过滤掉视频/音频文件，只保留图片
+                        low = u.lower()
+                        if not any(low.endswith(e) for e in ('.mp4', '.webm', '.mp3', '.m4a', '.ogg')):
+                            pics.append(u)
 
                 pub_nodes = it.xpath("pubDate")
                 if pub_nodes:
