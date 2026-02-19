@@ -71,33 +71,55 @@ class DataHandler:
         return title, desc or ""
 
     def strip_html_pic(self, html):
-        """从HTML中提取所有图片URL
-        除了常规<img>，还会提取：
-        - <video poster="..."> 视频封面海报
-        - YouTube视频链接 → 自动构造 i.ytimg.com 缩略图URL
-        这样社区帖子里分享的视频也能显示封面
-        """
+        """从HTML中提取所有图片URL，包含暴力正则匹配YouTube封面"""
+        if not html:
+            return []
+        
         soup = BeautifulSoup(html, "html.parser")
         urls = []
+        
         # 1. 常规 <img src="...">
         for img in soup.find_all("img"):
             src = img.get("src")
             if src and src not in urls:
                 urls.append(src)
-        # 2. <video poster="..."> 视频封面
+                
+        # 2. <video poster="...">
         for vid in soup.find_all("video"):
             poster = vid.get("poster")
             if poster and poster not in urls:
                 urls.append(poster)
-        # 3. 从YouTube视频链接自动构造缩略图
-        #    社区帖子分享视频时，HTML里往往只有<a>链接没有<img>
-        #    但YouTube缩略图URL格式固定：i.ytimg.com/vi/{ID}/hqdefault.jpg
+                
+        # 3. [暴力增强] 直接正则扫描整个HTML文本匹配YouTube ID
+        # 因为有时候 RSSHub 返回的 description 里只有纯文本链接，没有 <a> 标签
+        # 匹配 youtube.com/watch?v=xxx 或 youtu.be/xxx
+        patterns = [
+            r'youtube\.com/watch\?v=([\w-]{11})',
+            r'youtu\.be/([\w-]{11})',
+            r'youtube\.com/embed/([\w-]{11})',
+            r'youtube\.com/v/([\w-]{11})'
+        ]
+        
+        found_ids = set()
+        # 先搜 soup 里的 a 标签
         for a in soup.find_all("a", href=True):
-            m = re.search(r'(?:youtube\.com/watch\?v=|youtu\.be/)([\w-]{11})', a["href"])
-            if m:
-                yt_thumb = f"https://i.ytimg.com/vi/{m.group(1)}/hqdefault.jpg"
-                if yt_thumb not in urls:
-                    urls.append(yt_thumb)
+            for pat in patterns:
+                m = re.search(pat, a["href"])
+                if m: found_ids.add(m.group(1))
+
+        # 再暴力搜全文（兜底）
+        for pat in patterns:
+            for vid_id in re.findall(pat, html):
+                found_ids.add(vid_id)
+
+        # 构造封面地址
+        for vid_id in found_ids:
+            # 存两个分辨率，优先高清(maxres)，其次中等(hq)，防止maxres不存在
+            u1 = f"https://i.ytimg.com/vi/{vid_id}/maxresdefault.jpg"
+            u2 = f"https://i.ytimg.com/vi/{vid_id}/hqdefault.jpg"
+            if u1 not in urls: urls.append(u1)
+            if u2 not in urls: urls.append(u2)
+        
         return urls
 
     def strip_html(self, html):
@@ -506,21 +528,48 @@ class CardGen:
         self._draw_avatar_circle(im, PX, cy, AVT, avt_char, C_BLUE)
 
         # ---- 频道名 + 时间（同一行，模仿推特 "Name · 2h"） ----
+        # [修复] 强制截断超长频道名，防止和时间重叠乱码
         name_y = cy + (AVT - 20) // 2  # 垂直居中于头像
-        dr.text((CX, name_y), channel or "未知频道", font=fn, fill=C_NAME)
-
+        
+        display_name = channel or "未知频道"
+        # 去掉RSSHub可能附加的冗余后缀，让名字更短更干净
+        display_name = display_name.replace(" - Community Posts - YouTube", "").replace(" - YouTube", "")
+        
         if time_str:
-            name_w = d0.textlength(channel or "未知频道", font=fn)
             dot = " · "
-            dot_w = d0.textlength(dot, font=ft)
+            # 预留给时间和点的宽度
             time_w = d0.textlength(time_str, font=ft)
-            if name_w + dot_w + time_w <= CW:
-                # 名字后面跟 · 时间
-                dr.text((CX + name_w, name_y + 1), dot, font=ft, fill=C_GRAY)
-                dr.text((CX + name_w + dot_w, name_y + 1), time_str, font=ft, fill=C_GRAY)
-            else:
-                # 放不下就右对齐
-                dr.text((W - PX - time_w, name_y + 1), time_str, font=ft, fill=C_GRAY)
+            dot_w = d0.textlength(dot, font=ft)
+            
+            # 计算名字最大允许宽度 = 总宽度 - 时间宽 - 点宽 - 缓冲(10px)
+            max_name_w = CW - time_w - dot_w - 10
+            
+            # 测量当前名字宽度
+            current_w = d0.textlength(display_name, font=fn)
+            
+            # 如果名字太长，就循环截断直到放得下
+            if current_w > max_name_w:
+                while current_w > max_name_w and len(display_name) > 1:
+                    display_name = display_name[:-1]
+                    current_w = d0.textlength(display_name + "...", font=fn)
+                display_name += "..."
+            
+            # 绘制名字
+            dr.text((CX, name_y), display_name, font=fn, fill=C_NAME)
+            
+            # 紧接着绘制 · 时间
+            final_name_w = d0.textlength(display_name, font=fn)
+            dr.text((CX + final_name_w, name_y + 1), dot, font=ft, fill=C_GRAY)
+            dr.text((CX + final_name_w + dot_w, name_y + 1), time_str, font=ft, fill=C_GRAY)
+        else:
+            # 没有时间，直接画名字（也要防止超长）
+            current_w = d0.textlength(display_name, font=fn)
+            if current_w > CW:
+                while current_w > CW and len(display_name) > 1:
+                    display_name = display_name[:-1]
+                    current_w = d0.textlength(display_name + "...", font=fn)
+                display_name += "..."
+            dr.text((CX, name_y), display_name, font=fn, fill=C_NAME)
 
         cy += max(AVT, 24) + 10
 
@@ -841,14 +890,21 @@ class MyRssPlugin(Star):
     async def _make_card_b64(self, item: RSSItem) -> str:
         tb = None
         if self.read_pic and item.pic_urls:
-            try:
-                conn = aiohttp.TCPConnector(ssl=False)
-                async with aiohttp.ClientSession(trust_env=True, connector=conn) as s:
-                    async with s.get(item.pic_urls[0], timeout=aiohttp.ClientTimeout(total=15)) as r:
-                        if r.status == 200:
-                            tb = await r.read()
-            except Exception:
-                pass
+            # [修改] 遍历图片列表尝试下载，直到成功一个
+            # 解决YouTube封面可能是404的问题
+            conn = aiohttp.TCPConnector(ssl=False)
+            async with aiohttp.ClientSession(trust_env=True, connector=conn) as s:
+                for pu in item.pic_urls:
+                    try:
+                        async with s.get(pu, timeout=aiohttp.ClientTimeout(total=5)) as r:
+                            if r.status == 200:
+                                data = await r.read()
+                                # 简单校验数据长度，防止下载到空的
+                                if len(data) > 100: 
+                                    tb = data
+                                    break
+                    except Exception:
+                        continue
         return self.card.make(
             channel=item.chan_title,
             title=item.title,
