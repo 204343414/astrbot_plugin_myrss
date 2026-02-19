@@ -295,188 +295,238 @@ class CardGen:
             if current_line:
                 lines.append(current_line)
         return lines
+    def _round_image(self, img, radius=14):
+        """给图片加圆角效果
+        原理：画一个圆角矩形白色蒙版，把图片贴进去
+        需要 Pillow>=8.2（rounded_rectangle 支持）
+        """
+        img = img.convert("RGBA")
+        w, h = img.size
+        mask = Image.new("L", (w, h), 0)
+        md = ImageDraw.Draw(mask)
+        md.rounded_rectangle([(0, 0), (w - 1, h - 1)], radius=radius, fill=255)
+        white = Image.new("RGBA", (w, h), (255, 255, 255, 255))
+        white.paste(img, mask=mask)
+        return white.convert("RGB")
 
+    def _draw_avatar_circle(self, im, x, y, size, char, color):
+        """在图片上绘制一个带文字的圆形头像
+        用4x超采样画大圆再缩小，实现抗锯齿的平滑圆形边缘
+        char: 圆心里显示的字符（频道名首字）
+        color: 圆形的RGB背景色
+        """
+        scale = 4
+        big = Image.new("RGBA", (size * scale, size * scale), (0, 0, 0, 0))
+        bd = ImageDraw.Draw(big)
+        bd.ellipse([(0, 0), (size * scale - 1, size * scale - 1)], fill=color + (255,))
+        big = big.resize((size, size), Image.LANCZOS)
+        im.paste(big, (x, y), big)
+        # 在圆心画字
+        d = ImageDraw.Draw(im)
+        font = self._f(int(size * 0.42))
+        try:
+            bbox = font.getbbox(char)
+            cw = bbox[2] - bbox[0]
+            ch = bbox[3] - bbox[1]
+            d.text((x + (size - cw) / 2 - bbox[0], y + (size - ch) / 2 - bbox[1]),
+                   char, font=font, fill=(255, 255, 255))
+        except Exception:
+            d.text((x + size // 4, y + size // 4), "?", font=font, fill=(255, 255, 255))
+
+    def _format_time(self, ts_str):
+        """把RSS的长时间字符串简化成 YYYY-MM-DD HH:MM 格式
+        失败则原样截断返回，保证不崩溃
+        """
+        if not ts_str:
+            return ""
+        try:
+            from email.utils import parsedate_to_datetime
+            dt = parsedate_to_datetime(ts_str)
+            return dt.strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            pass
+        for fmt in ["%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S.%f%z"]:
+            try:
+                dt = datetime.strptime(ts_str.replace("Z", "+0000"), fmt)
+                return dt.strftime("%Y-%m-%d %H:%M")
+            except Exception:
+                continue
+        return ts_str[:25] if len(ts_str) > 25 else ts_str
     def make(self, channel="", title="", desc="", link="", ts="", thumb=None):
-        # ================= 配置区 =================
-        # 配色方案 (仿流行社交App设计)
-        COLOR_BG = (242, 244, 247)      # 整体背景灰
-        COLOR_CARD = (255, 255, 255)    # 卡片白
-        COLOR_TITLE = (33, 33, 33)      # 标题黑
-        COLOR_TEXT = (51, 51, 51)       # 正文深灰
-        COLOR_META = (144, 147, 153)    # 元数据浅灰
-        COLOR_ACCENT = (255, 102, 0) if "rsshub" in link else (0, 122, 255) # 强调色
-        
-        # 尺寸
-        width = self.w
-        padding = 24       # 内容内边距
-        card_margin = 16   # 卡片外边距
-        
-        # 字体大小
-        f_name = self._f(18)  # 频道名
-        f_time = self._f(12)  # 时间
-        f_title = self._f(20) # 标题（加粗感）
-        f_text = self._f(16)  # 正文
-        f_link = self._f(12)  # 底部链接
-        
-        # ================= 1. 预计算高度 =================
-        # 用于测量的画布
-        canvas = Image.new("RGB", (1, 1))
-        draw = ImageDraw.Draw(canvas)
-        
-        # 内容可用宽度
-        content_width = width - (card_margin * 2) - (padding * 2)
-        
-        # --- A. 头部 (频道名 + 时间) ---
-        # 模拟头像：画一个圆形色块
-        avatar_size = 40
-        header_height = avatar_size
-        
-        # --- B. 标题 ---
-        title_lines = self._wrap(title, f_title, content_width, draw)
-        # 只有当标题和正文不一样，且标题不是"无标题"时才显示
-        show_title = title and title != "无标题" and title != desc
-        title_block_h = (len(title_lines) * 30 + 10) if show_title else 0
-        
-        # --- C. 正文 ---
-        # 限制正文最大行数，防止刷屏，比如最多显示15行
-        desc_lines = self._wrap(desc or "", f_text, content_width, draw)
-        if len(desc_lines) > 20:
-            desc_lines = desc_lines[:20]
-            desc_lines.append("...... (内容过长，请查看原文)")
-        desc_block_h = (len(desc_lines) * 26 + 10) if desc_lines else 0
-        
-        # --- D. 图片 ---
-        processed_thumb = None
-        thumb_h = 0
+        """生成 Twitter/X 风格的动态卡片
+
+        布局（模仿推特时间线的单条推文）:
+        ┌──────────────────────────────────┐
+        │  [●]  频道名 · 2025-02-19 19:54  │
+        │       正文正文正文正文正文        │
+        │       正文正文...                │
+        │       ╭────────────────────╮     │
+        │       │   图片(圆角14px)    │     │
+        │       ╰────────────────────╯     │
+        │  ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─  │
+        │       🔗 来源链接                │
+        └──────────────────────────────────┘
+        多条拼合后底部分割线连成连续时间线。
+        """
+        # ============ Twitter/X 精确配色 ============
+        BG       = (255, 255, 255)       # 背景纯白
+        C_NAME   = (15, 20, 25)          # 名字黑 (#0F1419)
+        C_BODY   = (15, 20, 25)          # 正文黑
+        C_GRAY   = (83, 100, 113)        # 副文字灰 (#536471)
+        C_BORDER = (239, 243, 244)       # 分割线 (#EFF3F4)
+        C_BLUE   = (29, 155, 240)        # Twitter蓝 (#1D9BF0)
+
+        # ============ 布局常量 ============
+        W   = self.w                     # 卡片总宽度(默认480)
+        PX  = 16                         # 左右内边距
+        PY  = 14                         # 上下内边距
+        AVT = 48                         # 头像直径
+        GAP = 12                         # 头像和内容之间水平间距
+        CX  = PX + AVT + GAP            # 内容区起始X坐标
+        CW  = W - CX - PX               # 内容区可用宽度
+
+        # ============ 字体 ============
+        fn = self._f(15)                 # 频道名
+        ft = self._f(13)                 # 时间
+        fb = self._f(15)                 # 正文
+        fm = self._f(12)                 # 底部链接
+
+        # ============ 1. 预计算文本换行 ============
+        tmp = Image.new("RGB", (1, 1))
+        d0 = ImageDraw.Draw(tmp)
+
+        # Twitter 没有标题/正文之分，合并成一段
+        body = ""
+        if title and title not in ("无标题", ""):
+            body = title
+            # 如果描述和标题不同，追加描述
+            if desc and desc.strip() and desc.strip() != title.strip():
+                body += "\n\n" + desc.strip()
+        elif desc:
+            body = desc.strip()
+
+        body_lines = self._wrap(body, fb, CW, d0)
+        # 限制最大行数，防止超长刷屏
+        MAX_LINES = 25
+        if len(body_lines) > MAX_LINES:
+            body_lines = body_lines[:MAX_LINES]
+            body_lines.append("……")
+
+        LINE_H = 22  # 正文行高(px)
+
+        # ============ 2. 处理缩略图 ============
+        pic = None
+        pic_h = 0
         if thumb:
             try:
-                # 读取图片
-                img_data = BytesIO(thumb)
-                src_img = Image.open(img_data).convert("RGBA")
-                
-                # 计算等比缩放
-                src_w, src_h = src_img.size
-                ratio = content_width / src_w
-                new_h = int(src_h * ratio)
-                
-                # 限制最大高度 (例如不超过宽度的1.5倍)，避免长图炸裂
-                max_img_h = int(content_width * 1.5)
-                
-                # 高质量缩放
-                src_img = src_img.resize((content_width, new_h), Image.LANCZOS)
-                
-                # 如果图片过高，进行裁剪（保留顶部）
-                if new_h > max_img_h:
-                    src_img = src_img.crop((0, 0, content_width, max_img_h))
-                    new_h = max_img_h
-                
-                # 创建白色底图（防止透明图变黑）
-                bg = Image.new("RGBA", src_img.size, (255, 255, 255))
-                processed_thumb = Image.alpha_composite(bg, src_img).convert("RGB")
-                thumb_h = new_h + 16 # 图片高度 + 下方间距
-            except Exception:
-                processed_thumb = None
-        
-        # --- E. 底部 ---
-        footer_h = 30 if link else 0
-        
-        # 计算卡片总高度
-        card_content_h = (padding 
-                          + header_height + 16  # 头部 + 间距
-                          + title_block_h 
-                          + desc_block_h 
-                          + thumb_h 
-                          + footer_h 
-                          + padding)
-        
-        total_height = card_content_h + (card_margin * 2)
-        
-        # ================= 2. 绘制 =================
-        # 创建背景
-        im = Image.new("RGB", (width, total_height), COLOR_BG)
-        d = ImageDraw.Draw(im)
-        
-        # 绘制卡片阴影 (简单的向右下偏移灰色矩形)
-        shadow_offset = 4
-        d.rectangle(
-            [(card_margin + shadow_offset, card_margin + shadow_offset), 
-             (width - card_margin + shadow_offset, total_height - card_margin + shadow_offset)],
-            fill=(220, 222, 226)
-        )
-        
-        # 绘制卡片主体 (白色矩形)
-        card_x0, card_y0 = card_margin, card_margin
-        card_x1, card_y1 = width - card_margin, total_height - card_margin
-        d.rectangle([card_x0, card_y0, card_x1, card_y1], fill=COLOR_CARD, outline=(230, 230, 230))
-        
-        # 游标 Y
-        cy = card_y0 + padding
-        cx = card_x0 + padding
-        
-        # --- 绘制头部 ---
-        # 1. 头像圈 (取频道名首字)
-        first_char = channel[0].upper() if channel else "R"
-        d.ellipse([cx, cy, cx + avatar_size, cy + avatar_size], fill=COLOR_ACCENT)
-        # 头像文字居中
-        char_w = d.textlength(first_char, font=f_title)
-        # 垂直居中稍微有点trick，简单处理
-        d.text((cx + (avatar_size - char_w)/2, cy + 6), first_char, font=f_title, fill=(255,255,255))
-        
-        # 2. 频道名 & 时间
-        text_x = cx + avatar_size + 12
-        d.text((text_x, cy), channel, font=f_name, fill=COLOR_TITLE)
-        
-        # 处理时间显示
-        time_str = str(ts)
-        try:
-            if isinstance(ts, int) and ts > 0:
-                # 简单格式化时间戳
-                import time
-                time_str = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
-        except:
-            pass
-        d.text((text_x, cy + 24), "🕒 " + time_str, font=f_time, fill=COLOR_META)
-        
-        cy += header_height + 16
-        
-        # --- 绘制标题 ---
-        if show_title:
-            for line in title_lines:
-                d.text((cx, cy), line, font=f_title, fill=COLOR_TITLE)
-                cy += 30
-            cy += 10
-            
-        # --- 绘制正文 ---
-        if desc_lines:
-            for line in desc_lines:
-                d.text((cx, cy), line, font=f_text, fill=COLOR_TEXT)
-                cy += 26
-            cy += 10
-            
-        # --- 绘制图片 ---
-        if processed_thumb:
-            # 粘贴图片
-            im.paste(processed_thumb, (int(cx), int(cy)))
-            # 画一个极细的边框让图片不显得突兀
-            d.rectangle([cx, cy, cx + content_width, cy + processed_thumb.height], outline=(230, 230, 230))
-            cy += processed_thumb.height + 16
-            
-        # --- 绘制分割线和底部 ---
-        if link:
-            d.line([cx, cy, cx + content_width, cy], fill=(240, 240, 240), width=1)
-            cy += 10
-            # 链接
-            link_txt = link
-            if len(link_txt) > 60:
-                link_txt = link_txt[:60] + "..."
-            d.text((cx, cy), "🔗 来源: " + link_txt, font=f_link, fill=COLOR_META)
+                src = Image.open(BytesIO(thumb))
+                # 统一转RGBA，处理透明PNG
+                if src.mode != "RGBA":
+                    src = src.convert("RGBA")
 
-        # 输出
+                ratio = CW / src.width
+                new_h = int(src.height * ratio)
+                # 限制最大高度，防竖长图撑爆卡片
+                max_h = int(CW * 1.3)
+                src = src.resize((CW, min(new_h, max_h)), Image.LANCZOS)
+                if new_h > max_h:
+                    src = src.crop((0, 0, CW, max_h))
+                    new_h = max_h
+
+                # 把透明图合成到白底上（防止透明区域变黑）
+                white_bg = Image.new("RGBA", (CW, min(new_h, max_h)), (255, 255, 255, 255))
+                try:
+                    white_bg.paste(src, mask=src.split()[3])
+                except Exception:
+                    white_bg.paste(src)
+                # 加圆角
+                pic = self._round_image(white_bg.convert("RGB"), radius=14)
+                pic_h = pic.height
+            except Exception:
+                pic = None
+
+        # 格式化时间
+        time_str = self._format_time(ts)
+
+        # ============ 3. 计算总高度 ============
+        H = PY                                   # 上边距
+        H += max(AVT, 24)                        # 头部区(头像高度或名字行高)
+        H += 10                                  # 头部→正文间距
+        if body_lines:
+            H += len(body_lines) * LINE_H + 12   # 正文 + 底部间距
+        if pic:
+            H += pic_h + 14                      # 图片 + 底部间距
+        H += 1 + 10                              # 分割线 + 间距
+        if link:
+            H += 18 + 4                          # 链接行
+        H += PY                                  # 下边距
+
+        # ============ 4. 绘制画布 ============
+        im = Image.new("RGB", (W, H), BG)
+        dr = ImageDraw.Draw(im)
+        cy = PY  # 当前Y游标
+
+        # ---- 头像 ----
+        avt_char = "?"
+        for c in (channel or ""):
+            if c.strip():
+                avt_char = c
+                break
+        self._draw_avatar_circle(im, PX, cy, AVT, avt_char, C_BLUE)
+
+        # ---- 频道名 + 时间（同一行，模仿推特 "Name · 2h"） ----
+        name_y = cy + (AVT - 20) // 2  # 垂直居中于头像
+        dr.text((CX, name_y), channel or "未知频道", font=fn, fill=C_NAME)
+
+        if time_str:
+            name_w = d0.textlength(channel or "未知频道", font=fn)
+            dot = " · "
+            dot_w = d0.textlength(dot, font=ft)
+            time_w = d0.textlength(time_str, font=ft)
+            if name_w + dot_w + time_w <= CW:
+                # 名字后面跟 · 时间
+                dr.text((CX + name_w, name_y + 1), dot, font=ft, fill=C_GRAY)
+                dr.text((CX + name_w + dot_w, name_y + 1), time_str, font=ft, fill=C_GRAY)
+            else:
+                # 放不下就右对齐
+                dr.text((W - PX - time_w, name_y + 1), time_str, font=ft, fill=C_GRAY)
+
+        cy += max(AVT, 24) + 10
+
+        # ---- 正文 ----
+        if body_lines:
+            for line in body_lines:
+                dr.text((CX, cy), line, font=fb, fill=C_BODY)
+                cy += LINE_H
+            cy += 12
+
+        # ---- 图片（圆角） ----
+        if pic:
+            im.paste(pic, (CX, cy))
+            # 加圆角边框线，让图片边缘更清晰
+            dr.rounded_rectangle(
+                [(CX, cy), (CX + CW - 1, cy + pic_h - 1)],
+                radius=14, outline=C_BORDER, width=1
+            )
+            cy += pic_h + 14
+
+        # ---- 分割线 ----
+        dr.line([(PX, cy), (W - PX, cy)], fill=C_BORDER, width=1)
+        cy += 10
+
+        # ---- 链接 ----
+        if link:
+            lk = link if len(link) <= 50 else link[:50] + "..."
+            dr.text((CX, cy), "🔗 " + lk, font=fm, fill=C_BLUE)
+            cy += 22
+
+        # 底部边线（多条拼合时充当条目间分隔线，像推特时间线的灰线）
+        dr.line([(0, H - 1), (W, H - 1)], fill=C_BORDER, width=1)
+
         buf = BytesIO()
         im.save(buf, format="PNG")
         buf.seek(0)
         return base64.b64encode(buf.read()).decode()
-
 
 @register("astrbot_plugin_myrss", "MyRSS", "RSS订阅插件(LLM增强版)", "1.0.0", "")
 class MyRssPlugin(Star):
@@ -768,21 +818,24 @@ class MyRssPlugin(Star):
             return ""
 
         width = max(im.width for im in imgs)
-        pad = 12
+        # [修改] 间距设为0，让每条卡片底部自带的分割线直接充当
+        # 条目之间的分隔，拼出来就像推特时间线一样无缝衔接
+        pad = 0
         resized = []
-        total_h = pad
+        total_h = 0
         for im in imgs:
             if im.width != width:
                 nh = int(im.height * (width / im.width))
                 im = im.resize((width, nh), Image.LANCZOS)
             resized.append(im)
-            total_h += im.height + pad
+            total_h += im.height
 
+        # [修改] 白底画布，间距为0紧密拼接
         canvas = Image.new("RGB", (width, total_h), (255, 255, 255))
-        y = pad
+        y = 0
         for im in resized:
             canvas.paste(im, (0, y))
-            y += im.height + pad
+            y += im.height
 
         out = BytesIO()
         canvas.save(out, format="PNG")
