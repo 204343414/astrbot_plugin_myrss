@@ -261,162 +261,221 @@ class CardGen:
         return ImageFont.load_default()
 
     def _wrap(self, txt, font, mw, draw):
+        # [修复] 更健壮的换行逻辑，防止某些特殊字符导致崩溃
         if not txt:
             return []
         lines = []
-        for para in txt.split("\n"):
-            if not para.strip():
+        # 将文本按段落分割，保留空行
+        paragraphs = txt.split("\n")
+        
+        for para in paragraphs:
+            # 移除首尾空白，但如果是空行则保留高度
+            if not para:
                 lines.append("")
                 continue
-            buf = ""
-            for ch in para:
-                t = buf + ch
-                if draw.textbbox((0, 0), t, font=font)[2] > mw and buf:
-                    lines.append(buf)
-                    buf = ch
+            
+            # 逐字扫描
+            current_line = ""
+            for char in para:
+                # 尝试加入字符
+                test_line = current_line + char
+                # 获取宽度
+                w = draw.textlength(test_line, font=font)
+                if w > mw:
+                    # 如果超宽，且当前行不为空，则推入上一行
+                    if current_line:
+                        lines.append(current_line)
+                        current_line = char
+                    else:
+                        # 强制切断（针对超长连续字符）
+                        lines.append(char)
+                        current_line = ""
                 else:
-                    buf = t
-            if buf:
-                lines.append(buf)
+                    current_line = test_line
+            if current_line:
+                lines.append(current_line)
         return lines
 
-def make(self, channel="", title="", desc="", link="", ts="", thumb=None):
-    # [美化] 调整了整体布局，使其看起来像社交媒体的信息流卡片
-    pad = 30  # 增加边距，让画面呼吸感更强
-    cw = self.w - 2 * pad
-    
-    # 字体配置：标题大且重，正文适中，元数据（来源/时间）小且灰
-    # 注意：这里沿用了你原本的 _f 方法获取字体
-    font_source = self._f(16) 
-    font_title = self._f(22)
-    font_desc = self._f(15)
-    font_meta = self._f(12)
-
-    # 1. 预计算高度
-    tmp = Image.new("RGB", (1, 1))
-    d = ImageDraw.Draw(tmp)
-    
-    # 自动换行处理
-    tl = self._wrap(title, font_title, cw, d)
-    
-    # 限制描述文字长度，太长了做成长图不好看，限制约10行
-    dl = self._wrap((desc or "").strip(), font_desc, cw, d)
-    if len(dl) > 10:
-        dl = dl[:10]
-        dl[-1] = dl[-1].rstrip() + "..."
-
-    # 处理图片缩放
-    th = None
-    th_h = 0
-    if thumb:
+    def make(self, channel="", title="", desc="", link="", ts="", thumb=None):
+        # ================= 配置区 =================
+        # 配色方案 (仿流行社交App设计)
+        COLOR_BG = (242, 244, 247)      # 整体背景灰
+        COLOR_CARD = (255, 255, 255)    # 卡片白
+        COLOR_TITLE = (33, 33, 33)      # 标题黑
+        COLOR_TEXT = (51, 51, 51)       # 正文深灰
+        COLOR_META = (144, 147, 153)    # 元数据浅灰
+        COLOR_ACCENT = (255, 102, 0) if "rsshub" in link else (0, 122, 255) # 强调色
+        
+        # 尺寸
+        width = self.w
+        padding = 24       # 内容内边距
+        card_margin = 16   # 卡片外边距
+        
+        # 字体大小
+        f_name = self._f(18)  # 频道名
+        f_time = self._f(12)  # 时间
+        f_title = self._f(20) # 标题（加粗感）
+        f_text = self._f(16)  # 正文
+        f_link = self._f(12)  # 底部链接
+        
+        # ================= 1. 预计算高度 =================
+        # 用于测量的画布
+        canvas = Image.new("RGB", (1, 1))
+        draw = ImageDraw.Draw(canvas)
+        
+        # 内容可用宽度
+        content_width = width - (card_margin * 2) - (padding * 2)
+        
+        # --- A. 头部 (频道名 + 时间) ---
+        # 模拟头像：画一个圆形色块
+        avatar_size = 40
+        header_height = avatar_size
+        
+        # --- B. 标题 ---
+        title_lines = self._wrap(title, f_title, content_width, draw)
+        # 只有当标题和正文不一样，且标题不是"无标题"时才显示
+        show_title = title and title != "无标题" and title != desc
+        title_block_h = (len(title_lines) * 30 + 10) if show_title else 0
+        
+        # --- C. 正文 ---
+        # 限制正文最大行数，防止刷屏，比如最多显示15行
+        desc_lines = self._wrap(desc or "", f_text, content_width, draw)
+        if len(desc_lines) > 20:
+            desc_lines = desc_lines[:20]
+            desc_lines.append("...... (内容过长，请查看原文)")
+        desc_block_h = (len(desc_lines) * 26 + 10) if desc_lines else 0
+        
+        # --- D. 图片 ---
+        processed_thumb = None
+        thumb_h = 0
+        if thumb:
+            try:
+                # 读取图片
+                img_data = BytesIO(thumb)
+                src_img = Image.open(img_data).convert("RGBA")
+                
+                # 计算等比缩放
+                src_w, src_h = src_img.size
+                ratio = content_width / src_w
+                new_h = int(src_h * ratio)
+                
+                # 限制最大高度 (例如不超过宽度的1.5倍)，避免长图炸裂
+                max_img_h = int(content_width * 1.5)
+                
+                # 高质量缩放
+                src_img = src_img.resize((content_width, new_h), Image.LANCZOS)
+                
+                # 如果图片过高，进行裁剪（保留顶部）
+                if new_h > max_img_h:
+                    src_img = src_img.crop((0, 0, content_width, max_img_h))
+                    new_h = max_img_h
+                
+                # 创建白色底图（防止透明图变黑）
+                bg = Image.new("RGBA", src_img.size, (255, 255, 255))
+                processed_thumb = Image.alpha_composite(bg, src_img).convert("RGB")
+                thumb_h = new_h + 16 # 图片高度 + 下方间距
+            except Exception:
+                processed_thumb = None
+        
+        # --- E. 底部 ---
+        footer_h = 30 if link else 0
+        
+        # 计算卡片总高度
+        card_content_h = (padding 
+                          + header_height + 16  # 头部 + 间距
+                          + title_block_h 
+                          + desc_block_h 
+                          + thumb_h 
+                          + footer_h 
+                          + padding)
+        
+        total_height = card_content_h + (card_margin * 2)
+        
+        # ================= 2. 绘制 =================
+        # 创建背景
+        im = Image.new("RGB", (width, total_height), COLOR_BG)
+        d = ImageDraw.Draw(im)
+        
+        # 绘制卡片阴影 (简单的向右下偏移灰色矩形)
+        shadow_offset = 4
+        d.rectangle(
+            [(card_margin + shadow_offset, card_margin + shadow_offset), 
+             (width - card_margin + shadow_offset, total_height - card_margin + shadow_offset)],
+            fill=(220, 222, 226)
+        )
+        
+        # 绘制卡片主体 (白色矩形)
+        card_x0, card_y0 = card_margin, card_margin
+        card_x1, card_y1 = width - card_margin, total_height - card_margin
+        d.rectangle([card_x0, card_y0, card_x1, card_y1], fill=COLOR_CARD, outline=(230, 230, 230))
+        
+        # 游标 Y
+        cy = card_y0 + padding
+        cx = card_x0 + padding
+        
+        # --- 绘制头部 ---
+        # 1. 头像圈 (取频道名首字)
+        first_char = channel[0].upper() if channel else "R"
+        d.ellipse([cx, cy, cx + avatar_size, cy + avatar_size], fill=COLOR_ACCENT)
+        # 头像文字居中
+        char_w = d.textlength(first_char, font=f_title)
+        # 垂直居中稍微有点trick，简单处理
+        d.text((cx + (avatar_size - char_w)/2, cy + 6), first_char, font=f_title, fill=(255,255,255))
+        
+        # 2. 频道名 & 时间
+        text_x = cx + avatar_size + 12
+        d.text((text_x, cy), channel, font=f_name, fill=COLOR_TITLE)
+        
+        # 处理时间显示
+        time_str = str(ts)
         try:
-            th = Image.open(BytesIO(thumb)).convert("RGB")
-            # 限制图片最大高度，防止竖长图占满屏幕
-            max_img_h = 600
-            r = cw / th.width
-            th_h = int(th.height * r)
-            if th_h > max_img_h:
-                # 如果太长，就进行裁剪或缩放，这里选择缩放限制高度
-                th_h = max_img_h
-                th = th.resize((cw, th_h), Image.LANCZOS)
-            else:
-                th = th.resize((cw, th_h), Image.LANCZOS)
-        except Exception:
-            th = None
-            th_h = 0
-
-    # 布局计算 Y 轴坐标
-    # 结构：[来源 | 时间] -> [标题] -> [图片] -> [正文] -> [底部链接]
-    current_h = pad
-    
-    # Header (Source + Time)
-    header_h = 20
-    current_h += header_h + 15 # 头部 + 间距
-
-    # Title
-    title_h = len(tl) * 30  # 行高
-    current_h += title_h + 15
-
-    # Image
-    if th:
-        current_h += th_h + 15
-    
-    # Desc
-    desc_h = len(dl) * 24
-    if dl:
-        current_h += desc_h + 15
+            if isinstance(ts, int) and ts > 0:
+                # 简单格式化时间戳
+                import time
+                time_str = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
+        except:
+            pass
+        d.text((text_x, cy + 24), "🕒 " + time_str, font=f_time, fill=COLOR_META)
         
-    # Footer (Link)
-    if link:
-        current_h += 20
+        cy += header_height + 16
         
-    current_h += pad # 底部padding
+        # --- 绘制标题 ---
+        if show_title:
+            for line in title_lines:
+                d.text((cx, cy), line, font=f_title, fill=COLOR_TITLE)
+                cy += 30
+            cy += 10
+            
+        # --- 绘制正文 ---
+        if desc_lines:
+            for line in desc_lines:
+                d.text((cx, cy), line, font=f_text, fill=COLOR_TEXT)
+                cy += 26
+            cy += 10
+            
+        # --- 绘制图片 ---
+        if processed_thumb:
+            # 粘贴图片
+            im.paste(processed_thumb, (int(cx), int(cy)))
+            # 画一个极细的边框让图片不显得突兀
+            d.rectangle([cx, cy, cx + content_width, cy + processed_thumb.height], outline=(230, 230, 230))
+            cy += processed_thumb.height + 16
+            
+        # --- 绘制分割线和底部 ---
+        if link:
+            d.line([cx, cy, cx + content_width, cy], fill=(240, 240, 240), width=1)
+            cy += 10
+            # 链接
+            link_txt = link
+            if len(link_txt) > 60:
+                link_txt = link_txt[:60] + "..."
+            d.text((cx, cy), "🔗 来源: " + link_txt, font=f_link, fill=COLOR_META)
 
-    h = current_h
-    
-    # 2. 开始绘制
-    # 背景色改为非常淡的灰白色，比纯白护眼，显得更有质感
-    bg_color = (250, 250, 250)
-    img = Image.new("RGB", (self.w, h), bg_color)
-    dr = ImageDraw.Draw(img)
-
-    y = pad
-    
-    # 绘制头部：来源（蓝色突出） 和 时间（灰色）
-    # 将时间戳格式化一下，如果不是时间戳则直接显示
-    time_str = ts
-    if isinstance(ts, int) and ts > 0:
-        # 你原本的代码逻辑里 ts 传进来可能是字符串也可能是解析后的
-        # 这里保持原样，假设 ts 是字符串。如果是时间戳整数，建议在外面转好
-        pass
-        
-    dr.text((pad, y), f"@{channel}", font=font_source, fill=(0, 122, 255)) # 蓝色高亮频道名
-    # 把时间画在右侧
-    if time_str:
-        time_w = d.textlength(str(time_str), font=font_meta)
-        dr.text((self.w - pad - time_w, y + 2), str(time_str), font=font_meta, fill=(150, 150, 150))
-        
-    y += header_h + 15
-
-    # 绘制标题 (深黑色，加重)
-    for line in tl:
-        dr.text((pad, y), line, font=font_title, fill=(30, 30, 30))
-        y += 30
-    y += 15
-
-    # 绘制图片
-    if th:
-        # 简单的圆角矩形遮罩效果太麻烦，这里直接画个边框装饰
-        img.paste(th, (pad, y))
-        # 给图片加一个极细的边框
-        dr.rectangle([(pad, y), (pad + cw, y + th_h)], outline=(220, 220, 220), width=1)
-        y += th_h + 15
-
-    # 绘制正文 (深灰色)
-    if dl:
-        for line in dl:
-            dr.text((pad, y), line, font=font_desc, fill=(60, 60, 60))
-            y += 24
-        y += 15
-
-    # 绘制底部链接
-    if link:
-        # 绘制一条分割线
-        dr.line([(pad, y), (self.w - pad, y)], fill=(230, 230, 230), width=1)
-        y += 10
-        # 截断过长的链接
-        disp_link = link
-        if len(disp_link) > 50:
-            disp_link = disp_link[:50] + "..."
-        dr.text((pad, y), "🔗 " + disp_link, font=font_meta, fill=(150, 150, 150))
-
-    # 绘制最外层边框 (卡片感)
-    dr.rectangle([(0, 0), (self.w - 1, h - 1)], outline=(220, 220, 220), width=2)
-
-    buf = BytesIO()
-    img.save(buf, format="PNG")
-    buf.seek(0)
-    return base64.b64encode(buf.read()).decode()
+        # 输出
+        buf = BytesIO()
+        im.save(buf, format="PNG")
+        buf.seek(0)
+        return base64.b64encode(buf.read()).decode()
 
 
 @register("astrbot_plugin_myrss", "MyRSS", "RSS订阅插件(LLM增强版)", "1.0.0", "")
