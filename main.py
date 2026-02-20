@@ -24,6 +24,10 @@ from astrbot.api.star import Context, Star, register
 from astrbot.api import AstrBotConfig
 import astrbot.api.message_components as Comp
 
+# [防冲突] 模块级变量追踪当前活跃的调度器
+# 插件热更新时新实例先通过此引用杀掉老调度器，避免新老并行双推
+_ACTIVE_SCHED = None
+
 
 @dataclass
 class RSSItem:
@@ -47,11 +51,25 @@ class DataHandler:
             with open(self.config_path, "w", encoding="utf-8") as f:
                 json.dump(d, f, indent=2, ensure_ascii=False)
             return d
+        # [防冲突] 共享读锁，等待排他写锁释放后再读，避免读到写了一半的JSON
         with open(self.config_path, "r", encoding="utf-8") as f:
+            try:
+                import fcntl
+                fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+            except (ImportError, OSError):
+                pass
             return json.load(f)
 
     def save(self):
+        # [防冲突] 文件排他锁，防止新老实例同时写JSON导致数据丢失
+        # 场景：老实例的job推送完更新seen_links写文件，同时新实例也在写→后写的覆盖前面的
+        # fcntl仅Linux/Mac可用，Windows环境静默跳过
         with open(self.config_path, "w", encoding="utf-8") as f:
+            try:
+                import fcntl
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            except (ImportError, OSError):
+                pass
             json.dump(self.data, f, indent=2, ensure_ascii=False)
 
     def get_subs(self, user_id):
@@ -640,16 +658,36 @@ class MyRssPlugin(Star):
         # 防并发锁，key = (url, user)
         self._locks: dict = {}
 
+        # [防冲突] 在创建新调度器前，先杀掉模块级残留的老调度器
+        # 场景：插件热更新时框架直接创建新实例，老实例的destroy()可能未被调用
+        # 如果不杀，老调度器继续运行老代码的job，和新调度器同时推送→双推
+        global _ACTIVE_SCHED
+        if _ACTIVE_SCHED is not None:
+            try:
+                if _ACTIVE_SCHED.running:
+                    _ACTIVE_SCHED.shutdown(wait=True)
+                    self.logger.warning("MyRSS: 已强制停止残留的老调度器 id=%s", id(_ACTIVE_SCHED))
+            except Exception:
+                pass
+            _ACTIVE_SCHED = None
+
         self.sched = AsyncIOScheduler()
+        _ACTIVE_SCHED = self.sched  # [防冲突] 注册为全局引用，下次init时可找到并销毁
         self.sched.start()
         self._reload_jobs()
 
     async def destroy(self):
         """插件卸载/禁用时停止调度器"""
+        global _ACTIVE_SCHED
         try:
             if self.sched.running:
-                self.sched.shutdown(wait=False)
+                # [防冲突] wait=True：等正在执行的job跑完再关，避免推送到一半被掐断
+                # 之前用wait=False会导致job还在跑但调度器已标记关闭，行为未定义
+                self.sched.shutdown(wait=True)
                 self.logger.info("MyRSS: 调度器已停止")
+            # [防冲突] 清除全局引用，防止下次init误杀已关闭的对象
+            if _ACTIVE_SCHED is self.sched:
+                _ACTIVE_SCHED = None
         except Exception as e:
             self.logger.error("MyRSS: 停止调度器失败: %s", e)
 
@@ -682,10 +720,19 @@ class MyRssPlugin(Star):
             max_hours = max(cron_to_hours(si["cron_expr"]) for si in subs.values())
             merged_cron = f"0 */{max_hours} * * *"
             # 每个URL只注册一个job，拉取后分发给所有订阅者
+            # [防冲突] id + replace_existing 保证同一个url在调度器里只有一个job
+            # 没有id时APScheduler会自动生成随机id，reload_jobs就无法识别"已存在"
+            # replace_existing=True：如果id已存在就替换而非报错，适配热更新场景
+            # misfire_grace_time=120：job错过触发时间后120秒内还可以补执行，超时则跳过
+            # 防止调度器shutdown/restart期间堆积的job全部同时涌入
+            job_id = f"myrss_{url}"
             self.sched.add_job(
                 self._cron_cb_url, "cron",
                 **self._cron(merged_cron),
-                args=[url]
+                args=[url],
+                id=job_id,
+                replace_existing=True,
+                misfire_grace_time=120,
             )
             self.logger.info("RSS调度: %s 每%d小时拉取，%d个订阅者", url, max_hours, len(subs))
 
@@ -983,10 +1030,9 @@ class MyRssPlugin(Star):
 
     async def _cron_cb_url(self, url: str) -> None:
         """每个URL只拉取一次，结果分发给所有订阅者"""
+        # [诊断] 打印实例ID和调度器ID，如果日志里同一url出现两个不同的id就是双实例并行
+        self.logger.info("RSS拉取开始: instance=%s sched=%s url=%s", id(self), id(self.sched), url)
         if url not in self.dh.data:
-            return
-        subs = self.dh.data[url].get("subscribers", {})
-        if not subs:
             return
 
         self.logger.info("RSS公共拉取: %s -> %d个订阅者", url, len(subs))
@@ -1012,6 +1058,11 @@ class MyRssPlugin(Star):
             await self._cron_cb_inner(url, user)
 
     async def _cron_cb_inner(self, url: str, user: str, prefetched_items=None) -> None:
+        # [防冲突] 每次推送前从磁盘重载数据，拿到最新的seen_links
+        # 原因：新老实例各持有独立的内存副本(self.dh.data)，
+        # 如果只读内存，老实例看不到新实例写入的seen_links→重复推送
+        self.dh.data = self.dh._load()
+
         if url not in self.dh.data or user not in self.dh.data[url].get("subscribers", {}):
             return
 
