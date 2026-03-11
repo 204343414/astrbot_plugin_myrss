@@ -1034,6 +1034,9 @@ class MyRssPlugin(Star):
         self.logger.info("RSS拉取开始: instance=%s sched=%s url=%s", id(self), id(self.sched), url)
         if url not in self.dh.data:
             return
+        subs = self.dh.data[url].get("subscribers", {})
+        if not subs:
+            return
 
         self.logger.info("RSS公共拉取: %s -> %d个订阅者", url, len(subs))
 
