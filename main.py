@@ -999,14 +999,18 @@ class MyRssPlugin(Star):
         comps = []
         tb = None
         if self.read_pic and item.pic_urls:
-            try:
-                conn = aiohttp.TCPConnector(ssl=False)
-                async with aiohttp.ClientSession(trust_env=True, connector=conn) as s:
-                    async with s.get(item.pic_urls[0], timeout=aiohttp.ClientTimeout(total=15)) as r:
-                        if r.status == 200:
-                            tb = await r.read()
-            except Exception:
-                pass
+            conn = aiohttp.TCPConnector(ssl=False)
+            async with aiohttp.ClientSession(trust_env=True, connector=conn) as s:
+                for pu in item.pic_urls:
+                    try:
+                        async with s.get(pu, timeout=aiohttp.ClientTimeout(total=5)) as r:
+                            if r.status == 200:
+                                data = await r.read()
+                                if len(data) > 100:
+                                    tb = data
+                                    break
+                    except Exception:
+                        continue
         try:
             b64 = self.card.make(
                 channel=item.chan_title, title=item.title, desc=item.description,
