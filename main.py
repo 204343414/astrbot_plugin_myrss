@@ -86,7 +86,11 @@ class DataHandler:
         title = root.xpath("//title")[0].text
         desc_nodes = root.xpath("//description")
         desc = desc_nodes[0].text if desc_nodes else ""
-        return title, desc or ""
+        avatar = ""
+        img_nodes = root.xpath("//channel/image/url")
+        if img_nodes and img_nodes[0].text:
+            avatar = img_nodes[0].text
+        return title, desc or "", avatar
 
     def strip_html_pic(self, html):
         """从HTML中提取所有图片URL，包含暴力正则匹配YouTube封面"""
@@ -418,7 +422,7 @@ class CardGen:
             except Exception:
                 continue
         return ts_str[:25] if len(ts_str) > 25 else ts_str
-    def make(self, channel="", title="", desc="", link="", ts="", thumb=None):
+    def make(self, channel="", title="", desc="", link="", ts="", thumb=None, avatar=None):
         """生成 Twitter/X 风格的动态卡片
 
         布局（模仿推特时间线的单条推文）:
@@ -538,12 +542,29 @@ class CardGen:
         cy = PY  # 当前Y游标
 
         # ---- 头像 ----
-        avt_char = "?"
-        for c in (channel or ""):
-            if c.strip():
-                avt_char = c
-                break
-        self._draw_avatar_circle(im, PX, cy, AVT, avt_char, C_BLUE)
+        if avatar and isinstance(avatar, bytes) and len(avatar) > 100:
+            try:
+                avt_img = Image.open(BytesIO(avatar)).convert("RGBA")
+                avt_img = avt_img.resize((AVT, AVT), Image.LANCZOS)
+                # 圆形裁剪
+                mask = Image.new("L", (AVT, AVT), 0)
+                md = ImageDraw.Draw(mask)
+                md.ellipse([(0, 0), (AVT - 1, AVT - 1)], fill=255)
+                white = Image.new("RGB", (AVT, AVT), (255, 255, 255))
+                white.paste(avt_img.convert("RGB"), mask=mask)
+                im.paste(white, (PX, cy))
+                # 画圆形边框
+                dr.ellipse([(PX, cy), (PX + AVT - 1, cy + AVT - 1)], outline=C_BORDER, width=1)
+            except Exception:
+                avt_char = (channel or "?")[0] if channel else "?"
+                self._draw_avatar_circle(im, PX, cy, AVT, avt_char, C_BLUE)
+        else:
+            avt_char = "?"
+            for c in (channel or ""):
+                if c.strip():
+                    avt_char = c
+                    break
+            self._draw_avatar_circle(im, PX, cy, AVT, avt_char, C_BLUE)
 
         # ---- 频道名 + 时间（同一行，模仿推特 "Name · 2h"） ----
         # [修复] 强制截断超长频道名，防止和时间重叠乱码
@@ -914,7 +935,7 @@ class MyRssPlugin(Star):
             if text is None:
                 return event.plain_result("无法访问: " + url + "\n请检查RSSHub端点是否可用。")
             try:
-                title, desc = self.dh.parse_channel_info(text)
+                title, desc, avatar = self.dh.parse_channel_info(text)
             except Exception as e:
                 return event.plain_result("解析失败: " + str(e))
             items = await self._poll(url)
@@ -929,12 +950,32 @@ class MyRssPlugin(Star):
                     "seen_links": [it.link for it in items if it.link][:200],
                 }
             },
-            "info": {"title": title, "description": desc},
+            "info": {"title": title, "description": desc, "avatar": avatar},
             }
         self.dh.save()
         return self.dh.data[url]["info"]
-
+    def _get_avatar_url(self, item: RSSItem) -> str:
+        """从存储的订阅数据里获取频道头像URL"""
+        for url, info in self.dh.data.items():
+            if url in ("rsshub_endpoints", "settings"):
+                continue
+            if info.get("info", {}).get("title") == item.chan_title:
+                return info.get("info", {}).get("avatar", "")
+        return ""
     async def _make_card_b64(self, item: RSSItem) -> str:
+        # 下载频道头像
+        avt_data = None
+        if item.chan_title and item.chan_title != "未知":
+            avt_url = self._get_avatar_url(item)
+            if avt_url:
+                try:
+                    conn = aiohttp.TCPConnector(ssl=False)
+                    async with aiohttp.ClientSession(trust_env=True, connector=conn) as s:
+                        async with s.get(avt_url, timeout=aiohttp.ClientTimeout(total=5)) as r:
+                            if r.status == 200:
+                                avt_data = await r.read()
+                except Exception:
+                    pass
         tb = None
         if self.read_pic and item.pic_urls:
             # [修改] 遍历图片列表尝试下载，直到成功一个
@@ -959,6 +1000,7 @@ class MyRssPlugin(Star):
             link="" if self.hide_url else item.link,
             ts=item.pubDate or "",
             thumb=tb,
+            avatar=avt_data,
         )
 
     def _merge_cards_b64(self, cards_b64: list) -> str:
@@ -1011,10 +1053,23 @@ class MyRssPlugin(Star):
                                     break
                     except Exception:
                         continue
+        # 下载频道头像
+        avt_data = None
+        avt_url = self._get_avatar_url(item)
+        if avt_url:
+            try:
+                conn2 = aiohttp.TCPConnector(ssl=False)
+                async with aiohttp.ClientSession(trust_env=True, connector=conn2) as s2:
+                    async with s2.get(avt_url, timeout=aiohttp.ClientTimeout(total=5)) as r2:
+                        if r2.status == 200:
+                            avt_data = await r2.read()
+            except Exception:
+                pass
         try:
             b64 = self.card.make(
                 channel=item.chan_title, title=item.title, desc=item.description,
                 link="" if self.hide_url else item.link, ts=item.pubDate or "", thumb=tb,
+                avatar=avt_data,
             )
             comps.append(Comp.Image.fromBase64(b64))
         except Exception as e:
