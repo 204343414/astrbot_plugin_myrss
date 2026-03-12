@@ -732,15 +732,24 @@ class MyRssPlugin(Star):
             if not subs:
                 continue
             # 取所有订阅者中间隔最大的cron（最保守，减少拉取频率）
-            def cron_to_hours(expr: str) -> int:
-                """从 '0 */N * * *' 提取N，失败返回1"""
+            def cron_to_minutes(expr: str) -> int:
+                """支持 */15 * * * * 和 0 */1 * * * 两种格式"""
                 try:
-                    return int(expr.split(" ")[1].replace("*/", ""))
+                    f = expr.split(" ")
+                    if f[0].startswith("*/"):
+                        return int(f[0][2:])
+                    if f[1].startswith("*/"):
+                        return int(f[1][2:]) * 60
+                    return 60
                 except Exception:
-                    return 1
+                    return 60
 
-            max_hours = max(cron_to_hours(si["cron_expr"]) for si in subs.values())
-            merged_cron = f"0 */{max_hours} * * *"
+            max_minutes = max(cron_to_minutes(si["cron_expr"]) for si in subs.values())
+
+            if max_minutes < 60:
+                merged_cron = f"*/{max_minutes} * * * *"
+            else:
+                merged_cron = f"0 */{max_minutes // 60} * * *"
             # 每个URL只注册一个job，拉取后分发给所有订阅者
             # [防冲突] id + replace_existing 保证同一个url在调度器里只有一个job
             # 没有id时APScheduler会自动生成随机id，reload_jobs就无法识别"已存在"
@@ -756,7 +765,10 @@ class MyRssPlugin(Star):
                 replace_existing=True,
                 misfire_grace_time=120,
             )
-            self.logger.info("RSS调度: %s 每%d小时拉取，%d个订阅者", url, max_hours, len(subs))
+            if max_minutes < 60:
+                self.logger.info("RSS调度: %s 每%d分钟拉取，%d个订阅者", url, max_minutes, len(subs))
+            else:
+                self.logger.info("RSS调度: %s 每%d小时拉取，%d个订阅者", url, max_minutes // 60, len(subs))
 
     async def _fetch(self, url: str):
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
@@ -1204,12 +1216,12 @@ class MyRssPlugin(Star):
     # ============================================================
 
     @filter.llm_tool(name="myrss_subscribe")
-    async def tool_sub(self, event: AstrMessageEvent, url: str = "https://example.com", interval: int = 1):
+    async def tool_sub(self, event: AstrMessageEvent, url: str = "https://example.com", interval: int = 15):
         """用户想订阅、关注、追踪某个网站或博主更新时调用。传入用户给的链接即可。
     
         Args:
             url(string): 用户提供的链接或路径
-            interval(int): 检查间隔(小时)，默认1
+            interval(int): 检查间隔(分钟)，默认15
         """
         if not url or url == "https://example.com":
             yield event.plain_result(
@@ -1242,27 +1254,45 @@ class MyRssPlugin(Star):
         else:
             yield event.plain_result("请提供http开头的链接或/开头的路由。")
             return
-        if interval < 1:
-            interval = 1
+        if interval < 15:
+            interval = 15
+
         # 如果已有订阅者，间隔只能取更大值（保护公共源）
         if furl in self.dh.data:
             existing_subs = self.dh.data[furl].get("subscribers", {})
             if existing_subs:
-                def cron_to_hours(expr: str) -> int:
+                def cron_to_minutes(expr: str) -> int:
                     try:
-                        return int(expr.split(" ")[1].replace("*/", ""))
+                        f = expr.split(" ")
+                        # */15 * * * *
+                        if f[0].startswith("*/"):
+                            return int(f[0][2:])
+                        # 0 */1 * * *
+                        if f[1].startswith("*/"):
+                            return int(f[1][2:]) * 60
+                        return 60
                     except Exception:
-                        return 1
-                max_existing = max(cron_to_hours(si["cron_expr"]) for si in existing_subs.values())
+                        return 60
+
+                max_existing = max(cron_to_minutes(si["cron_expr"]) for si in existing_subs.values())
                 if interval < max_existing:
                     interval = max_existing
-                    yield event.plain_result(f"⚠️ 已有订阅者使用{max_existing}小时间隔，为保护公共源已自动调整为{max_existing}小时。")
-        ret = await self._add(furl, "0 */" + str(interval) + " * * *", event)
+                    yield event.plain_result(f"⚠️ 已有订阅者使用{max_existing}分钟间隔，为保护公共源已自动调整为{max_existing}分钟。")
+
+        # 分钟制cron
+        if interval < 60:
+            cron_expr = f"*/{interval} * * * *"
+        else:
+            cron_expr = f"0 */{interval // 60} * * *"
+
+        ret = await self._add(furl, cron_expr, event)
         if isinstance(ret, MessageEventResult):
             yield ret
             return
         self._reload_jobs()
-        yield event.plain_result("✅ 订阅成功！\n📡 " + ret["title"] + "\n📝 " + ret["description"] + "\n⏰ 每" + str(interval) + "小时\n🔗 " + furl)
+        unit = "分钟" if interval < 60 else "小时"
+        show_interval = interval if interval < 60 else interval // 60
+        yield event.plain_result("✅ 订阅成功！\n📡 " + ret["title"] + "\n📝 " + ret["description"] + "\n⏰ 每" + str(show_interval) + unit + "\n🔗 " + furl)
 
     @filter.llm_tool(name="myrss_list")
     async def tool_list(self, event: AstrMessageEvent, query: str = "all"):
