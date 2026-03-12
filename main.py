@@ -1279,6 +1279,9 @@ class MyRssPlugin(Star):
 
         blocked = self._group_data.get("blocked_feeds", {})
         push_groups = [g for g in active_groups if feed_route not in blocked.get(g, [])]
+        # 如果某群已经“自己订阅”了同一个源，就不再给它推全局，避免重复
+        personal_subs = set(self.dh.data.get(url, {}).get("subscribers", {}).keys())
+        push_groups = [g for g in push_groups if g not in personal_subs]
         self.logger.info("[MyRSS] global push %d items to %d groups (skipped %d blocked)",
                         len(batch), len(push_groups), len(active_groups) - len(push_groups))
 
@@ -2096,3 +2099,31 @@ class MyRssPlugin(Star):
             yield event.chain_result([Comp.Node(uin=0, name="Astrbot", content=comps)]).use_t2i(self.t2i)
         else:
             yield event.chain_result(comps).use_t2i(self.t2i)
+    @myrss.command("groups")
+    async def cmd_groups(self, event: AstrMessageEvent):
+        """列出机器人加入的群（需要 aiocqhttp / NapCat）"""
+        try:
+            if event.get_platform_name() != "aiocqhttp":
+                yield event.plain_result("当前平台不支持获取群列表（仅 aiocqhttp/NapCat 支持）。")
+                return
+
+            client = getattr(event, "bot", None)
+            if not client:
+                yield event.plain_result("无法获取协议端 client。")
+                return
+
+            ret = await client.api.call_action("get_group_list", no_cache=False)
+            data = ret.get("data", []) if isinstance(ret, dict) else []
+            if not data:
+                yield event.plain_result("群列表为空，或协议端未返回数据。")
+                return
+
+            lines = ["📋 机器人所在群列表："]
+            for i, g in enumerate(data):
+                gid = g.get("group_id", "")
+                gname = g.get("group_name", "")
+                lines.append(f"{i}. {gname} ({gid})")
+
+            yield event.plain_result("\n".join(lines))
+        except Exception as e:
+            yield event.plain_result("获取群列表失败：" + str(e))
