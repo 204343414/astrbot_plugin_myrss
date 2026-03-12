@@ -728,6 +728,7 @@ class MyRssPlugin(Star):
         self.compose = config.get("compose", True)
         self.enable_comment = config.get("enable_comment", True)
         self.comment_provider_id = config.get("comment_provider_id", "")
+        self.comment_persona = config.get("comment_persona", "")
         self.comment_max_length = config.get("comment_max_length", 80)
         self.bot_qq = config.get("bot_qq", "")
         self.bot_provider_name = config.get("bot_provider_name", "")
@@ -1033,11 +1034,10 @@ class MyRssPlugin(Star):
             return self.comment_provider_id
         # 自动获取默认provider
         try:
-            provider = self.ctx.get_using_provider()
-            if provider:
-                meta = provider.meta()
-                if isinstance(meta, dict):
-                    return meta.get("id", "")
+            cfg = self.ctx.get_config()
+            default_id = cfg.get("provider_settings", {}).get("default_provider_id", "")
+            if default_id:
+                return default_id
         except Exception:
             pass
         return ""
@@ -1061,6 +1061,19 @@ class MyRssPlugin(Star):
             desc_short = item.description[:200]
             content_summary += "\n" + desc_short
 
+        # 获取人格设定
+        system_prompt = None
+        if self.comment_persona:
+            try:
+                cfg = self.ctx.get_config()
+                personas = cfg.get("persona", [])
+                for p in personas:
+                    if p.get("name") == self.comment_persona:
+                        system_prompt = p.get("prompt", "")
+                        break
+            except Exception:
+                pass
+
         prompt = (
             f"你正在看一条来自「{item.chan_title}」的动态更新，内容如下：\n"
             f"---\n{content_summary}\n---\n"
@@ -1072,6 +1085,7 @@ class MyRssPlugin(Star):
             resp = await self.ctx.llm_generate(
                 chat_provider_id=provider_id,
                 prompt=prompt,
+                system_prompt=system_prompt,
             )
             comment = (resp.completion_text or "").strip()
             # 截断
