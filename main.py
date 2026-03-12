@@ -734,6 +734,7 @@ class MyRssPlugin(Star):
         self.bot_provider_name = config.get("bot_provider_name", "")
         self.content_filter = config.get("content_filter", True)
         self._comment_cache = {}  # key=item_link, value=comment_text
+        self._safe_cache = {}  # key=item_link, value=bool(safe)
         # 活跃群检测（学新闻插件）
         self._active_groups = set()  # 内存中记录有人说话的群
         self._group_data_file = "data/astrbot_plugin_myrss_groups.json"
@@ -747,6 +748,7 @@ class MyRssPlugin(Star):
         self.global_feed_interval = max(config.get("global_feed_interval", 15), 5)
         self.global_feed_max_interval = max(config.get("global_feed_max_interval", 1440), self.global_feed_interval)
         self._feed_miss_count = {}  # key=url, value=连续无更新次数
+        self._feed_tick = {}  # key=url, value=触发次数（用于退避skip计数）
         self.push_delay_min = config.get("push_delay_min", 5.0)
         self.push_delay_max = config.get("push_delay_max", 8.0)
         self.filter_provider_id = config.get("filter_provider_id", "")
@@ -1129,6 +1131,7 @@ class MyRssPlugin(Star):
                 }
             self.dh.data[url]["global"] = True
             self._feed_miss_count[url] = 0
+            self._feed_tick[url] = 0
 
             # 用基础间隔注册，退避在job内部通过跳过实现
             base = self.global_feed_interval
@@ -1162,28 +1165,34 @@ class MyRssPlugin(Star):
         return min(current, self.global_feed_max_interval)
 
     def _should_skip_this_tick(self, url: str) -> bool:
-        """判断本次tick是否应该跳过（实现退避）"""
-        miss = self._feed_miss_count.get(url, 0)
-        if miss < 3:
-            return False  # 前3次不跳
+    """判断本次tick是否应该跳过（实现退避）
+    修复点：不能用 miss 做取模（skip 时 miss 不变，会导致永远 skip）
+    改为用 tick（每次触发都会增长）来决定“每N次触发执行一次”
+    """
+    miss = self._feed_miss_count.get(url, 0)
+    if miss < 3:
+        return False  # 前3次不跳
 
-        # 当前应该的间隔
-        current_interval = self._get_current_interval(url)
-        base = self.global_feed_interval
+    current_interval = self._get_current_interval(url)
+    base = self.global_feed_interval
+    if base <= 0:
+        return False
 
-        # 需要跳过的tick数 = (当前间隔/基础间隔) - 1
-        skip_ratio = current_interval // base
+    # 需要每多少次基础tick执行一次
+    skip_ratio = max(1, current_interval // base)
 
-        # 用miss计数来决定：每skip_ratio个tick执行一次
-        if miss % (skip_ratio if skip_ratio > 0 else 1) == 0:
-            return False
-        return True
+    tick = self._feed_tick.get(url, 0)
+    # 每 skip_ratio 次触发执行 1 次，其它时候跳过
+    return (tick % skip_ratio) != 0
 
     async def _global_feed_job(self, url: str):
-        """全局订阅的定时推送（带指数退避）"""
-        # 退避检查：是否跳过本次
-        if self._should_skip_this_tick(url):
-            return
+    """全局订阅的定时推送（带指数退避）"""
+    # tick自增：每次触发都+1，用于退避skip计数
+    self._feed_tick[url] = self._feed_tick.get(url, 0) + 1
+
+    # 退避检查：是否跳过本次
+    if self._should_skip_this_tick(url):
+        return
 
         current_interval = self._get_current_interval(url)
         miss = self._feed_miss_count.get(url, 0)
@@ -1382,6 +1391,9 @@ class MyRssPlugin(Star):
         """检查内容是否安全，不安全返回False"""
         if not self.content_filter:
             return True
+        cache_key = item.link or (item.title + "|" + str(item.pubDate_timestamp))
+        if cache_key in self._safe_cache:
+            return self._safe_cache[cache_key]
         # 硬编码关键词兜底（不依赖LLM）
         check_text = (item.title + " " + (item.description or "")).lower()
         unsafe_words = ["习近平", "共产党", "六四", "天安门", "法轮", "台独",
