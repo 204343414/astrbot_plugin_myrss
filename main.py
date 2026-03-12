@@ -1057,7 +1057,8 @@ class MyRssPlugin(Star):
                     return json.load(f)
             except Exception:
                 pass
-        return {"groups": {}}
+        return {"groups": {}, "blocked_feeds": {}}
+        # blocked_feeds 结构: { "群unified_id": ["/twitter/user/elonmusk", ...] }
 
     def _save_group_data(self):
         try:
@@ -1213,11 +1214,23 @@ class MyRssPlugin(Star):
         if not comps:
             return
 
-        # 推送给所有活跃群
+        # 推送给所有活跃群（排除屏蔽了该源的群）
         active_groups = self._get_active_groups()
-        self.logger.info("[MyRSS] global push %d items to %d groups", len(batch), len(active_groups))
+        # 从URL提取路由部分用于匹配屏蔽列表
+        eps = self.dh.data.get("rsshub_endpoints", [])
+        feed_route = url
+        for ep in eps:
+            ep = ep.rstrip("/")
+            if url.startswith(ep):
+                feed_route = url[len(ep):]
+                break
 
-        for group_id in active_groups:
+        blocked = self._group_data.get("blocked_feeds", {})
+        push_groups = [g for g in active_groups if feed_route not in blocked.get(g, [])]
+        self.logger.info("[MyRSS] global push %d items to %d groups (skipped %d blocked)",
+                        len(batch), len(push_groups), len(active_groups) - len(push_groups))
+
+        for group_id in push_groups:
             try:
                 pn = group_id.split(":")[0]
                 if pn == "aiocqhttp" and self.compose:
@@ -1316,7 +1329,7 @@ class MyRssPlugin(Star):
         if not self.content_filter:
             return True
 
-        provider_id = await self._get_provider_id()
+        provider_id = self.filter_provider_id if self.filter_provider_id else await self._get_provider_id()
         if not provider_id:
             return True  # 没有provider就不过滤，放行
 
@@ -1766,7 +1779,99 @@ class MyRssPlugin(Star):
             cr = self.dh.data[u]["subscribers"][user]["cron_expr"]
             txt += "  " + str(i) + ". " + info["title"] + " [" + cr + "]\n"
         yield event.plain_result(txt)
+    @filter.llm_tool(name="myrss_block_feed")
+    async def tool_block(self, event: AstrMessageEvent, feed_keyword: str = ""):
+        """当群友说不想看某个订阅源的推送时调用（如"别发推特了""不要马斯克的"）。
 
+        Args:
+            feed_keyword(string): 要屏蔽的源关键词（如elonmusk、flag__chan、bilibili等）
+        """
+        if not feed_keyword:
+            yield event.plain_result(
+                "请告诉我要屏蔽哪个源。当前全局订阅源：\n" +
+                "\n".join(f"  {i}. {r}" for i, r in enumerate(self.global_feeds)) +
+                "\n回复关键词即可屏蔽，如 'elonmusk' 或 'bilibili'"
+            )
+            return
+
+        group_id = event.unified_msg_origin
+        if "GroupMessage" not in group_id:
+            yield event.plain_result("此功能仅在群聊中可用。")
+            return
+
+        # 模糊匹配
+        matched = []
+        for route in self.global_feeds:
+            if feed_keyword.lower() in route.lower():
+                matched.append(route)
+
+        if not matched:
+            yield event.plain_result(
+                f"没找到包含 '{feed_keyword}' 的订阅源。当前全局源：\n" +
+                "\n".join(f"  {r}" for r in self.global_feeds)
+            )
+            return
+
+        blocked = self._group_data.setdefault("blocked_feeds", {})
+        group_blocked = blocked.setdefault(group_id, [])
+
+        newly_blocked = []
+        for route in matched:
+            if route not in group_blocked:
+                group_blocked.append(route)
+                newly_blocked.append(route)
+
+        if not newly_blocked:
+            yield event.plain_result("这些源在本群已经屏蔽了：\n" + "\n".join(matched))
+            return
+
+        self._save_group_data()
+        yield event.plain_result(
+            "已在本群屏蔽以下推送：\n" +
+            "\n".join(f"  ✅ {r}" for r in newly_blocked) +
+            "\n其他群不受影响。如需恢复，说"恢复推送xxx"即可。"
+        )
+
+    @filter.llm_tool(name="myrss_unblock_feed")
+    async def tool_unblock(self, event: AstrMessageEvent, feed_keyword: str = ""):
+        """当群友说想恢复某个被屏蔽的推送时调用。
+
+        Args:
+            feed_keyword(string): 要恢复的源关键词
+        """
+        group_id = event.unified_msg_origin
+        if "GroupMessage" not in group_id:
+            yield event.plain_result("此功能仅在群聊中可用。")
+            return
+
+        blocked = self._group_data.get("blocked_feeds", {})
+        group_blocked = blocked.get(group_id, [])
+
+        if not group_blocked:
+            yield event.plain_result("本群没有屏蔽任何全局推送源。")
+            return
+
+        if not feed_keyword:
+            yield event.plain_result(
+                "本群当前屏蔽的源：\n" +
+                "\n".join(f"  {i}. {r}" for i, r in enumerate(group_blocked)) +
+                "\n告诉我要恢复哪个即可。"
+            )
+            return
+
+        matched = [r for r in group_blocked if feed_keyword.lower() in r.lower()]
+        if not matched:
+            yield event.plain_result(f"没找到包含 '{feed_keyword}' 的已屏蔽源。")
+            return
+
+        for r in matched:
+            group_blocked.remove(r)
+        self._save_group_data()
+
+        yield event.plain_result(
+            "已在本群恢复以下推送：\n" +
+            "\n".join(f"  ✅ {r}" for r in matched)
+        )
     @filter.llm_tool(name="myrss_unsubscribe")
     async def tool_unsub(self, event: AstrMessageEvent, idx: int = 0):
         """取消订阅，先调用myrss_list获取编号。
