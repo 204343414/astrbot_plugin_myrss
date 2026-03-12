@@ -2172,6 +2172,18 @@ class MyRssPlugin(Star):
 
         # 第1步：拉取
         yield event.plain_result("📡 [1/4] 正在拉取 RSS...")
+        # [test] 先抓一次频道信息，写入 dh.data，让 _poll() 能拿到 chan_title（否则显示“未知”）
+        try:
+            txt = await self._fetch(url)
+            if txt:
+                t, d, a = self.dh.parse_channel_info(txt)
+                self.dh.data[url] = {
+                    "info": {"title": t, "description": d, "avatar": a},
+                    "subscribers": {},
+                    "is_test": True,
+                }
+        except Exception:
+            pass
         items = await self._poll(url, num=1)
         if not items:
             yield event.plain_result("❌ 拉取失败，源无内容或不可访问。")
