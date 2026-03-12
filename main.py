@@ -1078,7 +1078,7 @@ class MyRssPlugin(Star):
             f"你正在看一条来自「{item.chan_title}」的动态更新，内容如下：\n"
             f"---\n{content_summary}\n---\n"
             f"请用你的人设风格，对这条动态写一句简短锐评（{self.comment_max_length}字以内）。"
-            f"要求：自然、有个性、可以吐槽或夸奖。不要复述原文。不要加引号。"
+            f"要求：自然、有个性、可以吐槽或夸奖。不要复述原文。不要加引号。用中文表达。"
         )
 
         try:
