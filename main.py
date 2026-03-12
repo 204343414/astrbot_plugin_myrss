@@ -423,7 +423,7 @@ class CardGen:
             except Exception:
                 continue
         return ts_str[:25] if len(ts_str) > 25 else ts_str
-    def make(self, channel="", title="", desc="", link="", ts="", thumb=None, avatar=None):
+    def make(self, channel="", title="", desc="", link="", ts="", thumb=None, avatar=None, comment="", bot_avatar=None, bot_provider_name=""):
         """生成 Twitter/X 风格的动态卡片
 
         布局（模仿推特时间线的单条推文）:
@@ -535,7 +535,13 @@ class CardGen:
         H += 1 + 10                                            # 分割线 + 间距
         if link:
             H += 18 + 4                                        # 链接行
-        H += PY                                                # 下边距                          # 下边距
+        if comment:
+            H += 6 + 1 + 10                                    # 锐评分割线
+            comment_lines_est = min(3, max(1, len(comment) // 20 + 1))
+            H += max(32 + 8, comment_lines_est * 18 + 8)       # 锐评区域
+            if bot_provider_name:
+                H += 14
+        H += PY                                                # 下边距
 
         # ============ 4. 绘制画布 ============
         im = Image.new("RGB", (W, H), BG)
@@ -646,6 +652,53 @@ class CardGen:
             lk = link if len(link) <= 50 else link[:50] + "..."
             dr.text((CX, cy), "🔗 " + lk, font=fm, fill=C_BLUE)
             cy += 22
+        # ---- 锐评栏 ----
+        if comment:
+            cy += 6
+            dr.line([(PX, cy), (W - PX, cy)], fill=C_BORDER, width=1)
+            cy += 10
+
+            # bot头像（小圆形，32px）
+            bot_avt_size = 32
+            bot_avt_x = CX
+            if bot_avatar and isinstance(bot_avatar, bytes) and len(bot_avatar) > 100:
+                try:
+                    bavt = Image.open(BytesIO(bot_avatar)).convert("RGBA")
+                    bavt = bavt.resize((bot_avt_size, bot_avt_size), Image.LANCZOS)
+                    bmask = Image.new("L", (bot_avt_size, bot_avt_size), 0)
+                    bmd = ImageDraw.Draw(bmask)
+                    bmd.ellipse([(0, 0), (bot_avt_size - 1, bot_avt_size - 1)], fill=255)
+                    bwhite = Image.new("RGB", (bot_avt_size, bot_avt_size), (255, 255, 255))
+                    bwhite.paste(bavt.convert("RGB"), mask=bmask)
+                    im.paste(bwhite, (bot_avt_x, cy))
+                    dr.ellipse([(bot_avt_x, cy), (bot_avt_x + bot_avt_size - 1, cy + bot_avt_size - 1)], outline=C_BORDER, width=1)
+                except Exception:
+                    self._draw_avatar_circle(im, bot_avt_x, cy, bot_avt_size, "B", (100, 100, 100))
+            else:
+                self._draw_avatar_circle(im, bot_avt_x, cy, bot_avt_size, "B", (100, 100, 100))
+
+            # 锐评文字
+            comment_x = bot_avt_x + bot_avt_size + 8
+            comment_w = W - comment_x - PX
+            fc_comment = self._f(13)
+            comment_lines = self._wrap(comment, fc_comment, comment_w, dr)
+            if len(comment_lines) > 3:
+                comment_lines = comment_lines[:3]
+                comment_lines[-1] = comment_lines[-1][:-2] + "..."
+
+            comment_y = cy + 2
+            for cl in comment_lines:
+                dr.text((comment_x, comment_y), cl, font=fc_comment, fill=C_GRAY)
+                comment_y += 18
+
+            # 服务商标注
+            if bot_provider_name:
+                provider_font = self._f(10)
+                provider_text = "via " + bot_provider_name
+                dr.text((comment_x, comment_y + 2), provider_text, font=provider_font, fill=(180, 180, 180))
+                comment_y += 14
+
+            cy = max(cy + bot_avt_size + 8, comment_y + 8)
 
         # 底部边线（多条拼合时充当条目间分隔线，像推特时间线的灰线）
         dr.line([(0, H - 1), (W, H - 1)], fill=C_BORDER, width=1)
@@ -673,6 +726,13 @@ class MyRssPlugin(Star):
         self.adjust_pic = config.get("is_adjust_pic", False)
         self.max_pic = config.get("max_pic_item", 3)
         self.compose = config.get("compose", True)
+        self.enable_comment = config.get("enable_comment", True)
+        self.comment_provider_id = config.get("comment_provider_id", "")
+        self.comment_max_length = config.get("comment_max_length", 80)
+        self.bot_qq = config.get("bot_qq", "")
+        self.bot_provider_name = config.get("bot_provider_name", "")
+        self.content_filter = config.get("content_filter", True)
+        self._comment_cache = {}  # key=item_link, value=comment_text
 
         self.pic = PicHandler(self.adjust_pic)
         self.card = CardGen()
@@ -967,6 +1027,103 @@ class MyRssPlugin(Star):
             }
         self.dh.save()
         return self.dh.data[url]["info"]
+    async def _get_provider_id(self) -> str:
+        """获取锐评用的provider ID"""
+        if self.comment_provider_id:
+            return self.comment_provider_id
+        # 自动获取默认provider
+        try:
+            provider = self.ctx.get_using_provider()
+            if provider:
+                meta = provider.meta()
+                if isinstance(meta, dict):
+                    return meta.get("id", "")
+        except Exception:
+            pass
+        return ""
+
+    async def _generate_comment(self, item: RSSItem) -> str:
+        """调用LLM生成锐评，带缓存"""
+        cache_key = item.link or (item.title + "|" + str(item.pubDate_timestamp))
+
+        # 命中缓存直接返回
+        if cache_key in self._comment_cache:
+            return self._comment_cache[cache_key]
+
+        provider_id = await self._get_provider_id()
+        if not provider_id:
+            self.logger.warning("[MyRSS] no provider for comment")
+            return ""
+
+        # 构造prompt
+        content_summary = item.title
+        if item.description:
+            desc_short = item.description[:200]
+            content_summary += "\n" + desc_short
+
+        prompt = (
+            f"你正在看一条来自「{item.chan_title}」的动态更新，内容如下：\n"
+            f"---\n{content_summary}\n---\n"
+            f"请用你的人设风格，对这条动态写一句简短锐评（{self.comment_max_length}字以内）。"
+            f"要求：自然、有个性、可以吐槽或夸奖。不要复述原文。不要加引号。"
+        )
+
+        try:
+            resp = await self.ctx.llm_generate(
+                chat_provider_id=provider_id,
+                prompt=prompt,
+            )
+            comment = (resp.completion_text or "").strip()
+            # 截断
+            if len(comment) > self.comment_max_length:
+                comment = comment[:self.comment_max_length] + "..."
+            # 缓存
+            if comment:
+                self._comment_cache[cache_key] = comment
+                # 限制缓存大小
+                if len(self._comment_cache) > 500:
+                    keys = list(self._comment_cache.keys())
+                    for k in keys[:200]:
+                        del self._comment_cache[k]
+            return comment
+        except Exception as e:
+            self.logger.error("[MyRSS] comment generation failed: %s", e)
+            return ""
+
+    async def _check_content_safe(self, item: RSSItem) -> bool:
+        """检查内容是否安全，不安全返回False"""
+        if not self.content_filter:
+            return True
+
+        provider_id = await self._get_provider_id()
+        if not provider_id:
+            return True  # 没有provider就不过滤，放行
+
+        content = (item.title + " " + (item.description or ""))[:300]
+
+        prompt = (
+            "判断以下内容是否包含以下任何一种不当信息：\n"
+            "1. 政治敏感/反动言论\n"
+            "2. 暴力血腥\n"
+            "3. 色情/露骨性内容\n"
+            "4. 其他可能导致社交平台账号被封禁的内容\n\n"
+            f"内容：{content}\n\n"
+            "只回答 SAFE 或 UNSAFE，不要解释。"
+        )
+
+        try:
+            resp = await self.ctx.llm_generate(
+                chat_provider_id=provider_id,
+                prompt=prompt,
+            )
+            result = (resp.completion_text or "").strip().upper()
+            if "UNSAFE" in result:
+                self.logger.warning("[MyRSS] content filtered: %s", item.title[:50])
+                return False
+            return True
+        except Exception as e:
+            self.logger.error("[MyRSS] content filter failed: %s", e)
+            return True  # 过滤出错时放行
     def _get_avatar_url(self, item: RSSItem) -> str:
         """从存储的订阅数据里获取频道头像URL"""
         for url, info in self.dh.data.items():
@@ -1006,6 +1163,27 @@ class MyRssPlugin(Star):
                                     break
                     except Exception:
                         continue
+        # 生成锐评
+        comment = ""
+        bot_avt = None
+        if self.enable_comment:
+            if await self._check_content_safe(item):
+                comment = await self._generate_comment(item)
+            else:
+                return ""  # 不安全内容，返回空跳过
+
+            # 下载bot头像
+            if self.bot_qq and comment:
+                bot_avt_url = f"https://q1.qlogo.cn/g?b=qq&nk={self.bot_qq}&s=640"
+                try:
+                    conn3 = aiohttp.TCPConnector(ssl=False)
+                    async with aiohttp.ClientSession(trust_env=True, connector=conn3) as s3:
+                        async with s3.get(bot_avt_url, timeout=aiohttp.ClientTimeout(total=5)) as r3:
+                            if r3.status == 200:
+                                bot_avt = await r3.read()
+                except Exception:
+                    pass
+
         return self.card.make(
             channel=item.chan_title,
             title=item.title,
@@ -1014,6 +1192,9 @@ class MyRssPlugin(Star):
             ts=item.pubDate or "",
             thumb=tb,
             avatar=avt_data,
+            comment=comment,
+            bot_avatar=bot_avt,
+            bot_provider_name=self.bot_provider_name,
         )
 
     def _merge_cards_b64(self, cards_b64: list) -> str:
@@ -1078,11 +1259,35 @@ class MyRssPlugin(Star):
                             avt_data = await r2.read()
             except Exception:
                 pass
+        # 生成锐评
+        comment = ""
+        bot_avt = None
+        if self.enable_comment:
+            if await self._check_content_safe(item):
+                comment = await self._generate_comment(item)
+            else:
+                self.logger.warning("[MyRSS] unsafe content skipped: %s", item.title[:50])
+                return [Comp.Plain("[内容已过滤]")]
+
+            if self.bot_qq and comment:
+                bot_avt_url = f"https://q1.qlogo.cn/g?b=qq&nk={self.bot_qq}&s=640"
+                try:
+                    conn3 = aiohttp.TCPConnector(ssl=False)
+                    async with aiohttp.ClientSession(trust_env=True, connector=conn3) as s3:
+                        async with s3.get(bot_avt_url, timeout=aiohttp.ClientTimeout(total=5)) as r3:
+                            if r3.status == 200:
+                                bot_avt = await r3.read()
+                except Exception:
+                    pass
+
         try:
             b64 = self.card.make(
                 channel=item.chan_title, title=item.title, desc=item.description,
                 link="" if self.hide_url else item.link, ts=item.pubDate or "", thumb=tb,
                 avatar=avt_data,
+                comment=comment,
+                bot_avatar=bot_avt,
+                bot_provider_name=self.bot_provider_name,
             )
             comps.append(Comp.Image.fromBase64(b64))
         except Exception as e:
@@ -1187,7 +1392,11 @@ class MyRssPlugin(Star):
         batch = new_items[:merge_limit]
 
         if len(batch) > 1:
-            cards = [await self._make_card_b64(it) for it in batch]
+            cards_raw = [await self._make_card_b64(it) for it in batch]
+            cards = [c for c in cards_raw if c]  # 过滤掉被内容审核拦截的空卡片
+            if not cards:
+                self.logger.info("[MyRSS] all items filtered, skip push")
+                return
             merged = self._merge_cards_b64(cards)
             if not merged:
                 for it in batch:
