@@ -1461,6 +1461,14 @@ class MyRssPlugin(Star):
             self.logger.error("[MyRSS] content filter failed, blocking for safety: %s", e)
             self._safe_cache[cache_key] = False
             return False  # 过滤出错时拦截，宁可不推也不冒险
+    def _get_avatar_url(self, item: RSSItem) -> str:
+        """从存储的订阅数据里获取频道头像URL"""
+        for url, info in self.dh.data.items():
+            if url in ("rsshub_endpoints", "settings"):
+                continue
+            if info.get("info", {}).get("title") == item.chan_title:
+                return info.get("info", {}).get("avatar", "")
+        return ""
     async def _make_card_b64(self, item: RSSItem) -> str:
         # 下载频道头像
         avt_data = None
@@ -2226,23 +2234,41 @@ class MyRssPlugin(Star):
                 yield event.plain_result("当前平台不支持获取群列表（仅 aiocqhttp/NapCat 支持）。")
                 return
 
-            client = getattr(event, "bot", None)
+            # AstrBot 官方文档要求的调用方式
+            from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
+            if not isinstance(event, AiocqhttpMessageEvent):
+                yield event.plain_result("事件类型不匹配，无法调用协议端 API。")
+                return
+
+            client = event.bot
             if not client:
                 yield event.plain_result("无法获取协议端 client。")
                 return
 
-            ret = await client.api.call_action("get_group_list", no_cache=False)
-            data = ret.get("data", []) if isinstance(ret, dict) else []
+            ret = await client.api.call_action('get_group_list')
+
+            # NapCat 返回格式可能是 list 或 dict{"data": list}
+            if isinstance(ret, list):
+                data = ret
+            elif isinstance(ret, dict):
+                data = ret.get("data", [])
+            else:
+                data = []
+
             if not data:
-                yield event.plain_result("群列表为空，或协议端未返回数据。")
+                yield event.plain_result("群列表为空，或协议端未返回数据。\n返回值类型: " + str(type(ret).__name__))
                 return
 
             lines = ["📋 机器人所在群列表："]
             for i, g in enumerate(data):
-                gid = g.get("group_id", "")
-                gname = g.get("group_name", "")
-                lines.append(f"{i}. {gname} ({gid})")
+                if isinstance(g, dict):
+                    gid = g.get("group_id", "")
+                    gname = g.get("group_name", "")
+                    lines.append(f"  {i}. {gname} ({gid})")
+                else:
+                    lines.append(f"  {i}. {g}")
 
             yield event.plain_result("\n".join(lines))
         except Exception as e:
+            self.logger.error("[MyRSS] get group list failed: %s", e, exc_info=True)
             yield event.plain_result("获取群列表失败：" + str(e))
