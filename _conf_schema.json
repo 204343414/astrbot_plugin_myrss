@@ -127,5 +127,9 @@
     "description": "安全模式测试群号（多个用逗号分隔，如 123456,789012）",
     "type": "string",
     "default": ""
+  },
+  "group_cooldown_minutes": {
+    "description": "全局推送冷却期（分钟）：同一个群在此时间内最多收到一次全局推送",
+    "type": "int",
+    "default": 60
   }
-}
