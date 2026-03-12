@@ -1197,6 +1197,9 @@ class MyRssPlugin(Star):
         miss = self._feed_miss_count.get(url, 0)
         self.logger.info("[MyRSS] global feed job: %s (miss=%d, interval=%dmin)", url, miss, current_interval)
 
+        # [防冲突] 每次执行前从磁盘重载，防止被 _cron_cb_inner 的 _load() 覆盖导致 seen_links 丢失
+        self.dh.data = self.dh._load()
+
         # 获取全局seen_links
         if url not in self.dh.data:
             return
@@ -1407,9 +1410,11 @@ class MyRssPlugin(Star):
         for w in unsafe_words:
             if w in check_text:
                 self.logger.warning("[MyRSS] content hard-filter hit '%s': %s", w, item.title[:30])
+                self._safe_cache[cache_key] = False
                 return False
         provider_id = self.filter_provider_id if self.filter_provider_id else await self._get_provider_id()
         if not provider_id:
+            self._safe_cache[cache_key] = True
             return True  # 没有provider就不过滤，放行
 
         content = (item.title + " " + (item.description or ""))[:300]
@@ -1432,19 +1437,14 @@ class MyRssPlugin(Star):
             result = (resp.completion_text or "").strip().upper()
             if "UNSAFE" in result:
                 self.logger.warning("[MyRSS] content filtered: %s", item.title[:50])
+                self._safe_cache[cache_key] = False
                 return False
+            self._safe_cache[cache_key] = True
             return True
         except Exception as e:
             self.logger.error("[MyRSS] content filter failed, blocking for safety: %s", e)
+            self._safe_cache[cache_key] = False
             return False  # 过滤出错时拦截，宁可不推也不冒险
-    def _get_avatar_url(self, item: RSSItem) -> str:
-        """从存储的订阅数据里获取频道头像URL"""
-        for url, info in self.dh.data.items():
-            if url in ("rsshub_endpoints", "settings"):
-                continue
-            if info.get("info", {}).get("title") == item.chan_title:
-                return info.get("info", {}).get("avatar", "")
-        return ""
     async def _make_card_b64(self, item: RSSItem) -> str:
         # 下载频道头像
         avt_data = None
