@@ -752,6 +752,8 @@ class MyRssPlugin(Star):
         self.push_delay_min = config.get("push_delay_min", 5.0)
         self.push_delay_max = config.get("push_delay_max", 8.0)
         self.filter_provider_id = config.get("filter_provider_id", "")
+        self.safe_mode = config.get("safe_mode", True)
+        self.safe_mode_groups = [g.strip() for g in config.get("safe_mode_groups", "").split(",") if g.strip()]
         self.image_caption_provider_id = config.get("image_caption_provider_id", "")
 
         self.pic = PicHandler(self.adjust_pic)
@@ -1273,7 +1275,18 @@ class MyRssPlugin(Star):
             return
 
         # 推送给所有活跃群（排除屏蔽了该源的群）
-        active_groups = self._get_active_groups()
+        # [安全模式] 如果开启，只推送到指定的测试群
+        if self.safe_mode:
+            if not self.safe_mode_groups:
+                self.logger.warning("[MyRSS] safe_mode ON but no test groups configured, skip push")
+                return
+            # 构造测试群的 unified_id
+            active_groups = []
+            for gid in self.safe_mode_groups:
+                active_groups.append(f"aiocqhttp:GroupMessage:{gid}")
+            self.logger.info("[MyRSS] safe_mode ON, only pushing to test groups: %s", self.safe_mode_groups)
+        else:
+            active_groups = self._get_active_groups()
         # 从URL提取路由部分用于匹配屏蔽列表
         eps = self.dh.data.get("rsshub_endpoints", [])
         feed_route = url
@@ -2104,6 +2117,76 @@ class MyRssPlugin(Star):
             yield event.chain_result([Comp.Node(uin=0, name="Astrbot", content=comps)]).use_t2i(self.t2i)
         else:
             yield event.chain_result(comps).use_t2i(self.t2i)
+    @myrss.command("test")
+    async def cmd_test(self, event: AstrMessageEvent, route: str = "/twitter/user/AnthropicAI"):
+        """测试推送流程：拉取指定源的最新一条，走完整的过滤+锐评+缓存流程，发到当前聊天。
+        用法：/myrss test [路由]
+        默认：/myrss test /twitter/user/AnthropicAI
+        """
+        eps = self.dh.data.get("rsshub_endpoints", [])
+        if not eps:
+            yield event.plain_result("没有配置 RSSHub 端点，无法测试。")
+            return
+
+        if not route.startswith("/"):
+            route = "/" + route
+
+        url = eps[0].rstrip("/") + route
+        yield event.plain_result(f"⏳ 开始测试推送流程...\n源: {route}\n10秒后拉取（模拟真实延迟）")
+
+        await asyncio.sleep(10)
+
+        # 第1步：拉取
+        yield event.plain_result("📡 [1/4] 正在拉取 RSS...")
+        items = await self._poll(url, num=1)
+        if not items:
+            yield event.plain_result("❌ 拉取失败，源无内容或不可访问。")
+            return
+        item = items[0]
+        yield event.plain_result(f"✅ 拉取成功: {item.title[:50]}")
+
+        # 第2步：内容过滤（走真实函数，会用缓存）
+        yield event.plain_result("🔍 [2/4] 正在过滤内容（LLM审核）...")
+        safe = await self._check_content_safe(item)
+        cache_hit = (item.link or item.title) in self._safe_cache
+        if not safe:
+            yield event.plain_result(f"🚫 内容被过滤（不安全），不会推送。缓存命中: {cache_hit}")
+            return
+        yield event.plain_result(f"✅ 内容安全。缓存命中: {cache_hit}")
+
+        # 第3步：生成锐评（走真实函数，会用缓存）
+        yield event.plain_result("💬 [3/4] 正在生成锐评（LLM评论）...")
+        comment = ""
+        if self.enable_comment:
+            comment = await self._generate_comment(item)
+            comment_cache_key = item.link or (item.title + "|" + str(item.pubDate_timestamp))
+            comment_cached = comment_cache_key in self._comment_cache
+            if comment:
+                yield event.plain_result(f"✅ 锐评: {comment[:60]}... 缓存命中: {comment_cached}")
+            else:
+                yield event.plain_result("⚠️ 锐评生成失败或为空")
+        else:
+            yield event.plain_result("⏭️ 锐评已关闭，跳过")
+
+        # 第4步：生成卡片并发送（走真实函数）
+        yield event.plain_result("🎨 [4/4] 正在生成卡片...")
+        comps = await self._make_comps(item)
+
+        user = event.unified_msg_origin
+        pn = user.split(":")[0]
+        if pn == "aiocqhttp" and self.compose:
+            yield event.chain_result([Comp.Node(uin=0, name="[测试]Astrbot", content=comps)]).use_t2i(self.t2i)
+        else:
+            yield event.chain_result(comps).use_t2i(self.t2i)
+
+        yield event.plain_result(
+            "✅ 测试完成！\n"
+            f"  过滤缓存大小: {len(self._safe_cache)}\n"
+            f"  锐评缓存大小: {len(self._comment_cache)}\n"
+            f"  安全模式: {'开启' if self.safe_mode else '关闭'}\n"
+            f"  测试群: {','.join(self.safe_mode_groups) if self.safe_mode_groups else '未配置'}\n"
+            "再次执行同样的 /myrss test 可验证缓存是否命中"
+        )
     @myrss.command("groups")
     async def cmd_groups(self, event: AstrMessageEvent):
         """列出机器人加入的群（需要 aiocqhttp / NapCat）"""
