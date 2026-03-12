@@ -80,5 +80,37 @@
     "description": "是否过滤不适合推送的内容（反动/暴力/涩情等）",
     "type": "bool",
     "default": true
+  },
+  "filter_provider_id": {
+    "description": "内容过滤用的LLM（建议选便宜快速的）",
+    "type": "string",
+    "default": "",
+    "_special": "select_provider"
+  },
+  "image_caption_provider_id": {
+    "description": "识图用的LLM（如gemini）",
+    "type": "string",
+    "default": "",
+    "_special": "select_provider"
+  },
+  "global_feeds": {
+    "description": "全局订阅源（推给所有活跃群），每行一个RSSHub路由，如 /twitter/user/elonmusk",
+    "type": "text",
+    "default": ""
+  },
+  "global_feed_interval": {
+    "description": "全局订阅检查间隔（分钟）",
+    "type": "int",
+    "default": 15
+  },
+  "push_delay_min": {
+    "description": "推送间隔最小秒数（防风控）",
+    "type": "float",
+    "default": 5.0
+  },
+  "push_delay_max": {
+    "description": "推送间隔最大秒数（防风控）",
+    "type": "float",
+    "default": 8.0
   }
 }
