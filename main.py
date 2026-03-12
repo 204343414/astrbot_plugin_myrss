@@ -1829,7 +1829,7 @@ class MyRssPlugin(Star):
         yield event.plain_result(
             "已在本群屏蔽以下推送：\n" +
             "\n".join(f"  ✅ {r}" for r in newly_blocked) +
-            "\n其他群不受影响。如需恢复，说"恢复推送xxx"即可。"
+            "\n其他群不受影响。如需恢复，说'恢复推送xxx'即可。"
         )
 
     @filter.llm_tool(name="myrss_unblock_feed")
