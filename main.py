@@ -183,7 +183,8 @@ class PicHandler:
 
 class URLMapper:
     RULES = [
-        (r"space\.bilibili\.com/(\d+)", "/bilibili/user/video/{0}", "B站UP主视频"),
+        (r"space\.bilibili\.com/(\d+)/dynamic", "/bilibili/user/dynamic/{0}", "B站UP主动态"),
+        (r"space\.bilibili\.com/(\d+)", "/bilibili/user/dynamic/{0}", "B站UP主动态"),
         (r"bilibili\.com/bangumi/media/md(\d+)", "/bilibili/bangumi/media/{0}", "B站番剧"),
         (r"live\.bilibili\.com/(\d+)", "/bilibili/live/room/{0}", "B站直播间"),
         (r"manga\.bilibili\.com/detail/mc(\d+)", "/bilibili/manga/update/{0}", "B站漫画"),
