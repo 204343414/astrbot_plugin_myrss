@@ -117,5 +117,15 @@
     "description": "推送间隔最大秒数（防风控）",
     "type": "float",
     "default": 8.0
+  },
+  "safe_mode": {
+    "description": "安全模式：开启后全局推送只发到测试群，不发其他群",
+    "type": "bool",
+    "default": true
+  },
+  "safe_mode_groups": {
+    "description": "安全模式测试群号（多个用逗号分隔，如 123456,789012）",
+    "type": "string",
+    "default": ""
   }
 }
