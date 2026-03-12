@@ -1070,37 +1070,37 @@ class MyRssPlugin(Star):
                 "info": {"title": title, "description": desc, "avatar": avatar},
             }
         self.dh.save()
-        return self.dh.data[url]["info"]
-            self.dh.data[url]["subscribers"][user] = {
-                "cron_expr": cron_expr,
-                "last_update": items[0].pubDate_timestamp,
-                "latest_link": items[0].link,
+    return self.dh.data[url]["info"]
+        self.dh.data[url]["subscribers"][user] = {
+            "cron_expr": cron_expr,
+            "last_update": items[0].pubDate_timestamp,
+            "latest_link": items[0].link,
+            "seen_links": [it.link for it in items if it.link][:200],
+        }
+    else:
+        text = await self._fetch(url)
+        if text is None:
+            return event.plain_result("无法访问: " + url + "\n请检查RSSHub端点是否可用。")
+        try:
+            title, desc, avatar = self.dh.parse_channel_info(text)
+        except Exception as e:
+            return event.plain_result("解析失败: " + str(e))
+        items = await self._poll(url)
+        if not items:
+            return event.plain_result("源可访问但无内容条目。")
+        self.dh.data[url] = {
+            "subscribers": {
+                user: {
+                    "cron_expr": cron_expr,
+                    "last_update": items[0].pubDate_timestamp,
+                    "latest_link": items[0].link,
                 "seen_links": [it.link for it in items if it.link][:200],
             }
-        else:
-            text = await self._fetch(url)
-            if text is None:
-                return event.plain_result("无法访问: " + url + "\n请检查RSSHub端点是否可用。")
-            try:
-                title, desc, avatar = self.dh.parse_channel_info(text)
-            except Exception as e:
-                return event.plain_result("解析失败: " + str(e))
-            items = await self._poll(url)
-            if not items:
-                return event.plain_result("源可访问但无内容条目。")
-            self.dh.data[url] = {
-                "subscribers": {
-                    user: {
-                        "cron_expr": cron_expr,
-                        "last_update": items[0].pubDate_timestamp,
-                        "latest_link": items[0].link,
-                    "seen_links": [it.link for it in items if it.link][:200],
-                }
-            },
-            "info": {"title": title, "description": desc, "avatar": avatar},
-            }
-        self.dh.save()
-        return self.dh.data[url]["info"]
+        },
+        "info": {"title": title, "description": desc, "avatar": avatar},
+        }
+    self.dh.save()
+    return self.dh.data[url]["info"]
     # ============================================================
     #  活跃群检测
     # ============================================================
