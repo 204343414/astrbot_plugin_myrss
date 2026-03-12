@@ -755,6 +755,8 @@ class MyRssPlugin(Star):
         self.filter_provider_id = config.get("filter_provider_id", "")
         self.safe_mode = config.get("safe_mode", True)
         self.safe_mode_groups = [g.strip() for g in config.get("safe_mode_groups", "").split(",") if g.strip()]
+        self.group_cooldown_seconds = max(config.get("group_cooldown_minutes", 60), 1) * 60
+        self._group_cooldown = {}  # key=group_id, value=上次推送的时间戳
         self.image_caption_provider_id = config.get("image_caption_provider_id", "")
 
         self.pic = PicHandler(self.adjust_pic)
@@ -1346,17 +1348,39 @@ class MyRssPlugin(Star):
         # 如果某群已经“自己订阅”了同一个源，就不再给它推全局，避免重复
         personal_subs = set(self.dh.data.get(url, {}).get("subscribers", {}).keys())
         push_groups = [g for g in push_groups if g not in personal_subs]
-        self.logger.info("[MyRSS] global push %d items to %d groups (skipped %d blocked)",
-                        len(batch), len(push_groups), len(active_groups) - len(push_groups))
+        # 冷却期检查：跳过最近已经推送过的群
+        now = time.time()
+        cooled_groups = []
+        skipped_cooldown = 0
+        for g in push_groups:
+            last_push = self._group_cooldown.get(g, 0)
+            if now - last_push >= self.group_cooldown_seconds:
+                cooled_groups.append(g)
+            else:
+                skipped_cooldown += 1
+                remaining = int((self.group_cooldown_seconds - (now - last_push)) / 60)
+                self.logger.info("[MyRSS] group %s in cooldown, skip (%d min remaining)", g, remaining)
+        push_groups = cooled_groups
+
+        self.logger.info("[MyRSS] global push %d items to %d groups (skipped %d blocked, %d cooldown)",
+                        len(batch), len(push_groups),
+                        len(active_groups) - len(push_groups) - skipped_cooldown, skipped_cooldown)
+
+        # 给推送内容加上退订提示
+        push_comps = list(comps)  # 复制一份，不污染原始 comps
+        push_comps.append(Comp.Plain("\n💡 如需退订本群推送，请@我说「屏蔽xxx」"))
 
         for group_id in push_groups:
             try:
                 pn = group_id.split(":")[0]
                 if pn == "aiocqhttp" and self.compose:
-                    node = Comp.Node(uin=0, name="Astrbot", content=comps)
+                    node = Comp.Node(uin=0, name="Astrbot", content=push_comps)
                     await self.ctx.send_message(group_id, MessageChain(chain=[node], use_t2i_=self.t2i))
                 else:
-                    await self.ctx.send_message(group_id, MessageChain(chain=comps, use_t2i_=self.t2i))
+                    await self.ctx.send_message(group_id, MessageChain(chain=push_comps, use_t2i_=self.t2i))
+
+                # 推送成功，记录冷却时间
+                self._group_cooldown[group_id] = time.time()
 
                 # 随机延迟防风控
                 delay = random.uniform(self.push_delay_min, self.push_delay_max)
@@ -2343,3 +2367,19 @@ class MyRssPlugin(Star):
         except Exception as e:
             self.logger.error("[MyRSS] get group list failed: %s", e, exc_info=True)
             yield event.plain_result("获取群列表失败：" + str(e))
+    @myrss.command("cooldown")
+    async def cmd_cooldown(self, event: AstrMessageEvent):
+        """查看各群的全局推送冷却状态"""
+        if not self._group_cooldown:
+            yield event.plain_result("当前没有任何群在冷却期内。")
+            return
+        now = time.time()
+        lines = ["📋 全局推送冷却状态："]
+        for gid, ts in sorted(self._group_cooldown.items(), key=lambda x: x[1], reverse=True):
+            elapsed = now - ts
+            remaining = self.group_cooldown_seconds - elapsed
+            if remaining > 0:
+                lines.append(f"  🔴 {gid} - 剩余 {int(remaining/60)} 分钟")
+            else:
+                lines.append(f"  🟢 {gid} - 已就绪")
+        yield event.plain_result("\n".join(lines))
