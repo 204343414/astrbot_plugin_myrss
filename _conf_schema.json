@@ -50,9 +50,16 @@
     "default": true
   },
   "comment_provider_id": {
-    "description": "锐评用的LLM provider ID（如 xai_source/grok-4-1-fast-reasoning），留空则自动用默认provider",
+    "description": "锐评用的LLM提供商（留空则用默认）",
     "type": "string",
-    "default": ""
+    "default": "",
+    "_special": "select_provider"
+  },
+  "comment_persona": {
+    "description": "锐评用的人格（留空则用默认人格）",
+    "type": "string",
+    "default": "",
+    "_special": "select_persona"
   },
   "comment_max_length": {
     "description": "锐评最大字数",
