@@ -1433,11 +1433,14 @@ class MyRssPlugin(Star):
         content = (item.title + " " + (item.description or ""))[:300]
 
         prompt = (
-            "判断以下内容是否包含以下任何一种不当信息：\n"
-            "1. 对中国国情比较政治敏感/反动和过激言论\n"
-            "2. 暴力血腥\n"
-            "3. 色情/露骨性内容\n"
-            "4. 其他可能导致社交平台账号被封禁的内容\n\n"
+            "你是内容安全审核员。判断以下内容是否包含明确的不当信息。\n"
+            "只有以下情况才算 UNSAFE：\n"
+            "1. 明确攻击中国政府/领导人的反动言论（科技/商业/国际新闻不算）\n"
+            "2. 血腥暴力的详细描写\n"
+            "3. 露骨色情内容\n"
+            "4. 明确的违法犯罪教唆\n\n"
+            "注意：正常的科技新闻、商业动态、AI讨论、国际时事报道都是 SAFE。\n"
+            "宁可放行也不要误杀正常内容。如果不确定，判定为 SAFE。\n\n"
             f"内容：{content}\n\n"
             "只回答 SAFE 或 UNSAFE，不要解释。"
         )
@@ -2117,16 +2120,38 @@ class MyRssPlugin(Star):
             yield event.chain_result([Comp.Node(uin=0, name="Astrbot", content=comps)]).use_t2i(self.t2i)
         else:
             yield event.chain_result(comps).use_t2i(self.t2i)
+    @myrss.command("clearcache")
+    async def cmd_clearcache(self, event: AstrMessageEvent):
+        """清空过滤缓存和锐评缓存"""
+        safe_count = len(self._safe_cache)
+        comment_count = len(self._comment_cache)
+        self._safe_cache.clear()
+        self._comment_cache.clear()
+        yield event.plain_result(f"✅ 缓存已清空\n  过滤缓存: {safe_count} 条已清除\n  锐评缓存: {comment_count} 条已清除")
     @myrss.command("test")
     async def cmd_test(self, event: AstrMessageEvent, route: str = "/twitter/user/AnthropicAI"):
-        """测试推送流程：拉取指定源的最新一条，走完整的过滤+锐评+缓存流程，发到当前聊天。
-        用法：/myrss test [路由]
-        默认：/myrss test /twitter/user/AnthropicAI
+        """测试推送流程：拉取指定源的最新一条，走完整的过滤+锐评+缓存流程。
+        用法：
+          /myrss test                              （默认 Anthropic 推特）
+          /myrss test /twitter/user/elonmusk       （RSSHub 路由）
+          /myrss test https://x.com/elonmusk       （自动转路由）
+          /myrss test https://space.bilibili.com/2267573/dynamic
         """
         eps = self.dh.data.get("rsshub_endpoints", [])
         if not eps:
             yield event.plain_result("没有配置 RSSHub 端点，无法测试。")
             return
+
+        # 支持传入完整URL，自动转成RSSHub路由
+        if route.startswith("http"):
+            matched = URLMapper.match(route)
+            if matched:
+                converted_route, platform_name = matched
+                yield event.plain_result(f"🔄 识别为 {platform_name}，转换路由: {converted_route}")
+                route = converted_route
+            else:
+                yield event.plain_result("❌ 无法识别该链接。\n\n" + URLMapper.suggest(route) + "\n\n请用 /开头的路由重试。")
+                return
 
         if not route.startswith("/"):
             route = "/" + route
@@ -2143,26 +2168,32 @@ class MyRssPlugin(Star):
             yield event.plain_result("❌ 拉取失败，源无内容或不可访问。")
             return
         item = items[0]
-        yield event.plain_result(f"✅ 拉取成功: {item.title[:50]}")
+        yield event.plain_result(f"✅ 拉取成功: {item.title[:80]}")
 
         # 第2步：内容过滤（走真实函数，会用缓存）
         yield event.plain_result("🔍 [2/4] 正在过滤内容（LLM审核）...")
+        cache_key = item.link or (item.title + "|" + str(item.pubDate_timestamp))
+        was_cached = cache_key in self._safe_cache
         safe = await self._check_content_safe(item)
-        cache_hit = (item.link or item.title) in self._safe_cache
         if not safe:
-            yield event.plain_result(f"🚫 内容被过滤（不安全），不会推送。缓存命中: {cache_hit}")
+            yield event.plain_result(
+                f"🚫 内容被过滤（判定不安全），不会推送。\n"
+                f"  缓存命中: {was_cached}\n"
+                f"  标题: {item.title[:60]}\n"
+                f"  如果这是误杀，可能需要调整过滤 prompt 或换一个过滤 provider。\n"
+                f"  提示: 可以临时关闭 content_filter 再测试，确认是过滤器问题还是其他问题。"
+            )
             return
-        yield event.plain_result(f"✅ 内容安全。缓存命中: {cache_hit}")
+        yield event.plain_result(f"✅ 内容安全。缓存命中: {was_cached}")
 
         # 第3步：生成锐评（走真实函数，会用缓存）
         yield event.plain_result("💬 [3/4] 正在生成锐评（LLM评论）...")
         comment = ""
         if self.enable_comment:
+            comment_was_cached = cache_key in self._comment_cache
             comment = await self._generate_comment(item)
-            comment_cache_key = item.link or (item.title + "|" + str(item.pubDate_timestamp))
-            comment_cached = comment_cache_key in self._comment_cache
             if comment:
-                yield event.plain_result(f"✅ 锐评: {comment[:60]}... 缓存命中: {comment_cached}")
+                yield event.plain_result(f"✅ 锐评: {comment[:80]}\n  缓存命中: {comment_was_cached}")
             else:
                 yield event.plain_result("⚠️ 锐评生成失败或为空")
         else:
@@ -2185,7 +2216,7 @@ class MyRssPlugin(Star):
             f"  锐评缓存大小: {len(self._comment_cache)}\n"
             f"  安全模式: {'开启' if self.safe_mode else '关闭'}\n"
             f"  测试群: {','.join(self.safe_mode_groups) if self.safe_mode_groups else '未配置'}\n"
-            "再次执行同样的 /myrss test 可验证缓存是否命中"
+            "再次执行同样的命令可验证缓存是否命中（应显示 True）"
         )
     @myrss.command("groups")
     async def cmd_groups(self, event: AstrMessageEvent):
