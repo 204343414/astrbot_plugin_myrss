@@ -1311,6 +1311,15 @@ class MyRssPlugin(Star):
             # 截断
             if len(comment) > self.comment_max_length:
                 comment = comment[:self.comment_max_length] + "..."
+            # 过滤锐评本身
+            if self.content_filter and comment:
+                unsafe_words = ["习近平", "共产党", "六四", "天安门", "法轮", "台独",
+                               "藏独", "疆独", "反共", "颠覆", "推翻", "操你", "傻逼"]
+                for w in unsafe_words:
+                    if w in comment:
+                        self.logger.warning("[MyRSS] comment contains unsafe word '%s', discarding", w)
+                        comment = ""
+                        break
             # 缓存
             if comment:
                 self._comment_cache[cache_key] = comment
@@ -1356,8 +1365,8 @@ class MyRssPlugin(Star):
                 return False
             return True
         except Exception as e:
-            self.logger.error("[MyRSS] content filter failed: %s", e)
-            return True  # 过滤出错时放行
+            self.logger.error("[MyRSS] content filter failed, blocking for safety: %s", e)
+            return False  # 过滤出错时拦截，宁可不推也不冒险
     def _get_avatar_url(self, item: RSSItem) -> str:
         """从存储的订阅数据里获取频道头像URL"""
         for url, info in self.dh.data.items():
