@@ -750,9 +750,6 @@ class MyRssPlugin(Star):
         self.filter_provider_id = config.get("filter_provider_id", "")
         self.image_caption_provider_id = config.get("image_caption_provider_id", "")
 
-        # 注册全局订阅的定时任务
-        if self.global_feeds:
-            self._setup_global_feeds()
         self.pic = PicHandler(self.adjust_pic)
         self.card = CardGen()
 
@@ -776,7 +773,9 @@ class MyRssPlugin(Star):
         _ACTIVE_SCHED = self.sched  # [防冲突] 注册为全局引用，下次init时可找到并销毁
         self.sched.start()
         self._reload_jobs()
-
+        # 注册全局订阅的定时任务（必须在sched.start()之后）
+        if self.global_feeds:
+            self._setup_global_feeds()
     async def destroy(self):
         """插件卸载/禁用时停止调度器"""
         global _ACTIVE_SCHED
@@ -1337,7 +1336,14 @@ class MyRssPlugin(Star):
         """检查内容是否安全，不安全返回False"""
         if not self.content_filter:
             return True
-
+        # 硬编码关键词兜底（不依赖LLM）
+        check_text = (item.title + " " + (item.description or "")).lower()
+        unsafe_words = ["习近平", "共产党", "六四", "天安门", "法轮", "台独",
+                       "藏独", "疆独", "反共", "颠覆", "推翻政权", "轮子功"]
+        for w in unsafe_words:
+            if w in check_text:
+                self.logger.warning("[MyRSS] content hard-filter hit '%s': %s", w, item.title[:30])
+                return False
         provider_id = self.filter_provider_id if self.filter_provider_id else await self._get_provider_id()
         if not provider_id:
             return True  # 没有provider就不过滤，放行
