@@ -1205,6 +1205,7 @@ class MyRssPlugin(Star):
 
         new_items = [it for it in items if item_key(it) not in seen]
         if not new_items:
+            self._feed_miss_count[url] = self._feed_miss_count.get(url, 0) + 1
             return
 
         # 内容过滤
@@ -1669,7 +1670,8 @@ class MyRssPlugin(Star):
         new_items = [it for it in items if item_key(it) not in seen]
 
         if not new_items:
-            self._feed_miss_count[url] = self._feed_miss_count.get(url, 0) + 1
+            si["latest_link"] = items[0].link
+            self.dh.save()
             return
 
         # 先更新去重记录再发送，防止并发重推
