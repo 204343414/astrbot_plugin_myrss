@@ -1462,10 +1462,7 @@ class MyRssPlugin(Star):
         comment = ""
         bot_avt = None
         if self.enable_comment:
-            if await self._check_content_safe(item):
-                comment = await self._generate_comment(item)
-            else:
-                return ""  # 不安全内容，返回空跳过
+            comment = await self._generate_comment(item)
 
             # 下载bot头像
             if self.bot_qq and comment:
@@ -1558,11 +1555,7 @@ class MyRssPlugin(Star):
         comment = ""
         bot_avt = None
         if self.enable_comment:
-            if await self._check_content_safe(item):
-                comment = await self._generate_comment(item)
-            else:
-                self.logger.warning("[MyRSS] unsafe content skipped: %s", item.title[:50])
-                return [Comp.Plain("[内容已过滤]")]
+            comment = await self._generate_comment(item)
 
             if self.bot_qq and comment:
                 bot_avt_url = f"https://q1.qlogo.cn/g?b=qq&nk={self.bot_qq}&s=640"
@@ -1685,7 +1678,17 @@ class MyRssPlugin(Star):
         if ts_candidates:
             si["last_update"] = max(ts_candidates)
         self.dh.save()
-
+        # 内容过滤（去重后、推送前）
+        if self.content_filter:
+            filtered = []
+            for it in new_items:
+                if await self._check_content_safe(it):
+                    filtered.append(it)
+                else:
+                    self.logger.info("[MyRSS] filtered: %s", it.title[:30])
+            new_items = filtered
+            if not new_items:
+                return
         pn = user.split(":")[0]
         merge_limit = 5
         batch = new_items[:merge_limit]
