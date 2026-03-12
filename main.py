@@ -734,7 +734,25 @@ class MyRssPlugin(Star):
         self.bot_provider_name = config.get("bot_provider_name", "")
         self.content_filter = config.get("content_filter", True)
         self._comment_cache = {}  # key=item_link, value=comment_text
+        # 活跃群检测（学新闻插件）
+        self._active_groups = set()  # 内存中记录有人说话的群
+        self._group_data_file = "data/astrbot_plugin_myrss_groups.json"
+        self._group_data = self._load_group_data()
 
+        # 全局订阅
+        self.global_feeds = [
+            line.strip() for line in config.get("global_feeds", "").split("\n")
+            if line.strip() and line.strip().startswith("/")
+        ]
+        self.global_feed_interval = max(config.get("global_feed_interval", 15), 5)
+        self.push_delay_min = config.get("push_delay_min", 5.0)
+        self.push_delay_max = config.get("push_delay_max", 8.0)
+        self.filter_provider_id = config.get("filter_provider_id", "")
+        self.image_caption_provider_id = config.get("image_caption_provider_id", "")
+
+        # 注册全局订阅的定时任务
+        if self.global_feeds:
+            self._setup_global_feeds()
         self.pic = PicHandler(self.adjust_pic)
         self.card = CardGen()
 
@@ -1028,6 +1046,195 @@ class MyRssPlugin(Star):
             }
         self.dh.save()
         return self.dh.data[url]["info"]
+    # ============================================================
+    #  活跃群检测
+    # ============================================================
+
+    def _load_group_data(self) -> dict:
+        if os.path.exists(self._group_data_file):
+            try:
+                with open(self._group_data_file, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return {"groups": {}}
+
+    def _save_group_data(self):
+        try:
+            with open(self._group_data_file, "w", encoding="utf-8") as f:
+                json.dump(self._group_data, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            self.logger.error("[MyRSS] save group data failed: %s", e)
+
+    def _mark_active(self, unified_id: str):
+        """标记某个群有人说话"""
+        if "GroupMessage" not in unified_id:
+            return
+        self._active_groups.add(unified_id)
+        if unified_id not in self._group_data["groups"]:
+            self._group_data["groups"][unified_id] = {
+                "active": True,
+                "dormant": False,
+                "last_activity": int(time.time()),
+            }
+        else:
+            self._group_data["groups"][unified_id]["active"] = True
+            self._group_data["groups"][unified_id]["dormant"] = False
+            self._group_data["groups"][unified_id]["last_activity"] = int(time.time())
+
+    def _get_active_groups(self) -> list:
+        """获取所有活跃群的unified_id列表"""
+        result = []
+        for uid, info in self._group_data["groups"].items():
+            if info.get("active") and not info.get("dormant"):
+                result.append(uid)
+        return result
+
+    def _reset_activity(self):
+        """推送后重置活跃状态，等下次有人说话"""
+        for uid in self._group_data["groups"]:
+            self._group_data["groups"][uid]["active"] = uid in self._active_groups
+        self._active_groups.clear()
+        self._save_group_data()
+
+    @filter.regex(r"[\s\S]*")
+    async def _catch_activity(self, event: AstrMessageEvent):
+        """捕获所有消息记录活跃度，不产生回复"""
+        if hasattr(event, "unified_msg_origin"):
+            self._mark_active(event.unified_msg_origin)
+    # ============================================================
+    #  全局订阅
+    # ============================================================
+
+    def _setup_global_feeds(self):
+        """为全局订阅源注册定时任务"""
+        eps = self.dh.data.get("rsshub_endpoints", [])
+        if not eps:
+            self.logger.warning("[MyRSS] no endpoints for global feeds")
+            return
+
+        for route in self.global_feeds:
+            url = eps[0].rstrip("/") + route
+
+            # 确保数据里有这个URL的记录
+            if url not in self.dh.data:
+                self.dh.data[url] = {
+                    "subscribers": {},
+                    "info": {"title": route, "description": "全局订阅"},
+                    "global": True,
+                }
+
+            self.dh.data[url]["global"] = True
+
+            # 注册定时任务
+            if self.global_feed_interval < 60:
+                cron = f"*/{self.global_feed_interval} * * * *"
+            else:
+                cron = f"0 */{self.global_feed_interval // 60} * * *"
+
+            job_id = f"myrss_global_{url}"
+            self.sched.add_job(
+                self._global_feed_job, "cron",
+                **self._cron(cron),
+                args=[url],
+                id=job_id,
+                replace_existing=True,
+                misfire_grace_time=120,
+            )
+            self.logger.info("[MyRSS] global feed registered: %s every %d min", route, self.global_feed_interval)
+
+        self.dh.save()
+
+    async def _global_feed_job(self, url: str):
+        """全局订阅的定时推送"""
+        self.logger.info("[MyRSS] global feed job: %s", url)
+
+        # 获取全局seen_links
+        if url not in self.dh.data:
+            return
+        feed_data = self.dh.data[url]
+        seen = set(feed_data.get("global_seen_links", []))
+
+        items = await self._poll(url, num=self.max_poll, after_ts=feed_data.get("global_last_update", 0))
+        if not items:
+            return
+
+        def item_key(it):
+            return it.link if it.link else f"{it.title}|{it.pubDate_timestamp}"
+
+        new_items = [it for it in items if item_key(it) not in seen]
+        if not new_items:
+            return
+
+        # 内容过滤
+        safe_items = []
+        for it in new_items:
+            if self.content_filter:
+                if await self._check_content_safe(it):
+                    safe_items.append(it)
+                else:
+                    self.logger.info("[MyRSS] global feed filtered: %s", it.title[:30])
+            else:
+                safe_items.append(it)
+
+        if not safe_items:
+            # 更新seen即使被过滤
+            new_keys = [item_key(it) for it in new_items]
+            feed_data["global_seen_links"] = (new_keys + feed_data.get("global_seen_links", []))[:200]
+            ts_list = [it.pubDate_timestamp for it in new_items if it.pubDate_timestamp > 0]
+            if ts_list:
+                feed_data["global_last_update"] = max(ts_list)
+            self.dh.save()
+            return
+
+        # 更新seen_links（推送前，防重复）
+        new_keys = [item_key(it) for it in safe_items]
+        feed_data["global_seen_links"] = (new_keys + feed_data.get("global_seen_links", []))[:200]
+        ts_list = [it.pubDate_timestamp for it in safe_items if it.pubDate_timestamp > 0]
+        if ts_list:
+            feed_data["global_last_update"] = max(ts_list)
+        self.dh.save()
+
+        # 生成卡片（只生成一次，推给所有群）
+        batch = safe_items[:5]
+        if len(batch) > 1:
+            cards = [await self._make_card_b64(it) for it in batch]
+            cards = [c for c in cards if c]
+            if cards:
+                merged = self._merge_cards_b64(cards)
+                comps = [Comp.Image.fromBase64(merged)] if merged else None
+            else:
+                comps = None
+        elif batch:
+            comps = await self._make_comps(batch[0])
+        else:
+            return
+
+        if not comps:
+            return
+
+        # 推送给所有活跃群
+        active_groups = self._get_active_groups()
+        self.logger.info("[MyRSS] global push %d items to %d groups", len(batch), len(active_groups))
+
+        for group_id in active_groups:
+            try:
+                pn = group_id.split(":")[0]
+                if pn == "aiocqhttp" and self.compose:
+                    node = Comp.Node(uin=0, name="Astrbot", content=comps)
+                    await self.ctx.send_message(group_id, MessageChain(chain=[node], use_t2i_=self.t2i))
+                else:
+                    await self.ctx.send_message(group_id, MessageChain(chain=comps, use_t2i_=self.t2i))
+
+                # 随机延迟防风控
+                delay = random.uniform(self.push_delay_min, self.push_delay_max)
+                await asyncio.sleep(delay)
+
+            except Exception as e:
+                self.logger.error("[MyRSS] global push failed to %s: %s", group_id, e)
+
+        self._reset_activity()
+        self.logger.info("[MyRSS] global push done")
     async def _get_provider_id(self) -> str:
         """获取锐评用的provider ID"""
         if self.comment_provider_id:
@@ -1050,7 +1257,7 @@ class MyRssPlugin(Star):
         if cache_key in self._comment_cache:
             return self._comment_cache[cache_key]
 
-        provider_id = await self._get_provider_id()
+        provider_id = self.filter_provider_id if self.filter_provider_id else await self._get_provider_id()
         if not provider_id:
             self.logger.warning("[MyRSS] no provider for comment")
             return ""
@@ -1340,10 +1547,14 @@ class MyRssPlugin(Star):
             return
 
         # 分发给每个订阅者（各自独立去重）
-        for user in list(subs.keys()):
+        for i, user in enumerate(list(subs.keys())):
             lock = self._get_lock(url, user)
             async with lock:
                 await self._cron_cb_inner(url, user, prefetched_items=items)
+            # 多个订阅者间随机延迟防风控
+            if i < len(subs) - 1:
+                delay = random.uniform(self.push_delay_min, self.push_delay_max)
+                await asyncio.sleep(delay)
 
     async def _cron_cb(self, url: str, user: str) -> None:
         """带锁的定时回调入口，防止同一订阅并发执行"""
@@ -1439,19 +1650,19 @@ class MyRssPlugin(Star):
     # ============================================================
 
     @filter.llm_tool(name="myrss_subscribe")
-    async def tool_sub(self, event: AstrMessageEvent, url: str = "https://example.com", interval: int = 15):
-        """用户想订阅、关注、追踪某个网站或博主更新时调用。传入用户给的链接即可。
-    
+    async def tool_sub(self, event: AstrMessageEvent, url: str = "https://example.com", interval: int = 15, target_group: str = ""):
+        """用户想订阅某个网站/博主更新时调用。
+
         Args:
-            url(string): 用户提供的链接或路径
-            interval(int): 检查间隔(分钟)，默认15
+            url(string): 链接或路由路径
+            interval(int): 间隔分钟数，默认15
+            target_group(string): 指定推送到的群号(可选，不填则推到当前会话)
         """
         if not url or url == "https://example.com":
             yield event.plain_result(
-                "请让用户提供具体链接。支持以下平台自动识别：\n"
-                "B站(space.bilibili.com/UID)、YouTube、Twitter/X、微博、知乎、"
-                "小红书、GitHub、Telegram、抖音、Instagram、Pixiv等。\n"
-                "也可使用 /开头的RSSHub路由路径，如 /bilibili/weekly\n"
+                "需要用户提供链接或路由。支持平台：B站、YouTube、Twitter/X、微博、知乎等。\n"
+                "路由示例：/youtube/community/@用户名、/twitter/user/用户名、/bilibili/user/dynamic/UID\n"
+                "可选参数：interval(分钟)、target_group(指定群号)\n"
                 "详见 https://docs.rsshub.app"
             )
             return
@@ -1507,7 +1718,27 @@ class MyRssPlugin(Star):
             cron_expr = f"*/{interval} * * * *"
         else:
             cron_expr = f"0 */{interval // 60} * * *"
-
+        # 如果指定了目标群
+        if target_group:
+            # 构造目标群的unified_msg_origin
+            pn = event.unified_msg_origin.split(":")[0]
+            target_umo = f"{pn}:GroupMessage:{target_group}"
+            # 临时替换event的origin
+            original_umo = event.unified_msg_origin
+            event._unified_msg_origin = target_umo
+            ret = await self._add(furl, cron_expr, event)
+            event._unified_msg_origin = original_umo
+            if isinstance(ret, MessageEventResult):
+                yield ret
+                return
+            self._reload_jobs()
+            yield event.plain_result(
+                "✅ 订阅成功！\n📡 " + ret["title"] +
+                "\n⏰ 每" + str(show_interval) + unit +
+                "\n📍 推送到群 " + target_group +
+                "\n🔗 " + furl
+            )
+            return
         ret = await self._add(furl, cron_expr, event)
         if isinstance(ret, MessageEventResult):
             yield ret
