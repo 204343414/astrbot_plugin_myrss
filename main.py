@@ -748,7 +748,7 @@ class MyRssPlugin(Star):
         self.global_feed_interval = max(config.get("global_feed_interval", 15), 5)
         self.global_feed_max_interval = max(config.get("global_feed_max_interval", 1440), self.global_feed_interval)
         self._feed_miss_count = {}  # key=url, value=连续无更新次数
-        self._feed_tick = {}  # key=url, value=触发次数（用于退避skip计数）
+        self._feed_tick = {}  # key=url, value=全局订阅触发次数（用于退避skip计数）
         self.push_delay_min = config.get("push_delay_min", 5.0)
         self.push_delay_max = config.get("push_delay_max", 8.0)
         self.filter_provider_id = config.get("filter_provider_id", "")
@@ -1165,34 +1165,33 @@ class MyRssPlugin(Star):
         return min(current, self.global_feed_max_interval)
 
     def _should_skip_this_tick(self, url: str) -> bool:
-    """判断本次tick是否应该跳过（实现退避）
-    修复点：不能用 miss 做取模（skip 时 miss 不变，会导致永远 skip）
-    改为用 tick（每次触发都会增长）来决定“每N次触发执行一次”
-    """
-    miss = self._feed_miss_count.get(url, 0)
-    if miss < 3:
-        return False  # 前3次不跳
+        """判断本次tick是否应该跳过（实现退避）
+        修复点：不能用 miss 做取模（skip 时 miss 不变，会导致永远 skip）
+        改为用 tick（每次触发都会增长）来决定“每N次触发执行一次”
+        """
+        miss = self._feed_miss_count.get(url, 0)
+        if miss < 3:
+            return False  # 前3次不跳
 
-    current_interval = self._get_current_interval(url)
-    base = self.global_feed_interval
-    if base <= 0:
-        return False
+        current_interval = self._get_current_interval(url)
+        base = self.global_feed_interval
+        if base <= 0:
+            return False
 
-    # 需要每多少次基础tick执行一次
-    skip_ratio = max(1, current_interval // base)
+        # 需要每多少次基础tick执行一次
+        skip_ratio = max(1, current_interval // base)
 
-    tick = self._feed_tick.get(url, 0)
-    # 每 skip_ratio 次触发执行 1 次，其它时候跳过
-    return (tick % skip_ratio) != 0
-
+        tick = self._feed_tick.get(url, 0)
+        # 每 skip_ratio 次触发执行 1 次，其它时候跳过
+        return (tick % skip_ratio) != 0
     async def _global_feed_job(self, url: str):
-    """全局订阅的定时推送（带指数退避）"""
-    # tick自增：每次触发都+1，用于退避skip计数
-    self._feed_tick[url] = self._feed_tick.get(url, 0) + 1
+        """全局订阅的定时推送（带指数退避）"""
+        # tick自增：每次触发都+1，用于退避skip计数
+        self._feed_tick[url] = self._feed_tick.get(url, 0) + 1
 
-    # 退避检查：是否跳过本次
-    if self._should_skip_this_tick(url):
-        return
+        # 退避检查：是否跳过本次
+        if self._should_skip_this_tick(url):
+            return
 
         current_interval = self._get_current_interval(url)
         miss = self._feed_miss_count.get(url, 0)
@@ -1300,6 +1299,7 @@ class MyRssPlugin(Star):
                 self.logger.error("[MyRSS] global push failed to %s: %s", group_id, e)
         # 有新内容推送了，重置退避
         self._feed_miss_count[url] = 0
+        self._feed_tick[url] = 0
         self._reset_activity()
         self.logger.info("[MyRSS] global push done")
     async def _get_provider_id(self) -> str:
@@ -1949,24 +1949,59 @@ class MyRssPlugin(Star):
             "\n".join(f"  ✅ {r}" for r in matched)
         )
     @filter.llm_tool(name="myrss_unsubscribe")
-    async def tool_unsub(self, event: AstrMessageEvent, idx: int = 0):
-        """取消订阅，先调用myrss_list获取编号。
-    
+    async def tool_unsub(self, event: AstrMessageEvent, idx: int = 0, idxs: str = ""):
+        """取消订阅（支持多选/清空）。
+
         Args:
-            idx(int): 订阅编号
+            idx(int): 单个编号（兼容旧用法）
+            idxs(string): 多个编号，如 "0、2、4" / "0,2,4" / "0 2 4"
+                         或 "all"/"清空"/"全部"
         """
         user = event.unified_msg_origin
         urls = self.dh.get_subs(user)
-        if idx < 0 or idx >= len(urls):
-            yield event.plain_result("编号" + str(idx) + "不存在，有效范围0~" + str(len(urls) - 1))
+        if not urls:
+            yield event.plain_result("当前没有任何订阅。")
             return
-        u = urls[idx]
-        t = self.dh.data[u]["info"]["title"]
-        self.dh.data[u]["subscribers"].pop(user)
+
+        # 解析要删除的编号列表
+        to_remove = []
+
+        if idxs and str(idxs).strip():
+            s = str(idxs).strip().lower()
+            if s in ("all", "清空", "全部"):
+                to_remove = list(range(len(urls)))
+            else:
+                nums = [int(x) for x in re.findall(r"\d+", s)]
+                to_remove = sorted(set(n for n in nums if 0 <= n < len(urls)))
+                if not to_remove:
+                    yield event.plain_result("没解析到有效编号。示例：0、2、4 或 all/清空/全部")
+                    return
+        else:
+            # 兼容旧逻辑：只删一个 idx
+            if idx < 0 or idx >= len(urls):
+                yield event.plain_result("编号" + str(idx) + "不存在，有效范围0~" + str(len(urls) - 1))
+                return
+            to_remove = [idx]
+
+        removed_titles = []
+        # 注意：这里不要边删边重新取urls；我们用同一份 urls 快照一次性删完
+        for n in to_remove:
+            u = urls[n]
+            t = self.dh.data.get(u, {}).get("info", {}).get("title", u)
+            try:
+                self.dh.data[u]["subscribers"].pop(user, None)
+                removed_titles.append(t)
+            except Exception:
+                pass
+
         self.dh.save()
         self._reload_jobs()
-        yield event.plain_result("✅ 已取消: " + t)
 
+        if removed_titles:
+            msg = "✅ 已取消以下订阅：\n" + "\n".join(f"  - {x}" for x in removed_titles)
+            yield event.plain_result(msg)
+        else:
+            yield event.plain_result("没有取消任何订阅（可能已经被删过）。")
     # ============================================================
     #  手动命令
     # ============================================================
