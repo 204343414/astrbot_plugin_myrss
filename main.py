@@ -849,6 +849,9 @@ class MyRssPlugin(Star):
                 self.logger.info("RSS调度: %s 每%d分钟拉取，%d个订阅者", url, max_minutes, len(subs))
             else:
                 self.logger.info("RSS调度: %s 每%d小时拉取，%d个订阅者", url, max_minutes // 60, len(subs))
+                    # 重建全局订阅 job（因为 remove_all_jobs 会一并清除）
+        if self.global_feeds:
+            self._setup_global_feeds()
 
     async def _fetch(self, url: str):
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
@@ -1312,7 +1315,7 @@ class MyRssPlugin(Star):
         if cache_key in self._comment_cache:
             return self._comment_cache[cache_key]
 
-        provider_id = self.filter_provider_id if self.filter_provider_id else await self._get_provider_id()
+        provider_id = self.comment_provider_id if self.comment_provider_id else await self._get_provider_id()
         if not provider_id:
             self.logger.warning("[MyRSS] no provider for comment")
             return ""
@@ -1789,6 +1792,8 @@ class MyRssPlugin(Star):
             cron_expr = f"*/{interval} * * * *"
         else:
             cron_expr = f"0 */{interval // 60} * * *"
+        unit = "分钟" if interval < 60 else "小时"
+        show_interval = interval if interval < 60 else interval // 60
         # 如果指定了目标群
         if target_group:
             # 构造目标群的unified_msg_origin
@@ -1815,8 +1820,6 @@ class MyRssPlugin(Star):
             yield ret
             return
         self._reload_jobs()
-        unit = "分钟" if interval < 60 else "小时"
-        show_interval = interval if interval < 60 else interval // 60
         yield event.plain_result("✅ 订阅成功！\n📡 " + ret["title"] + "\n📝 " + ret["description"] + "\n⏰ 每" + str(show_interval) + unit + "\n🔗 " + furl)
 
     @filter.llm_tool(name="myrss_list")
