@@ -1023,84 +1023,61 @@ class MyRssPlugin(Star):
 
     async def _add(self, url: str, cron_expr: str, event: AstrMessageEvent):
         user = event.unified_msg_origin
+
+        async def poll_with_retry(u: str, retries: int = 3, sleep_s: int = 5):
+            last = []
+            for i in range(retries):
+                last = await self._poll(u)
+                if last:
+                    return last
+                if i < retries - 1:
+                    await asyncio.sleep(sleep_s)
+            return last
+
+        # 已存在订阅源：只加订阅者
         if url in self.dh.data:
-            # 最多重试3次，每次间隔5秒（应对B站等不稳定源）
-            items = None
-            for attempt in range(3):
-                items = await self._poll(url)
-                if items:
-                    break
-                if attempt < 2:
-                    await asyncio.sleep(5)
+            items = await poll_with_retry(url)
             if not items:
                 return event.plain_result("连续3次无法从该源获取内容，源可能暂时不可用，请稍后重试。")
+
+            self.dh.data[url].setdefault("subscribers", {})
             self.dh.data[url]["subscribers"][user] = {
                 "cron_expr": cron_expr,
                 "last_update": items[0].pubDate_timestamp,
                 "latest_link": items[0].link,
                 "seen_links": [it.link for it in items if it.link][:200],
             }
-        else:
-            text = await self._fetch(url)
-            if text is None:
-                return event.plain_result("无法访问: " + url + "\n请检查RSSHub端点是否可用。")
-            try:
-                title, desc, avatar = self.dh.parse_channel_info(text)
-            except Exception as e:
-                return event.plain_result("解析失败: " + str(e))
-            # 最多重试3次
-            items = None
-            for attempt in range(3):
-                items = await self._poll(url)
-                if items:
-                    break
-                if attempt < 2:
-                    await asyncio.sleep(5)
-            if not items:
-                return event.plain_result("源可访问但连续3次获取不到内容，可能是该平台接口不稳定，请稍后重试。")
-            self.dh.data[url] = {
-                "subscribers": {
-                    user: {
-                        "cron_expr": cron_expr,
-                        "last_update": items[0].pubDate_timestamp,
-                        "latest_link": items[0].link,
-                        "seen_links": [it.link for it in items if it.link][:200],
-                    }
-                },
-                "info": {"title": title, "description": desc, "avatar": avatar},
-            }
-        self.dh.save()
-    return self.dh.data[url]["info"]
-        self.dh.data[url]["subscribers"][user] = {
-            "cron_expr": cron_expr,
-            "last_update": items[0].pubDate_timestamp,
-            "latest_link": items[0].link,
-            "seen_links": [it.link for it in items if it.link][:200],
-        }
-    else:
+
+            self.dh.save()
+            return self.dh.data[url]["info"]
+
+        # 新订阅源：先解析频道信息
         text = await self._fetch(url)
         if text is None:
             return event.plain_result("无法访问: " + url + "\n请检查RSSHub端点是否可用。")
+
         try:
             title, desc, avatar = self.dh.parse_channel_info(text)
         except Exception as e:
             return event.plain_result("解析失败: " + str(e))
-        items = await self._poll(url)
+
+        items = await poll_with_retry(url)
         if not items:
-            return event.plain_result("源可访问但无内容条目。")
+            return event.plain_result("源可访问但连续3次获取不到内容，可能是该平台接口不稳定，请稍后重试。")
+
         self.dh.data[url] = {
             "subscribers": {
                 user: {
                     "cron_expr": cron_expr,
                     "last_update": items[0].pubDate_timestamp,
                     "latest_link": items[0].link,
-                "seen_links": [it.link for it in items if it.link][:200],
-            }
-        },
-        "info": {"title": title, "description": desc, "avatar": avatar},
+                    "seen_links": [it.link for it in items if it.link][:200],
+                }
+            },
+            "info": {"title": title, "description": desc, "avatar": avatar},
         }
-    self.dh.save()
-    return self.dh.data[url]["info"]
+        self.dh.save()
+        return self.dh.data[url]["info"]
     # ============================================================
     #  活跃群检测
     # ============================================================
