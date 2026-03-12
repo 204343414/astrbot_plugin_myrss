@@ -745,6 +745,8 @@ class MyRssPlugin(Star):
             if line.strip() and line.strip().startswith("/")
         ]
         self.global_feed_interval = max(config.get("global_feed_interval", 15), 5)
+        self.global_feed_max_interval = max(config.get("global_feed_max_interval", 1440), self.global_feed_interval)
+        self._feed_miss_count = {}  # key=url, value=连续无更新次数
         self.push_delay_min = config.get("push_delay_min", 5.0)
         self.push_delay_max = config.get("push_delay_max", 8.0)
         self.filter_provider_id = config.get("filter_provider_id", "")
@@ -1107,7 +1109,7 @@ class MyRssPlugin(Star):
     # ============================================================
 
     def _setup_global_feeds(self):
-        """为全局订阅源注册定时任务"""
+        """为全局订阅源注册定时任务（用最短间隔，在job内部动态跳过）"""
         eps = self.dh.data.get("rsshub_endpoints", [])
         if not eps:
             self.logger.warning("[MyRSS] no endpoints for global feeds")
@@ -1116,21 +1118,21 @@ class MyRssPlugin(Star):
         for route in self.global_feeds:
             url = eps[0].rstrip("/") + route
 
-            # 确保数据里有这个URL的记录
             if url not in self.dh.data:
                 self.dh.data[url] = {
                     "subscribers": {},
                     "info": {"title": route, "description": "全局订阅"},
                     "global": True,
                 }
-
             self.dh.data[url]["global"] = True
+            self._feed_miss_count[url] = 0
 
-            # 注册定时任务
-            if self.global_feed_interval < 60:
-                cron = f"*/{self.global_feed_interval} * * * *"
+            # 用基础间隔注册，退避在job内部通过跳过实现
+            base = self.global_feed_interval
+            if base < 60:
+                cron = f"*/{base} * * * *"
             else:
-                cron = f"0 */{self.global_feed_interval // 60} * * *"
+                cron = f"0 */{base // 60} * * *"
 
             job_id = f"myrss_global_{url}"
             self.sched.add_job(
@@ -1141,13 +1143,48 @@ class MyRssPlugin(Star):
                 replace_existing=True,
                 misfire_grace_time=120,
             )
-            self.logger.info("[MyRSS] global feed registered: %s every %d min", route, self.global_feed_interval)
+            self.logger.info("[MyRSS] global feed: %s base=%dmin", route, base)
 
         self.dh.save()
 
+    def _get_current_interval(self, url: str) -> int:
+        """根据连续miss次数计算当前间隔（分钟）"""
+        miss = self._feed_miss_count.get(url, 0)
+        base = self.global_feed_interval
+
+        # 每3次miss翻倍: 0-2次=base, 3-5次=2x, 6-8次=4x, 9-11次=8x...
+        multiplier = 2 ** (miss // 3)
+        current = base * multiplier
+
+        return min(current, self.global_feed_max_interval)
+
+    def _should_skip_this_tick(self, url: str) -> bool:
+        """判断本次tick是否应该跳过（实现退避）"""
+        miss = self._feed_miss_count.get(url, 0)
+        if miss < 3:
+            return False  # 前3次不跳
+
+        # 当前应该的间隔
+        current_interval = self._get_current_interval(url)
+        base = self.global_feed_interval
+
+        # 需要跳过的tick数 = (当前间隔/基础间隔) - 1
+        skip_ratio = current_interval // base
+
+        # 用miss计数来决定：每skip_ratio个tick执行一次
+        if miss % (skip_ratio if skip_ratio > 0 else 1) == 0:
+            return False
+        return True
+
     async def _global_feed_job(self, url: str):
-        """全局订阅的定时推送"""
-        self.logger.info("[MyRSS] global feed job: %s", url)
+        """全局订阅的定时推送（带指数退避）"""
+        # 退避检查：是否跳过本次
+        if self._should_skip_this_tick(url):
+            return
+
+        current_interval = self._get_current_interval(url)
+        miss = self._feed_miss_count.get(url, 0)
+        self.logger.info("[MyRSS] global feed job: %s (miss=%d, interval=%dmin)", url, miss, current_interval)
 
         # 获取全局seen_links
         if url not in self.dh.data:
@@ -1157,6 +1194,10 @@ class MyRssPlugin(Star):
 
         items = await self._poll(url, num=self.max_poll, after_ts=feed_data.get("global_last_update", 0))
         if not items:
+            self._feed_miss_count[url] = self._feed_miss_count.get(url, 0) + 1
+            new_interval = self._get_current_interval(url)
+            self.logger.info("[MyRSS] no new items, miss=%d, next check ~%dmin",
+                           self._feed_miss_count[url], new_interval)
             return
 
         def item_key(it):
@@ -1244,7 +1285,8 @@ class MyRssPlugin(Star):
 
             except Exception as e:
                 self.logger.error("[MyRSS] global push failed to %s: %s", group_id, e)
-
+        # 有新内容推送了，重置退避
+        self._feed_miss_count[url] = 0
         self._reset_activity()
         self.logger.info("[MyRSS] global push done")
     async def _get_provider_id(self) -> str:
@@ -1627,8 +1669,7 @@ class MyRssPlugin(Star):
         new_items = [it for it in items if item_key(it) not in seen]
 
         if not new_items:
-            si["latest_link"] = items[0].link
-            self.dh.save()
+            self._feed_miss_count[url] = self._feed_miss_count.get(url, 0) + 1
             return
 
         # 先更新去重记录再发送，防止并发重推
