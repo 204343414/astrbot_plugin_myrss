@@ -51,7 +51,7 @@
   },
   "comment_provider_id": {
     "description": "锐评用的LLM provider ID（如 xai_source/grok-4-1-fast-reasoning），留空则自动用默认provider",
-    "type": "str",
+    "type": "string",
     "default": ""
   },
   "comment_max_length": {
@@ -61,12 +61,12 @@
   },
   "bot_qq": {
     "description": "Bot的QQ号（用于显示头像）",
-    "type": "str",
+    "type": "string",
     "default": ""
   },
   "bot_provider_name": {
     "description": "Bot使用的服务商名称（显示在锐评旁边）",
-    "type": "str",
+    "type": "string",
     "default": ""
   },
   "content_filter": {
