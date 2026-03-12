@@ -682,8 +682,9 @@ class CardGen:
             comment_w = W - comment_x - PX
             fc_comment = self._f(13)
             comment_lines = self._wrap(comment, fc_comment, comment_w, dr)
-            if len(comment_lines) > 3:
-                comment_lines = comment_lines[:3]
+            # 放宽锐评行数限制，防止被截断
+            if len(comment_lines) > 16:
+                comment_lines = comment_lines[:6]
                 comment_lines[-1] = comment_lines[-1][:-2] + "..."
 
             comment_y = cy + 2
@@ -2176,6 +2177,20 @@ class MyRssPlugin(Star):
             yield event.plain_result("❌ 拉取失败，源无内容或不可访问。")
             return
         item = items[0]
+        # [Hack] 临时把测试源的信息注入 data，让 _make_card_b64 能查到头像/标题
+        if url not in self.dh.data:
+            # 尝试再 fetch 一次拿 channel info
+            try:
+                txt = await self._fetch(url)
+                if txt:
+                    t, d, a = self.dh.parse_channel_info(txt)
+                    self.dh.data[url] = {
+                        "info": {"title": t, "description": d, "avatar": a},
+                        "subscribers": {},  # 空订阅
+                        "is_test": True     # 标记为测试
+                    }
+            except Exception:
+                pass
         yield event.plain_result(f"✅ 拉取成功: {item.title[:80]}")
 
         # 第2步：内容过滤（走真实函数，会用缓存）
