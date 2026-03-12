@@ -1212,7 +1212,10 @@ class MyRssPlugin(Star):
             return
 
         def item_key(it):
-            return it.link if it.link else f"{it.title}|{it.pubDate_timestamp}"
+            if it.link:
+                # 归一化：去掉 query / fragment，避免同一条推文因为参数不同被当成新内容
+                return it.link.split("#", 1)[0].split("?", 1)[0]
+            return f"{it.title}|{it.pubDate_timestamp}"
 
         new_items = [it for it in items if item_key(it) not in seen]
         if not new_items:
@@ -1674,7 +1677,9 @@ class MyRssPlugin(Star):
             return
 
         def item_key(it: RSSItem) -> str:
-            return it.link if it.link else f"{it.title}|{it.pubDate_timestamp}"
+            if it.link:
+                return it.link.split("#", 1)[0].split("?", 1)[0]
+            return f"{it.title}|{it.pubDate_timestamp}"
 
         # 去重
         seen = set(si.get("seen_links", []))
