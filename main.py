@@ -537,7 +537,7 @@ class CardGen:
             H += 18 + 4                                        # 链接行
         if comment:
             H += 6 + 1 + 10                                    # 锐评分割线
-            comment_lines_est = min(3, max(1, len(comment) // 20 + 1))
+            comment_lines_est = min(6, max(1, len(comment) // 15 + 1))
             H += max(32 + 8, comment_lines_est * 18 + 8)       # 锐评区域
             if bot_provider_name:
                 H += 14
@@ -683,7 +683,7 @@ class CardGen:
             fc_comment = self._f(13)
             comment_lines = self._wrap(comment, fc_comment, comment_w, dr)
             # 放宽锐评行数限制，防止被截断
-            if len(comment_lines) > 16:
+            if len(comment_lines) > 6:
                 comment_lines = comment_lines[:6]
                 comment_lines[-1] = comment_lines[-1][:-2] + "..."
 
@@ -1458,6 +1458,7 @@ class MyRssPlugin(Star):
         if not self.content_filter:
             return True
         norm_link = item.link.split("#", 1)[0].split("?", 1)[0] if item.link else ""
+        cache_key = norm_link or (item.title + "|" + str(item.pubDate_timestamp))
         if cache_key in self._safe_cache:
             return self._safe_cache[cache_key]
         # 硬编码关键词兜底（不依赖LLM）
