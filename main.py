@@ -328,42 +328,6 @@ class CardGen:
 
         return None
 
-            def score(name: str) -> int:
-                n = name.lower()
-                s = 0
-                if "notosanscjk" in n or "noto sans cjk" in n:
-                    s += 100
-                if "notosansjp" in n or "noto sans jp" in n:
-                    s += 90
-                if "notosanssc" in n or "noto sans sc" in n:
-                    s += 80
-                if "cjk" in n:
-                    s += 70
-                if "jp" in n or "japan" in n:
-                    s += 60
-                if "sc" in n or "chinese" in n:
-                    s += 50
-                if "minecraft" in n:
-                    s += 40
-                if "中文" in name:
-                    s += 30
-                return -s
-
-            files.sort(key=score)
-            if files:
-                return os.path.join(fonts_dir, files[0])
-
-        for p in [
-            "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
-            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-            "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
-            "/System/Library/Fonts/PingFang.ttc",
-            "C:\\Windows\\Fonts\\msyh.ttc",
-        ]:
-            if os.path.exists(p):
-                return p
-        return None
-
     def _f(self, sz):
         if self.font_path:
             try:
