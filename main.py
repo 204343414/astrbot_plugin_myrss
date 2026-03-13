@@ -576,9 +576,6 @@ class MyRssPlugin(Star):
         _ACTIVE_SCHED = self.sched  # [防冲突] 注册为全局引用，下次init时可找到并销毁
         self.sched.start()
         self._reload_jobs()
-        # 注册全局订阅的定时任务（必须在sched.start()之后）
-        if self.global_feeds:
-            self._setup_global_feeds()
     async def destroy(self):
         """插件卸载/禁用时停止调度器"""
         global _ACTIVE_SCHED
@@ -1006,8 +1003,7 @@ class MyRssPlugin(Star):
         return (tick % skip_ratio) != 0
     async def _global_feed_job(self, url: str):
         """全局订阅的定时推送（带指数退避）"""
-        async with self._data_lock:
-            await self._global_feed_job_inner(url)
+        await self._global_feed_job_inner(url)
 
     async def _global_feed_job_inner(self, url: str):
         """全局推送实际逻辑（被 _data_lock 保护）"""
@@ -1022,8 +1018,8 @@ class MyRssPlugin(Star):
         miss = self._feed_miss_count.get(url, 0)
         self.logger.info("[MyRSS] global feed job: %s (miss=%d, interval=%dmin)", url, miss, current_interval)
 
-        # [防冲突] 每次执行前从磁盘重载，防止被 _cron_cb_inner 的 _load() 覆盖导致 seen_links 丢失
-        self.dh.data = self.dh._load()
+        async with self._data_lock:
+            self.dh.data = self.dh._load()
 
         # 获取全局seen_links
         if url not in self.dh.data:
@@ -1523,12 +1519,11 @@ class MyRssPlugin(Star):
             await self._cron_cb_inner(url, user)
 
     async def _cron_cb_inner(self, url: str, user: str, prefetched_items=None) -> None:
-        async with self._data_lock:
-            await self._cron_cb_inner_impl(url, user, prefetched_items)
+        await self._cron_cb_inner_impl(url, user, prefetched_items)
 
     async def _cron_cb_inner_impl(self, url: str, user: str, prefetched_items=None) -> None:
-        # [防冲突] 每次推送前从磁盘重载数据，拿到最新的seen_links
-        self.dh.data = self.dh._load()
+        async with self._data_lock:
+            self.dh.data = self.dh._load()
 
         if url not in self.dh.data or user not in self.dh.data[url].get("subscribers", {}):
             return
