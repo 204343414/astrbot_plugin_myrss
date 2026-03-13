@@ -1058,7 +1058,7 @@ class MyRssPlugin(Star):
             return False
 
     async def _process_vote(self, event: AstrMessageEvent):
-        """处理群友对推荐的投票"""
+        """处理群友对推荐的投票：1人同意即订阅，1人拒绝即取消"""
         group_id = event.unified_msg_origin
         text = ""
         try:
@@ -1073,11 +1073,6 @@ class MyRssPlugin(Star):
         if not is_agree and not is_reject:
             return
 
-        try:
-            voter = str(event.message_obj.sender.user_id)
-        except Exception:
-            voter = f"anon_{int(time.time())}"
-
         target_rec_id = None
         target_rec = None
         for rec_id, rec in sorted(self._pending_recs.items(), key=lambda x: x[1].get("created_at", 0), reverse=True):
@@ -1090,47 +1085,31 @@ class MyRssPlugin(Star):
 
         if not target_rec:
             return
-        
-        # 检查是否超时自动通过（1小时无人拒绝）
-        elapsed = time.time() - target_rec.get("created_at", 0)
-        if elapsed > 3600:
-            gs = target_rec["groups"][group_id]
-            if gs.get("status") == "pending":
-                gs["status"] = "approved"
-                self._save_recs()
-                ok = await self._auto_subscribe(
-                    target_rec["url"], group_id, target_rec.get("interval", 30)
-                )
-                title = target_rec.get("title", "未知")
-                if ok:
-                    await self.ctx.send_message(group_id, MessageChain(chain=[
-                        Comp.Plain(f"✅ 推荐「{title}」1小时无人拒绝，已自动订阅！")
-                    ]))
-                return
 
         gs = target_rec["groups"][group_id]
+        title = target_rec.get("title", "未知")
 
         if is_agree:
-            if voter not in gs.get("agrees", []):
-                gs.setdefault("agrees", []).append(voter)
-                self._save_recs()
+            gs["status"] = "approved"
+            self._save_recs()
+            ok = await self._auto_subscribe(
+                target_rec["url"], group_id, target_rec.get("interval", 30)
+            )
+            if ok:
+                await self.ctx.send_message(group_id, MessageChain(chain=[
+                    Comp.Plain(f"✅ 已订阅「{title}」\n⏰ 每{target_rec.get('interval', 30)}分钟检查更新")
+                ]))
+            else:
+                await self.ctx.send_message(group_id, MessageChain(chain=[
+                    Comp.Plain(f"⚠️ 订阅失败，请手动订阅: {target_rec.get('route', '')}")
+                ]))
 
-            if len(gs["agrees"]) >= 1:
-                gs["status"] = "approved"
-                self._save_recs()
-                ok = await self._auto_subscribe(
-                    target_rec["url"], group_id, target_rec.get("interval", 30)
-                )
-                title = target_rec.get("title", "未知")
-                interval = target_rec.get("interval", 30)
-                if ok:
-                    await self.ctx.send_message(group_id, MessageChain(chain=[
-                        Comp.Plain(f"✅ 推荐通过！已自动订阅「{title}」\n⏰ 每{interval}分钟检查更新")
-                    ]))
-                else:
-                    await self.ctx.send_message(group_id, MessageChain(chain=[
-                        Comp.Plain(f"⚠️ 投票通过但订阅失败，请手动订阅: {target_rec.get('route', '')}")
-                    ]))
+        elif is_reject:
+            gs["status"] = "rejected"
+            self._save_recs()
+            await self.ctx.send_message(group_id, MessageChain(chain=[
+                Comp.Plain(f"❌ 推荐「{title}」已取消")
+            ]))
 
         elif is_reject:
             if voter not in gs.get("rejects", []):
