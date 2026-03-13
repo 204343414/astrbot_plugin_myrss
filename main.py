@@ -333,7 +333,7 @@ body{font-family:"Noto Sans SC","Noto Sans CJK SC","PingFang SC",
   <div class="rc-vt">
     <div class="rc-vid">推荐编号: {{rec_id}}</div>
     <div class="rc-vp">回复「同意」订阅 / 回复「拒绝」取消</div>
-    <div class="rc-vi">1人同意即订阅 · 3人拒绝则取消</div>
+    <div class="rc-vi">1人回复即生效 · 1小时无人回复自动订阅</div>
   </div>
 </div>
 </body></html>"""
