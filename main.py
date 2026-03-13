@@ -2163,3 +2163,19 @@ class MyRssPlugin(Star):
             else:
                 lines.append(f"  🟢 {gid} - 已就绪")
         yield event.plain_result("\n".join(lines))
+    @myrss.command("resetglobal")
+    async def cmd_resetglobal(self, event: AstrMessageEvent):
+        """重置全局订阅的已推送记录，下次检查时重新推送"""
+        count = 0
+        for url, info in self.dh.data.items():
+            if url in ("rsshub_endpoints", "settings"):
+                continue
+            if info.get("global"):
+                info["global_seen_links"] = []
+                info["global_last_update"] = 0
+                count += 1
+        self.dh.save()
+        self._feed_miss_count.clear()
+        self._feed_tick.clear()
+        self._group_cooldown.clear()
+        yield event.plain_result(f"✅ 已重置 {count} 个全局源的推送记录和冷却\n下次检查（~5分钟内）将重新推送")
