@@ -1386,7 +1386,8 @@ class MyRssPlugin(Star):
 
     async def _generate_comment(self, item: RSSItem) -> str:
         """调用LLM生成锐评，带缓存"""
-        cache_key = item.link or (item.title + "|" + str(item.pubDate_timestamp))
+        norm_link = item.link.split("#", 1)[0].split("?", 1)[0] if item.link else ""
+        cache_key = norm_link or (item.title + "|" + str(item.pubDate_timestamp))
 
         # 命中缓存直接返回
         if cache_key in self._comment_cache:
@@ -1403,18 +1404,15 @@ class MyRssPlugin(Star):
             desc_short = item.description[:200]
             content_summary += "\n" + desc_short
 
-        # 获取人格设定
+        # 获取人格设定（v4 正统：PersonaManager）
         system_prompt = None
         if self.comment_persona:
             try:
-                cfg = self.ctx.get_config()
-                personas = cfg.get("persona", [])
-                for p in personas:
-                    if p.get("name") == self.comment_persona:
-                        system_prompt = p.get("prompt", "")
-                        break
+                persona = self.ctx.persona_manager.get_persona(self.comment_persona)
+                if persona:
+                    system_prompt = persona.system_prompt
             except Exception:
-                pass
+                system_prompt = None
 
         prompt = (
             f"你正在看一条来自「{item.chan_title}」的动态更新，内容如下：\n"
@@ -1459,7 +1457,7 @@ class MyRssPlugin(Star):
         """检查内容是否安全，不安全返回False"""
         if not self.content_filter:
             return True
-        cache_key = item.link or (item.title + "|" + str(item.pubDate_timestamp))
+        norm_link = item.link.split("#", 1)[0].split("?", 1)[0] if item.link else ""
         if cache_key in self._safe_cache:
             return self._safe_cache[cache_key]
         # 硬编码关键词兜底（不依赖LLM）
@@ -2252,7 +2250,8 @@ class MyRssPlugin(Star):
 
         # 第2步：内容过滤（走真实函数，会用缓存）
         yield event.plain_result("🔍 [2/4] 正在过滤内容（LLM审核）...")
-        cache_key = item.link or (item.title + "|" + str(item.pubDate_timestamp))
+        norm_link = item.link.split("#", 1)[0].split("?", 1)[0] if item.link else ""
+        cache_key = norm_link or (item.title + "|" + str(item.pubDate_timestamp))
         was_cached = cache_key in self._safe_cache
         safe = await self._check_content_safe(item)
         if not safe:
