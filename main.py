@@ -1151,12 +1151,16 @@ class MyRssPlugin(Star):
                 pn = group_id.split(":")[0]
                 if pn == "aiocqhttp" and self.compose:
                     node = Comp.Node(uin=0, name="Astrbot", content=push_comps)
-                    await self.ctx.send_message(group_id, MessageChain(chain=[node], use_t2i_=self.t2i))
+                    ret = await self.ctx.send_message(group_id, MessageChain(chain=[node], use_t2i_=self.t2i))
                 else:
-                    await self.ctx.send_message(group_id, MessageChain(chain=push_comps, use_t2i_=self.t2i))
+                    ret = await self.ctx.send_message(group_id, MessageChain(chain=push_comps, use_t2i_=self.t2i))
 
-                # 推送成功，记录冷却时间
-                self._group_cooldown[group_id] = time.time()
+                # 只有确认发送成功才设冷却（send_message 失败时返回 None）
+                if ret is not None and ret is not False:
+                    self._group_cooldown[group_id] = time.time()
+                    self.logger.info("[MyRSS] push ok to %s", group_id)
+                else:
+                    self.logger.warning("[MyRSS] push to %s returned %s, skip cooldown", group_id, ret)
 
                 # 随机延迟防风控
                 delay = random.uniform(self.push_delay_min, self.push_delay_max)
