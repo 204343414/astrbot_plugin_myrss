@@ -270,22 +270,63 @@ class CardGen:
         self.font_path = self._find()
 
     def _find(self):
+        # 1. 插件目录下的字体（优先级最高）
         base_dir = os.path.dirname(__file__)
-        root_fonts = []
         for fn in os.listdir(base_dir):
-            lower = fn.lower()
-            if lower.endswith((".ttf", ".otf", ".ttc")):
-                root_fonts.append(os.path.join(base_dir, fn))
-        if root_fonts:
-            return root_fonts[0]
+            if fn.lower().endswith((".ttf", ".otf", ".ttc")):
+                return os.path.join(base_dir, fn)
 
-        fonts_dir = os.path.join(os.path.dirname(__file__), "fonts")
+        fonts_dir = os.path.join(base_dir, "fonts")
         if os.path.isdir(fonts_dir):
-            files = []
             for fn in os.listdir(fonts_dir):
-                lower = fn.lower()
-                if lower.endswith((".ttf", ".otf", ".ttc")):
-                    files.append(fn)
+                if fn.lower().endswith((".ttf", ".otf", ".ttc")):
+                    return os.path.join(fonts_dir, fn)
+
+        # 2. 递归扫描系统字体目录
+        system_font_dirs = ["/usr/share/fonts", "/usr/local/share/fonts"]
+        best = None
+        fallback = None
+        for font_dir in system_font_dirs:
+            if not os.path.isdir(font_dir):
+                continue
+            for root, dirs, files in os.walk(font_dir):
+                for fn in files:
+                    if not fn.lower().endswith((".ttf", ".otf", ".ttc")):
+                        continue
+                    full = os.path.join(root, fn)
+                    low = fn.lower()
+                    # 跳过 ColorEmoji（Pillow 不支持渲染）
+                    if "emoji" in low or "color" in low:
+                        continue
+                    # 优先选 CJK/中文/日文字体
+                    if any(kw in low for kw in ("cjk", "noto", "wqy", "zenhei", "microhei",
+                                                 "chinese", "sc", "jp", "kr", "gothic",
+                                                 "ipag", "ipa")):
+                        if best is None:
+                            best = full
+                    elif fallback is None:
+                        fallback = full
+        if best:
+            return best
+        if fallback:
+            return fallback
+
+        # 3. 都没有：自动下载（只下载一次）
+        cache_path = os.path.join(base_dir, "NotoSansSC-Regular.otf")
+        if os.path.exists(cache_path):
+            return cache_path
+
+        dl_url = "https://github.com/notofonts/noto-cjk/raw/main/Sans/OTF/SimplifiedChinese/NotoSansSC-Regular.otf"
+        try:
+            import urllib.request
+            logging.getLogger("astrbot").info("[MyRSS] 系统无CJK字体，正在下载 NotoSansSC...")
+            urllib.request.urlretrieve(dl_url, cache_path)
+            logging.getLogger("astrbot").info("[MyRSS] 字体下载完成: %s", cache_path)
+            return cache_path
+        except Exception as e:
+            logging.getLogger("astrbot").warning("[MyRSS] 字体下载失败: %s", e)
+
+        return None
 
             def score(name: str) -> int:
                 n = name.lower()
@@ -423,6 +464,28 @@ class CardGen:
             except Exception:
                 continue
         return ts_str[:25] if len(ts_str) > 25 else ts_str
+    @staticmethod
+    def _clean_emoji(text):
+        """把常见 emoji 替换成文字，其余无法渲染的直接去掉"""
+        if not text:
+            return text
+        replacements = {
+            "🔗": "[链接]", "📡": "[源]", "📝": "[文]", "📋": "[列表]",
+            "✅": "[OK]", "❌": "[X]", "⚠️": "[!]", "🔍": "[搜]",
+            "💬": "[评]", "🎨": "[图]", "⏳": "[等]", "⏭️": "[跳]",
+            "🚫": "[禁]", "💡": "[提示]", "🔴": "[●]", "🟢": "[○]",
+            "🎉": "[庆]", "🔥": "[火]", "👍": "[赞]", "👎": "[踩]",
+            "❤️": "[心]", "😂": "[笑]", "😊": "[笑]", "🤔": "[想]",
+            "💦": "[汗]", "✨": "[闪]", "⭐": "[星]", "🌟": "[星]",
+        }
+        for emoji, replacement in replacements.items():
+            text = text.replace(emoji, replacement)
+        # 去掉剩余无法渲染的 emoji
+        text = re.sub(r'[\U0001F000-\U0001FFFF]', '', text)
+        text = re.sub(r'[\U00002600-\U000027BF]', '', text)
+        text = re.sub(r'[\U0000FE00-\U0000FE0F]', '', text)
+        text = re.sub(r'[\U0000200D]', '', text)
+        return text
     def make(self, channel="", title="", desc="", link="", ts="", thumb=None, avatar=None, comment="", bot_avatar=None, bot_provider_name=""):
         """生成 Twitter/X 风格的动态卡片
 
@@ -471,6 +534,12 @@ class CardGen:
         # 标题和正文分开处理（而不是合并成一段）
         # 这样标题可以用大字体，正文用小字体，有层次感
         # 如果标题和正文内容重复，则只显示标题
+        # 清理 emoji，防止渲染成 "?"
+        channel = self._clean_emoji(channel) or channel
+        title = self._clean_emoji(title) or title
+        desc = self._clean_emoji(desc) or desc
+        comment = self._clean_emoji(comment) or comment
+        link = self._clean_emoji(link) or link
         show_title = title and title not in ("无标题", "")
         title_lines = self._wrap(title, fh, CW, d0) if show_title else []
         if len(title_lines) > 4:
