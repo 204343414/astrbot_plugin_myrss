@@ -28,6 +28,7 @@ import astrbot.api.message_components as Comp
 # [防冲突] 模块级变量追踪当前活跃的调度器
 # 插件热更新时新实例先通过此引用杀掉老调度器，避免新老并行双推
 _ACTIVE_SCHED = None
+_ALL_SCHEDS = set()  # 追踪所有调度器，防多实例
 
 
 @dataclass
@@ -368,6 +369,7 @@ body{
         self._env = Environment(loader=BaseLoader(), autoescape=True)
         self._tpl = self._env.from_string(self.CARD_HTML)
         self.logger = logging.getLogger("astrbot")
+        self._sema = asyncio.Semaphore(2)  # 最多同时 2 个截图请求
 
     def _format_time(self, ts_str):
         """把RSS时间字符串简化为 YYYY-MM-DD HH:MM"""
@@ -448,20 +450,15 @@ body{
             return ""
 
     async def _screenshot(self, html: str) -> str:
-        """POST HTML 到 browserless，返回 base64 PNG
-
-        自动尝试 v1 (/screenshot) 和 v2 (/chromium/screenshot) 端点。
-        """
         payload = {
             "html": html,
             "options": {
                 "fullPage": True,
                 "type": "png",
             },
-            # viewport 宽度 = 卡片宽度，确保截图不留白边
             "viewport": {
                 "width": self.w,
-                "height": 1,              # 高度设1，fullPage自动按内容裁切
+                "height": 1,
                 "deviceScaleFactor": 2,
             },
             "gotoOptions": {
@@ -469,38 +466,42 @@ body{
             },
         }
 
-        # v1 和 v2 端点都试一下，谁通用谁
         endpoints = [
             f"{self.browserless_url}/chromium/screenshot",
         ]
 
-        conn = aiohttp.TCPConnector(ssl=False)
-        timeout = aiohttp.ClientTimeout(total=30)
+        async with self._sema:
+            conn = aiohttp.TCPConnector(ssl=False)
+            timeout = aiohttp.ClientTimeout(total=30)
 
-        async with aiohttp.ClientSession(connector=conn, timeout=timeout) as session:
-            for ep in endpoints:
-                try:
-                    async with session.post(
-                        ep, json=payload,
-                        headers={"Content-Type": "application/json"},
-                    ) as resp:
-                        if resp.status == 200:
-                            ct = resp.headers.get("Content-Type", "")
-                            data = await resp.read()
-                            # 校验返回的确实是图片（不是 JSON 错误信息）
-                            if len(data) > 500 and (
-                                "image" in ct or data[:4] == b'\x89PNG'
-                            ):
-                                self.logger.debug("[CardGen] 截图成功 via %s (%d bytes)", ep, len(data))
-                                return base64.b64encode(data).decode()
-                        # 非200或非图片，记录日志后尝试下一个端点
-                        body = await resp.text()
-                        self.logger.warning("[CardGen] %s -> HTTP %d: %s", ep, resp.status, body[:200])
-                except aiohttp.ClientError as e:
-                    self.logger.warning("[CardGen] %s 连接失败: %s", ep, e)
-                    continue
+            async with aiohttp.ClientSession(connector=conn, timeout=timeout) as session:
+                for ep in endpoints:
+                    # 429 重试（最多 3 次，间隔递增）
+                    for attempt in range(3):
+                        try:
+                            async with session.post(
+                                ep, json=payload,
+                                headers={"Content-Type": "application/json"},
+                            ) as resp:
+                                if resp.status == 200:
+                                    ct = resp.headers.get("Content-Type", "")
+                                    data = await resp.read()
+                                    if len(data) > 500 and (
+                                        "image" in ct or data[:4] == b'\x89PNG'
+                                    ):
+                                        return base64.b64encode(data).decode()
+                                elif resp.status == 429:
+                                    wait = 2 ** attempt
+                                    self.logger.warning("[CardGen] 429, retry in %ds (attempt %d/3)", wait, attempt + 1)
+                                    await asyncio.sleep(wait)
+                                    continue
+                                body = await resp.text()
+                                self.logger.warning("[CardGen] %s -> HTTP %d: %s", ep, resp.status, body[:200])
+                        except aiohttp.ClientError as e:
+                            self.logger.warning("[CardGen] %s 连接失败: %s", ep, e)
+                        break  # 非429错误不重试
 
-        raise RuntimeError("browserless 所有端点均不可用，请检查容器是否运行")
+        raise RuntimeError("browserless 不可用")
 
 @register("astrbot_plugin_myrss", "MyRSS", "RSS订阅插件(LLM增强版)", "1.0.0", "")
 class MyRssPlugin(Star):
@@ -565,18 +566,21 @@ class MyRssPlugin(Star):
         # [防冲突] 在创建新调度器前，先杀掉模块级残留的老调度器
         # 场景：插件热更新时框架直接创建新实例，老实例的destroy()可能未被调用
         # 如果不杀，老调度器继续运行老代码的job，和新调度器同时推送→双推
-        global _ACTIVE_SCHED
-        if _ACTIVE_SCHED is not None:
+        global _ACTIVE_SCHED, _ALL_SCHEDS
+        # 杀掉所有残留的调度器（不只是上一个）
+        for old_sched in list(_ALL_SCHEDS):
             try:
-                if _ACTIVE_SCHED.running:
-                    _ACTIVE_SCHED.shutdown(wait=True)
-                    self.logger.warning("MyRSS: 已强制停止残留的老调度器 id=%s", id(_ACTIVE_SCHED))
+                if old_sched.running:
+                    old_sched.shutdown(wait=False)
+                    self.logger.warning("MyRSS: 停止残留调度器 id=%s", id(old_sched))
             except Exception:
                 pass
-            _ACTIVE_SCHED = None
+        _ALL_SCHEDS.clear()
+        _ACTIVE_SCHED = None
 
         self.sched = AsyncIOScheduler()
-        _ACTIVE_SCHED = self.sched  # [防冲突] 注册为全局引用，下次init时可找到并销毁
+        _ACTIVE_SCHED = self.sched
+        _ALL_SCHEDS.add(self.sched)
         self.sched.start()
         self._reload_jobs()
     async def destroy(self):
@@ -591,6 +595,7 @@ class MyRssPlugin(Star):
             # [防冲突] 清除全局引用，防止下次init误杀已关闭的对象
             if _ACTIVE_SCHED is self.sched:
                 _ACTIVE_SCHED = None
+            _ALL_SCHEDS.discard(self.sched)
         except Exception as e:
             self.logger.error("MyRSS: 停止调度器失败: %s", e)
 
