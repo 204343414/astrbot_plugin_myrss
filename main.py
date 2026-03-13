@@ -461,8 +461,8 @@ body{
             # viewport 宽度 = 卡片宽度，确保截图不留白边
             "viewport": {
                 "width": self.w,
-                "height": 800,
-                "deviceScaleFactor": 2,   # 2x 清晰度，文字更锐利
+                "height": 1,              # 高度设1，fullPage自动按内容裁切
+                "deviceScaleFactor": 2,
             },
             "gotoOptions": {
                 "waitUntil": "domcontentloaded",
@@ -1458,7 +1458,10 @@ class MyRssPlugin(Star):
                 bot_avatar=bot_avt,
                 bot_provider_name=self.bot_provider_name,
             )
-            comps.append(Comp.Image.fromBase64(b64))
+            if b64:
+                comps.append(Comp.Image.fromBase64(b64))
+            else:
+                comps.append(Comp.Plain("📡 " + item.chan_title + "\n📝 " + item.title + "\n" + item.description))
         except Exception as e:
             self.logger.error("卡片生成失败: %s", e)
             comps.append(Comp.Plain("📡 " + item.chan_title + "\n📝 " + item.title + "\n" + item.description))
