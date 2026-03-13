@@ -2329,7 +2329,7 @@ class MyRssPlugin(Star):
 
         card_comps = [
             Comp.Image.fromBase64(b64),
-            Comp.Plain(f"\n📢 有人推荐订阅「{title}」\n回复「同意」订阅 / 回复「拒绝」取消\n（1人同意即通过，3人拒绝则取消）"),
+            Comp.Plain(f"\n📢 有人推荐订阅「{title}」\n回复「同意」订阅 / 回复「拒绝」取消\n（1人回复即生效，1小时无人回复自动订阅）"),
         ]
 
         sent_count = 0
@@ -2360,7 +2360,7 @@ class MyRssPlugin(Star):
             f"  📮 成功: {sent_count}群 / 失败: {fail_count}群\n"
             f"  🆔 编号: {rec_id}\n"
             f"  ⏰ 通过后订阅间隔: {max(interval, 15)}分钟\n\n"
-            f"群友回复「同意」或「拒绝」即可投票"
+            f"群友回复「同意」或「拒绝」即可，1小时无人回复自动订阅"
         )
     @filter.llm_tool(name="myrss_unsubscribe")
     async def tool_unsub(self, event: AstrMessageEvent, idx: int = 0, idxs: str = ""):
@@ -2798,7 +2798,7 @@ class MyRssPlugin(Star):
 
         card_comps = [
             Comp.Image.fromBase64(b64),
-            Comp.Plain(f"\n📢 有人推荐订阅「{title}」\n回复「同意」订阅 / 回复「拒绝」取消\n（1人同意即通过，3人拒绝则取消）"),
+            Comp.Plain(f"\n📢 有人推荐订阅「{title}」\n回复「同意」订阅 / 回复「拒绝」取消\n（1人回复即生效，1小时无人回复自动订阅）"),
         ]
 
         sent_count = 0
@@ -2816,7 +2816,7 @@ class MyRssPlugin(Star):
             except Exception as e:
                 self.logger.error("[MyRSS] recommend send failed: %s", e)
 
-        yield event.plain_result(f"✅ 推荐已发送到 {sent_count}/{len(target_groups)} 个群\n编号: {rec_id}\n群友回复「同意」或「拒绝」投票")
+        yield event.plain_result(f"✅ 推荐已发送到 {sent_count}/{len(target_groups)} 个群\n编号: {rec_id}\n群友回复「同意」或「拒绝」即可，1小时无人回复自动订阅")
     async def _check_rec_timeout(self):
         """检查超时的推荐，1小时无人拒绝自动通过"""
         now = time.time()
