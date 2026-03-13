@@ -2220,11 +2220,12 @@ class MyRssPlugin(Star):
 
     @filter.llm_tool(name="myrss_recommend")
     async def tool_recommend(self, event: AstrMessageEvent, route: str = "", group_ids: str = "", interval: int = 30):
-        """把频道推荐到指定群，群友投票同意后自动订阅。
+        """用户说"推荐到群""发到群""推到群"时调用此工具（不是preview）。把上次预览的频道推荐到指定群，群友投票同意后自动订阅。
+        route参数可以留空，会自动使用上次预览的频道。
 
         Args:
-            route(string): RSSHub路由（可从preview获取）
-            group_ids(string): 目标群号，逗号分隔。传"all"推到所有群
+            route(string): RSSHub路由，留空则用上次预览的。如 /twitter/user/hachi_08
+            group_ids(string): 目标群号，逗号分隔，如 "721058477,123456"。传"all"推到所有群
             interval(int): 订阅间隔分钟数，默认30
         """
         if not route:
