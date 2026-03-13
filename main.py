@@ -558,7 +558,7 @@ class MyRssPlugin(Star):
 
         # 防并发锁，key = (url, user)
         self._locks: dict = {}
-
+        self._data_lock = asyncio.Lock()  # 保护 dh.data 读写
         # [防冲突] 在创建新调度器前，先杀掉模块级残留的老调度器
         # 场景：插件热更新时框架直接创建新实例，老实例的destroy()可能未被调用
         # 如果不杀，老调度器继续运行老代码的job，和新调度器同时推送→双推
