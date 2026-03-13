@@ -2123,9 +2123,15 @@ class MyRssPlugin(Star):
     @filter.llm_tool(name="myrss_preview")
     async def tool_preview(self, event: AstrMessageEvent, url: str = ""):
         """用户想查看/搜索某个频道的信息时调用。生成频道预览卡片。
+        
+        常用路由格式（直接填到url参数里）：
+        - 推特/X: /twitter/user/用户名  （如 /twitter/user/Google）
+        - B站: /bilibili/user/dynamic/UID
+        - YouTube: /youtube/user/@用户名
+        - 也可以传完整链接如 https://x.com/Google
 
         Args:
-            url(string): 频道链接或RSSHub路由
+            url(string): 频道链接或RSSHub路由，如 /twitter/user/Google 或 https://x.com/Google
         """
         if not url:
             yield event.plain_result(
