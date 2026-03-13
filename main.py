@@ -2710,3 +2710,107 @@ class MyRssPlugin(Star):
         self._feed_tick.clear()
         self._group_cooldown.clear()
         yield event.plain_result(f"✅ 已重置 {count} 个全局源的推送记录和冷却\n下次检查（~5分钟内）将重新推送")
+    @myrss.command("recommend")
+    async def cmd_recommend(self, event: AstrMessageEvent, group_id: str = "", route: str = ""):
+        """手动推荐上次预览的频道到指定群
+        用法：/myrss recommend 721058477
+              /myrss recommend 721058477 /twitter/user/hachi_08
+        """
+        if not group_id:
+            yield event.plain_result("用法: /myrss recommend <群号> [路由]\n群号必填，路由不填则用上次预览的频道")
+            return
+
+        if not route:
+            if self._last_preview:
+                route = self._last_preview["route"]
+            else:
+                yield event.plain_result("没有上次预览的频道。请先预览一个频道或提供路由。")
+                return
+
+        eps = self.dh.data.get("rsshub_endpoints", [])
+        if not eps:
+            yield event.plain_result("未配置RSSHub端点。")
+            return
+
+        if not route.startswith("/"):
+            route = "/" + route
+
+        full_url = eps[0].rstrip("/") + route
+        pn = event.unified_msg_origin.split(":")[0]
+        gids = [g.strip() for g in re.split(r'[,，\s]+', group_id) if g.strip()]
+        target_groups = [f"{pn}:GroupMessage:{gid}" for gid in gids]
+
+        yield event.plain_result(f"📡 正在准备推荐卡片 {route} → {gids}...")
+
+        text = await self._fetch(full_url)
+        title, desc, avatar_url = "未知", "", ""
+        if text:
+            try:
+                title, desc, avatar_url = self.dh.parse_channel_info(text)
+            except Exception:
+                pass
+
+        if self._last_preview and self._last_preview.get("route") == route:
+            title = self._last_preview.get("title", title)
+            desc = self._last_preview.get("description", desc)
+            avatar_url = self._last_preview.get("avatar_url", avatar_url)
+
+        items = await self._poll(full_url, num=3)
+        previews = [{"title": it.title, "time": self.card._format_time(it.pubDate) if it.pubDate else ""} for it in items]
+
+        avt_data = None
+        if avatar_url:
+            try:
+                conn = aiohttp.TCPConnector(ssl=False)
+                async with aiohttp.ClientSession(trust_env=True, connector=conn) as s:
+                    async with s.get(avatar_url, timeout=aiohttp.ClientTimeout(total=5)) as r:
+                        if r.status == 200:
+                            avt_data = await r.read()
+            except Exception:
+                pass
+
+        rec_id = f"R{int(time.time()) % 100000:05d}"
+        b64 = await self.card.make_rec_card(
+            title=title, description=desc, avatar=avt_data,
+            route=route, previews=previews, rec_id=rec_id,
+        )
+
+        if not b64:
+            yield event.plain_result("❌ 推荐卡片生成失败。")
+            return
+
+        groups_state = {}
+        for gid in target_groups:
+            groups_state[gid] = {"agrees": [], "rejects": [], "status": "pending"}
+
+        self._pending_recs[rec_id] = {
+            "route": route, "url": full_url, "title": title,
+            "description": desc, "avatar_url": avatar_url,
+            "recommender": event.unified_msg_origin,
+            "groups": groups_state,
+            "interval": 30,
+            "created_at": time.time(),
+        }
+        self._save_recs()
+
+        card_comps = [
+            Comp.Image.fromBase64(b64),
+            Comp.Plain(f"\n📢 有人推荐订阅「{title}」\n回复「同意」订阅 / 回复「拒绝」取消\n（1人同意即通过，3人拒绝则取消）"),
+        ]
+
+        sent_count = 0
+        for gid in target_groups:
+            try:
+                gpn = gid.split(":")[0]
+                if gpn == "aiocqhttp" and self.compose:
+                    node = Comp.Node(uin=0, name="频道推荐", content=card_comps)
+                    ret = await self.ctx.send_message(gid, MessageChain(chain=[node]))
+                else:
+                    ret = await self.ctx.send_message(gid, MessageChain(chain=card_comps))
+                if ret is not None and ret is not False:
+                    sent_count += 1
+                await asyncio.sleep(2)
+            except Exception as e:
+                self.logger.error("[MyRSS] recommend send failed: %s", e)
+
+        yield event.plain_result(f"✅ 推荐已发送到 {sent_count}/{len(target_groups)} 个群\n编号: {rec_id}\n群友回复「同意」或「拒绝」投票")
