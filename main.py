@@ -16,7 +16,8 @@ from typing import List
 
 from lxml import etree
 from bs4 import BeautifulSoup
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image
+from jinja2 import Environment, BaseLoader
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult, MessageChain
@@ -264,155 +265,112 @@ class URLMapper:
 
 
 class CardGen:
-    def __init__(self, width=480):
+    """HTML模板 + Browserless 截图的卡片生成器（替代 Pillow）
+    
+    优势：
+    - Emoji 原生彩色渲染
+    - CSS 排版，不用手算像素坐标
+    - 图片/头像用 <img> data URI，不怕防盗链
+    """
+
+    CARD_HTML = r"""<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{
+  font-family:"Noto Sans SC","Noto Sans CJK SC","PingFang SC",
+              -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,
+              "Helvetica Neue",sans-serif;
+  background:#fff;
+  width:{{width}}px;
+  -webkit-font-smoothing:antialiased;
+}
+.card{padding:14px 16px;border-bottom:1px solid #EFF3F4}
+.hdr{display:flex;align-items:center;margin-bottom:10px}
+.avt{width:48px;height:48px;border-radius:50%;flex-shrink:0;
+     margin-right:12px;overflow:hidden;border:1px solid #EFF3F4}
+.avt img{width:100%;height:100%;object-fit:cover}
+.avt-ph{width:48px;height:48px;border-radius:50%;flex-shrink:0;
+        margin-right:12px;background:#1D9BF0;
+        display:flex;align-items:center;justify-content:center;
+        color:#fff;font-size:20px;font-weight:700;line-height:1}
+.meta{overflow:hidden;display:flex;align-items:baseline;flex-wrap:nowrap}
+.name{font-weight:700;font-size:15px;color:#0F1419;
+      white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+      max-width:260px}
+.tm{font-size:13px;color:#536471;white-space:nowrap;margin-left:2px}
+.body{margin-left:60px}
+.ttl{font-size:17px;font-weight:700;color:#0F1419;line-height:1.5;
+     margin-bottom:6px;
+     display:-webkit-box;-webkit-line-clamp:4;
+     -webkit-box-orient:vertical;overflow:hidden}
+.dsc{font-size:15px;color:#536471;line-height:1.6;margin-bottom:10px;
+     white-space:pre-line;word-break:break-word;
+     display:-webkit-box;-webkit-line-clamp:15;
+     -webkit-box-orient:vertical;overflow:hidden}
+.pic{border-radius:14px;border:1px solid #EFF3F4;
+     width:100%;max-height:500px;object-fit:cover;
+     margin-bottom:12px;display:block}
+.hr{border:none;border-top:1px solid #EFF3F4;margin:8px 0}
+.lnk{font-size:13px;color:#1D9BF0;word-break:break-all}
+.cmt{margin-top:8px;padding-top:10px;border-top:1px solid #EFF3F4;
+     display:flex;align-items:flex-start}
+.bavt{width:32px;height:32px;border-radius:50%;flex-shrink:0;
+      margin-right:8px;overflow:hidden;border:1px solid #EFF3F4}
+.bavt img{width:100%;height:100%;object-fit:cover}
+.bavt-ph{width:32px;height:32px;border-radius:50%;flex-shrink:0;
+         margin-right:8px;background:#646464;
+         display:flex;align-items:center;justify-content:center;
+         color:#fff;font-size:14px;font-weight:700;line-height:1}
+.ctx{font-size:13px;color:#536471;line-height:1.5;flex:1}
+.pvd{font-size:11px;color:#B4B4B4;margin-top:4px}
+</style></head><body>
+<div class="card">
+  <div class="hdr">
+    {% if avatar_b64 %}
+    <div class="avt"><img src="data:image/png;base64,{{avatar_b64}}"></div>
+    {% else %}
+    <div class="avt-ph">{{avatar_char}}</div>
+    {% endif %}
+    <div class="meta">
+      <span class="name">{{channel}}</span>
+      {% if time_str %}<span class="tm">&middot; {{time_str}}</span>{% endif %}
+    </div>
+  </div>
+  <div class="body">
+    {% if title %}<div class="ttl">{{title}}</div>{% endif %}
+    {% if desc %}<div class="dsc">{{desc}}</div>{% endif %}
+    {% if thumb_b64 %}
+    <img class="pic" src="data:image/jpeg;base64,{{thumb_b64}}">
+    {% endif %}
+    <hr class="hr">
+    {% if link %}<div class="lnk">🔗 {{link_display}}</div>{% endif %}
+    {% if comment %}
+    <div class="cmt">
+      {% if bot_avatar_b64 %}
+      <div class="bavt"><img src="data:image/png;base64,{{bot_avatar_b64}}"></div>
+      {% else %}
+      <div class="bavt-ph">B</div>
+      {% endif %}
+      <div>
+        <div class="ctx">{{comment}}</div>
+        {% if bot_provider_name %}<div class="pvd">via {{bot_provider_name}}</div>{% endif %}
+      </div>
+    </div>
+    {% endif %}
+  </div>
+</div>
+</body></html>"""
+
+    def __init__(self, width=480, browserless_url="http://browserless:3000"):
         self.w = width
-        self.pad = 22
-        self.font_path = self._find()
-
-    def _find(self):
-        # 1. 插件目录下的字体（优先级最高）
-        base_dir = os.path.dirname(__file__)
-        for fn in os.listdir(base_dir):
-            if fn.lower().endswith((".ttf", ".otf", ".ttc")):
-                return os.path.join(base_dir, fn)
-
-        fonts_dir = os.path.join(base_dir, "fonts")
-        if os.path.isdir(fonts_dir):
-            for fn in os.listdir(fonts_dir):
-                if fn.lower().endswith((".ttf", ".otf", ".ttc")):
-                    return os.path.join(fonts_dir, fn)
-
-        # 2. 递归扫描系统字体目录
-        system_font_dirs = ["/usr/share/fonts", "/usr/local/share/fonts"]
-        best = None
-        fallback = None
-        for font_dir in system_font_dirs:
-            if not os.path.isdir(font_dir):
-                continue
-            for root, dirs, files in os.walk(font_dir):
-                for fn in files:
-                    if not fn.lower().endswith((".ttf", ".otf", ".ttc")):
-                        continue
-                    full = os.path.join(root, fn)
-                    low = fn.lower()
-                    # 跳过 ColorEmoji（Pillow 不支持渲染）
-                    if "emoji" in low or "color" in low:
-                        continue
-                    # 优先选 CJK/中文/日文字体
-                    if any(kw in low for kw in ("cjk", "noto", "wqy", "zenhei", "microhei",
-                                                 "chinese", "sc", "jp", "kr", "gothic",
-                                                 "ipag", "ipa")):
-                        if best is None:
-                            best = full
-                    elif fallback is None:
-                        fallback = full
-        if best:
-            return best
-        if fallback:
-            return fallback
-
-        # 3. 都没有：自动下载（只下载一次）
-        cache_path = os.path.join(base_dir, "NotoSansSC-Regular.otf")
-        if os.path.exists(cache_path):
-            return cache_path
-
-        dl_url = "https://github.com/notofonts/noto-cjk/raw/main/Sans/OTF/SimplifiedChinese/NotoSansSC-Regular.otf"
-        try:
-            import urllib.request
-            logging.getLogger("astrbot").info("[MyRSS] 系统无CJK字体，正在下载 NotoSansSC...")
-            urllib.request.urlretrieve(dl_url, cache_path)
-            logging.getLogger("astrbot").info("[MyRSS] 字体下载完成: %s", cache_path)
-            return cache_path
-        except Exception as e:
-            logging.getLogger("astrbot").warning("[MyRSS] 字体下载失败: %s", e)
-
-        return None
-
-    def _f(self, sz):
-        if self.font_path:
-            try:
-                return ImageFont.truetype(self.font_path, sz)
-            except Exception:
-                pass
-        return ImageFont.load_default()
-
-    def _wrap(self, txt, font, mw, draw):
-        # [修复] 更健壮的换行逻辑，防止某些特殊字符导致崩溃
-        if not txt:
-            return []
-        lines = []
-        # 将文本按段落分割，保留空行
-        paragraphs = txt.split("\n")
-        
-        for para in paragraphs:
-            # 移除首尾空白，但如果是空行则保留高度
-            if not para:
-                lines.append("")
-                continue
-            
-            # 逐字扫描
-            current_line = ""
-            for char in para:
-                # 尝试加入字符
-                test_line = current_line + char
-                # 获取宽度
-                w = draw.textlength(test_line, font=font)
-                if w > mw:
-                    # 如果超宽，且当前行不为空，则推入上一行
-                    if current_line:
-                        lines.append(current_line)
-                        current_line = char
-                    else:
-                        # 强制切断（针对超长连续字符）
-                        lines.append(char)
-                        current_line = ""
-                else:
-                    current_line = test_line
-            if current_line:
-                lines.append(current_line)
-        return lines
-    def _round_image(self, img, radius=14):
-        """给图片加圆角效果
-        原理：画一个圆角矩形白色蒙版，把图片贴进去
-        需要 Pillow>=8.2（rounded_rectangle 支持）
-        """
-        img = img.convert("RGBA")
-        w, h = img.size
-        mask = Image.new("L", (w, h), 0)
-        md = ImageDraw.Draw(mask)
-        md.rounded_rectangle([(0, 0), (w - 1, h - 1)], radius=radius, fill=255)
-        white = Image.new("RGBA", (w, h), (255, 255, 255, 255))
-        white.paste(img, mask=mask)
-        return white.convert("RGB")
-
-    def _draw_avatar_circle(self, im, x, y, size, char, color):
-        """在图片上绘制一个带文字的圆形头像
-        用4x超采样画大圆再缩小，实现抗锯齿的平滑圆形边缘
-        char: 圆心里显示的字符（频道名首字）
-        color: 圆形的RGB背景色
-        """
-        scale = 4
-        big = Image.new("RGBA", (size * scale, size * scale), (0, 0, 0, 0))
-        bd = ImageDraw.Draw(big)
-        bd.ellipse([(0, 0), (size * scale - 1, size * scale - 1)], fill=color + (255,))
-        big = big.resize((size, size), Image.LANCZOS)
-        im.paste(big, (x, y), big)
-        # 在圆心画字
-        d = ImageDraw.Draw(im)
-        font = self._f(int(size * 0.42))
-        try:
-            bbox = font.getbbox(char)
-            cw = bbox[2] - bbox[0]
-            ch = bbox[3] - bbox[1]
-            d.text((x + (size - cw) / 2 - bbox[0], y + (size - ch) / 2 - bbox[1]),
-                   char, font=font, fill=(255, 255, 255))
-        except Exception:
-            d.text((x + size // 4, y + size // 4), "?", font=font, fill=(255, 255, 255))
+        self.browserless_url = browserless_url.rstrip("/")
+        self._env = Environment(loader=BaseLoader(), autoescape=True)
+        self._tpl = self._env.from_string(self.CARD_HTML)
+        self.logger = logging.getLogger("astrbot")
 
     def _format_time(self, ts_str):
-        """把RSS的长时间字符串简化成 YYYY-MM-DD HH:MM 格式
-        失败则原样截断返回，保证不崩溃
-        """
+        """把RSS时间字符串简化为 YYYY-MM-DD HH:MM"""
         if not ts_str:
             return ""
         try:
@@ -428,319 +386,122 @@ class CardGen:
             except Exception:
                 continue
         return ts_str[:25] if len(ts_str) > 25 else ts_str
-    @staticmethod
-    def _clean_emoji(text):
-        """把常见 emoji 替换成文字，其余无法渲染的直接去掉"""
-        if not text:
-            return text
-        replacements = {
-            "🔗": "[链接]", "📡": "[源]", "📝": "[文]", "📋": "[列表]",
-            "✅": "[OK]", "❌": "[X]", "⚠️": "[!]", "🔍": "[搜]",
-            "💬": "[评]", "🎨": "[图]", "⏳": "[等]", "⏭️": "[跳]",
-            "🚫": "[禁]", "💡": "[提示]", "🔴": "[●]", "🟢": "[○]",
-            "🎉": "[庆]", "🔥": "[火]", "👍": "[赞]", "👎": "[踩]",
-            "❤️": "[心]", "😂": "[笑]", "😊": "[笑]", "🤔": "[想]",
-            "💦": "[汗]", "✨": "[闪]", "⭐": "[星]", "🌟": "[星]",
-        }
-        for emoji, replacement in replacements.items():
-            text = text.replace(emoji, replacement)
-        # 去掉剩余无法渲染的 emoji
-        text = re.sub(r'[\U0001F000-\U0001FFFF]', '', text)
-        text = re.sub(r'[\U00002600-\U000027BF]', '', text)
-        text = re.sub(r'[\U0000FE00-\U0000FE0F]', '', text)
-        text = re.sub(r'[\U0000200D]', '', text)
-        return text
-    def make(self, channel="", title="", desc="", link="", ts="", thumb=None, avatar=None, comment="", bot_avatar=None, bot_provider_name=""):
-        """生成 Twitter/X 风格的动态卡片
 
-        布局（模仿推特时间线的单条推文）:
-        ┌──────────────────────────────────┐
-        │  [●]  频道名 · 2025-02-19 19:54  │
-        │       正文正文正文正文正文        │
-        │       正文正文...                │
-        │       ╭────────────────────╮     │
-        │       │   图片(圆角14px)    │     │
-        │       ╰────────────────────╯     │
-        │  ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─  │
-        │       🔗 来源链接                │
-        └──────────────────────────────────┘
-        多条拼合后底部分割线连成连续时间线。
-        """
-        # ============ Twitter/X 精确配色 ============
-        BG       = (255, 255, 255)       # 背景纯白
-        C_NAME   = (15, 20, 25)          # 名字黑 (#0F1419)
-        C_BODY   = (15, 20, 25)          # 正文黑
-        C_GRAY   = (83, 100, 113)        # 副文字灰 (#536471)
-        C_BORDER = (239, 243, 244)       # 分割线 (#EFF3F4)
-        C_BLUE   = (29, 155, 240)        # Twitter蓝 (#1D9BF0)
+    async def make(self, channel="", title="", desc="", link="", ts="",
+                   thumb=None, avatar=None, comment="", bot_avatar=None,
+                   bot_provider_name=""):
+        """渲染 HTML → browserless 截图 → 返回 base64 PNG"""
 
-        # ============ 布局常量 ============
-        W   = self.w                     # 卡片总宽度(默认480)
-        PX  = 16                         # 左右内边距
-        PY  = 14                         # 上下内边距
-        AVT = 48                         # 头像直径
-        GAP = 12                         # 头像和内容之间水平间距
-        CX  = PX + AVT + GAP            # 内容区起始X坐标
-        CW  = W - CX - PX               # 内容区可用宽度
-
-        # ============ 字体 ============
-        # fn: 频道名  ft: 时间  fh: 标题(大)  fb: 正文  fm: 底部链接
-        fn = self._f(16)                 # 频道名
-        ft = self._f(12)                 # 时间
-        fh = self._f(18)                 # 标题（比正文大，视觉层次分明）
-        fb = self._f(15)                 # 正文
-        fm = self._f(12)                 # 底部链接
-
-        # ============ 1. 预计算文本换行 ============
-        tmp = Image.new("RGB", (1, 1))
-        d0 = ImageDraw.Draw(tmp)
-
-        # 标题和正文分开处理（而不是合并成一段）
-        # 这样标题可以用大字体，正文用小字体，有层次感
-        # 如果标题和正文内容重复，则只显示标题
-        # 清理 emoji，防止渲染成 "?"
-        channel = self._clean_emoji(channel) or channel
-        title = self._clean_emoji(title) or title
-        desc = self._clean_emoji(desc) or desc
-        comment = self._clean_emoji(comment) or comment
-        link = self._clean_emoji(link) or link
-        show_title = title and title not in ("无标题", "")
-        title_lines = self._wrap(title, fh, CW, d0) if show_title else []
-        if len(title_lines) > 4:
-            title_lines = title_lines[:4]
-            title_lines[-1] = title_lines[-1].rstrip() + "..."
-        TITLE_LH = 30  # 标题行高(px)：18px字体 × 1.67倍 ≈ 30
-
-        # 正文：如果和标题完全相同就不重复显示
-        desc_text = (desc or "").strip()
-        if show_title and desc_text == title.strip():
-            desc_text = ""
-        desc_lines = self._wrap(desc_text, fb, CW, d0) if desc_text else []
-        if len(desc_lines) > 15:
-            desc_lines = desc_lines[:15]
-            desc_lines[-1] = desc_lines[-1].rstrip() + "..."
-        DESC_LH = 26   # 正文行高(px)：15px字体 × 1.73倍 ≈ 26，不再挤
-
-        # ============ 2. 处理缩略图 ============
-        pic = None
-        pic_h = 0
-        if thumb:
-            try:
-                src = Image.open(BytesIO(thumb))
-                # 统一转RGBA，处理透明PNG
-                if src.mode != "RGBA":
-                    src = src.convert("RGBA")
-
-                ratio = CW / src.width
-                new_h = int(src.height * ratio)
-                # 限制最大高度，防竖长图撑爆卡片
-                max_h = int(CW * 1.3)
-                src = src.resize((CW, min(new_h, max_h)), Image.LANCZOS)
-                if new_h > max_h:
-                    src = src.crop((0, 0, CW, max_h))
-                    new_h = max_h
-
-                # 把透明图合成到白底上（防止透明区域变黑）
-                white_bg = Image.new("RGBA", (CW, min(new_h, max_h)), (255, 255, 255, 255))
-                try:
-                    white_bg.paste(src, mask=src.split()[3])
-                except Exception:
-                    white_bg.paste(src)
-                # 加圆角
-                pic = self._round_image(white_bg.convert("RGB"), radius=14)
-                pic_h = pic.height
-            except Exception:
-                pic = None
-
-        # 格式化时间
+        display_name = (channel or "未知频道")
+        display_name = display_name.replace(" - Community Posts - YouTube", "").replace(" - YouTube", "")
         time_str = self._format_time(ts)
 
-        # ============ 3. 计算总高度 ============
-        # 逐块累加：上边距 → 头像区 → 标题 → 正文 → 图片 → 分割线 → 链接 → 下边距
-        H = PY                                                 # 上边距
-        H += max(AVT, 24) + 10                                 # 头像/名字区 + 间距
-        if title_lines:
-            H += len(title_lines) * TITLE_LH + 8              # 标题块 + 底部间距
-        if desc_lines:
-            H += len(desc_lines) * DESC_LH + 10               # 正文块 + 底部间距
-        if pic:
-            H += pic_h + 14                                    # 图片 + 底部间距
-        H += 1 + 10                                            # 分割线 + 间距
-        if link:
-            H += 18 + 4                                        # 链接行
-        if comment:
-            H += 6 + 1 + 10                                    # 锐评分割线
-            comment_lines_est = min(6, max(1, len(comment) // 15 + 1))
-            H += max(32 + 8, comment_lines_est * 18 + 8)       # 锐评区域
-            if bot_provider_name:
-                H += 14
-        H += PY                                                # 下边距
-
-        # ============ 4. 绘制画布 ============
-        im = Image.new("RGB", (W, H), BG)
-        dr = ImageDraw.Draw(im)
-        cy = PY  # 当前Y游标
-
-        # ---- 头像 ----
+        # 头像 → base64 data URI
+        avatar_b64 = ""
+        avatar_char = "?"
         if avatar and isinstance(avatar, bytes) and len(avatar) > 100:
-            try:
-                avt_img = Image.open(BytesIO(avatar)).convert("RGBA")
-                avt_img = avt_img.resize((AVT, AVT), Image.LANCZOS)
-                # 圆形裁剪
-                mask = Image.new("L", (AVT, AVT), 0)
-                md = ImageDraw.Draw(mask)
-                md.ellipse([(0, 0), (AVT - 1, AVT - 1)], fill=255)
-                white = Image.new("RGB", (AVT, AVT), (255, 255, 255))
-                white.paste(avt_img.convert("RGB"), mask=mask)
-                im.paste(white, (PX, cy))
-                # 画圆形边框
-                dr.ellipse([(PX, cy), (PX + AVT - 1, cy + AVT - 1)], outline=C_BORDER, width=1)
-            except Exception:
-                avt_char = (channel or "?")[0] if channel else "?"
-                self._draw_avatar_circle(im, PX, cy, AVT, avt_char, C_BLUE)
-        else:
-            avt_char = "?"
-            for c in (channel or ""):
-                if c.strip():
-                    avt_char = c
-                    break
-            self._draw_avatar_circle(im, PX, cy, AVT, avt_char, C_BLUE)
+            avatar_b64 = base64.b64encode(avatar).decode()
+        for c in (channel or ""):
+            if c.strip():
+                avatar_char = c
+                break
 
-        # ---- 频道名 + 时间（同一行，模仿推特 "Name · 2h"） ----
-        # [修复] 强制截断超长频道名，防止和时间重叠乱码
-        name_y = cy + (AVT - 20) // 2  # 垂直居中于头像
-        
-        display_name = channel or "未知频道"
-        # 去掉RSSHub可能附加的冗余后缀，让名字更短更干净
-        display_name = display_name.replace(" - Community Posts - YouTube", "").replace(" - YouTube", "")
-        
-        if time_str:
-            dot = " · "
-            # 预留给时间和点的宽度
-            time_w = d0.textlength(time_str, font=ft)
-            dot_w = d0.textlength(dot, font=ft)
-            
-            # 计算名字最大允许宽度 = 总宽度 - 时间宽 - 点宽 - 缓冲(10px)
-            max_name_w = CW - time_w - dot_w - 10
-            
-            # 测量当前名字宽度
-            current_w = d0.textlength(display_name, font=fn)
-            
-            # 如果名字太长，就循环截断直到放得下
-            if current_w > max_name_w:
-                while current_w > max_name_w and len(display_name) > 1:
-                    display_name = display_name[:-1]
-                    current_w = d0.textlength(display_name + "...", font=fn)
-                display_name += "..."
-            
-            # 绘制名字
-            dr.text((CX, name_y), display_name, font=fn, fill=C_NAME)
-            
-            # 紧接着绘制 · 时间
-            final_name_w = d0.textlength(display_name, font=fn)
-            dr.text((CX + final_name_w, name_y + 1), dot, font=ft, fill=C_GRAY)
-            dr.text((CX + final_name_w + dot_w, name_y + 1), time_str, font=ft, fill=C_GRAY)
-        else:
-            # 没有时间，直接画名字（也要防止超长）
-            current_w = d0.textlength(display_name, font=fn)
-            if current_w > CW:
-                while current_w > CW and len(display_name) > 1:
-                    display_name = display_name[:-1]
-                    current_w = d0.textlength(display_name + "...", font=fn)
-                display_name += "..."
-            dr.text((CX, name_y), display_name, font=fn, fill=C_NAME)
+        # 缩略图
+        thumb_b64 = ""
+        if thumb and isinstance(thumb, bytes) and len(thumb) > 100:
+            thumb_b64 = base64.b64encode(thumb).decode()
 
-        cy += max(AVT, 24) + 10
+        # Bot 头像
+        bot_avatar_b64 = ""
+        if bot_avatar and isinstance(bot_avatar, bytes) and len(bot_avatar) > 100:
+            bot_avatar_b64 = base64.b64encode(bot_avatar).decode()
 
-        # ---- 标题（大字，深黑） ----
-        if title_lines:
-            for line in title_lines:
-                dr.text((CX, cy), line, font=fh, fill=C_NAME)
-                cy += TITLE_LH
-            cy += 8
+        # 链接截断
+        link_display = link if len(link) <= 50 else link[:50] + "..."
 
-        # ---- 正文（小字，深灰，和标题形成对比） ----
-        if desc_lines:
-            for line in desc_lines:
-                dr.text((CX, cy), line, font=fb, fill=C_GRAY)
-                cy += DESC_LH
-            cy += 10
+        # 去重：desc 与 title 相同则不重复显示
+        desc_clean = (desc or "").strip()
+        if title and desc_clean == (title or "").strip():
+            desc_clean = ""
+        show_title = title and title not in ("无标题", "")
 
-        # ---- 图片（圆角） ----
-        if pic:
-            im.paste(pic, (CX, cy))
-            # 加圆角边框线，让图片边缘更清晰
-            dr.rounded_rectangle(
-                [(CX, cy), (CX + CW - 1, cy + pic_h - 1)],
-                radius=14, outline=C_BORDER, width=1
-            )
-            cy += pic_h + 14
+        html = self._tpl.render(
+            width=self.w,
+            channel=display_name,
+            time_str=time_str,
+            avatar_b64=avatar_b64,
+            avatar_char=avatar_char,
+            title=title if show_title else "",
+            desc=desc_clean,
+            thumb_b64=thumb_b64,
+            link=link,
+            link_display=link_display,
+            comment=comment,
+            bot_avatar_b64=bot_avatar_b64,
+            bot_provider_name=bot_provider_name,
+        )
 
-        # ---- 分割线 ----
-        dr.line([(PX, cy), (W - PX, cy)], fill=C_BORDER, width=1)
-        cy += 10
+        try:
+            return await self._screenshot(html)
+        except Exception as e:
+            self.logger.error("[CardGen] browserless 截图失败: %s", e)
+            return ""
 
-        # ---- 链接 ----
-        if link:
-            lk = link if len(link) <= 50 else link[:50] + "..."
-            dr.text((CX, cy), "🔗 " + lk, font=fm, fill=C_BLUE)
-            cy += 22
-        # ---- 锐评栏 ----
-        if comment:
-            cy += 6
-            dr.line([(PX, cy), (W - PX, cy)], fill=C_BORDER, width=1)
-            cy += 10
+    async def _screenshot(self, html: str) -> str:
+        """POST HTML 到 browserless，返回 base64 PNG
 
-            # bot头像（小圆形，32px）
-            bot_avt_size = 32
-            bot_avt_x = CX
-            if bot_avatar and isinstance(bot_avatar, bytes) and len(bot_avatar) > 100:
+        自动尝试 v1 (/screenshot) 和 v2 (/chromium/screenshot) 端点。
+        """
+        payload = {
+            "html": html,
+            "options": {
+                "fullPage": True,
+                "type": "png",
+            },
+            # viewport 宽度 = 卡片宽度，确保截图不留白边
+            "viewport": {
+                "width": self.w,
+                "height": 800,
+                "deviceScaleFactor": 2,   # 2x 清晰度，文字更锐利
+            },
+            "gotoOptions": {
+                "waitUntil": "domcontentloaded",
+            },
+        }
+
+        # v1 和 v2 端点都试一下，谁通用谁
+        endpoints = [
+            f"{self.browserless_url}/screenshot",            # v1
+            f"{self.browserless_url}/chromium/screenshot",   # v2
+        ]
+
+        conn = aiohttp.TCPConnector(ssl=False)
+        timeout = aiohttp.ClientTimeout(total=30)
+
+        async with aiohttp.ClientSession(connector=conn, timeout=timeout) as session:
+            for ep in endpoints:
                 try:
-                    bavt = Image.open(BytesIO(bot_avatar)).convert("RGBA")
-                    bavt = bavt.resize((bot_avt_size, bot_avt_size), Image.LANCZOS)
-                    bmask = Image.new("L", (bot_avt_size, bot_avt_size), 0)
-                    bmd = ImageDraw.Draw(bmask)
-                    bmd.ellipse([(0, 0), (bot_avt_size - 1, bot_avt_size - 1)], fill=255)
-                    bwhite = Image.new("RGB", (bot_avt_size, bot_avt_size), (255, 255, 255))
-                    bwhite.paste(bavt.convert("RGB"), mask=bmask)
-                    im.paste(bwhite, (bot_avt_x, cy))
-                    dr.ellipse([(bot_avt_x, cy), (bot_avt_x + bot_avt_size - 1, cy + bot_avt_size - 1)], outline=C_BORDER, width=1)
-                except Exception:
-                    self._draw_avatar_circle(im, bot_avt_x, cy, bot_avt_size, "B", (100, 100, 100))
-            else:
-                self._draw_avatar_circle(im, bot_avt_x, cy, bot_avt_size, "B", (100, 100, 100))
+                    async with session.post(
+                        ep, json=payload,
+                        headers={"Content-Type": "application/json"},
+                    ) as resp:
+                        if resp.status == 200:
+                            ct = resp.headers.get("Content-Type", "")
+                            data = await resp.read()
+                            # 校验返回的确实是图片（不是 JSON 错误信息）
+                            if len(data) > 500 and (
+                                "image" in ct or data[:4] == b'\x89PNG'
+                            ):
+                                self.logger.debug("[CardGen] 截图成功 via %s (%d bytes)", ep, len(data))
+                                return base64.b64encode(data).decode()
+                        # 非200或非图片，记录日志后尝试下一个端点
+                        body = await resp.text()
+                        self.logger.warning("[CardGen] %s -> HTTP %d: %s", ep, resp.status, body[:200])
+                except aiohttp.ClientError as e:
+                    self.logger.warning("[CardGen] %s 连接失败: %s", ep, e)
+                    continue
 
-            # 锐评文字
-            comment_x = bot_avt_x + bot_avt_size + 8
-            comment_w = W - comment_x - PX
-            fc_comment = self._f(13)
-            comment_lines = self._wrap(comment, fc_comment, comment_w, dr)
-            # 放宽锐评行数限制，防止被截断
-            if len(comment_lines) > 6:
-                comment_lines = comment_lines[:6]
-                comment_lines[-1] = comment_lines[-1][:-2] + "..."
-
-            comment_y = cy + 2
-            for cl in comment_lines:
-                dr.text((comment_x, comment_y), cl, font=fc_comment, fill=C_GRAY)
-                comment_y += 18
-
-            # 服务商标注
-            if bot_provider_name:
-                provider_font = self._f(10)
-                provider_text = "via " + bot_provider_name
-                dr.text((comment_x, comment_y + 2), provider_text, font=provider_font, fill=(180, 180, 180))
-                comment_y += 14
-
-            cy = max(cy + bot_avt_size + 8, comment_y + 8)
-
-        # 底部边线（多条拼合时充当条目间分隔线，像推特时间线的灰线）
-        dr.line([(0, H - 1), (W, H - 1)], fill=C_BORDER, width=1)
-
-        buf = BytesIO()
-        im.save(buf, format="PNG")
-        buf.seek(0)
-        return base64.b64encode(buf.read()).decode()
+        raise RuntimeError("browserless 所有端点均不可用，请检查容器是否运行")
 
 @register("astrbot_plugin_myrss", "MyRSS", "RSS订阅插件(LLM增强版)", "1.0.0", "")
 class MyRssPlugin(Star):
@@ -793,7 +554,8 @@ class MyRssPlugin(Star):
         self.image_caption_provider_id = config.get("image_caption_provider_id", "")
 
         self.pic = PicHandler(self.adjust_pic)
-        self.card = CardGen()
+        self.browserless_url = config.get("browserless_url", "http://browserless:3000")
+        self.card = CardGen(browserless_url=self.browserless_url)
 
         # 防并发锁，key = (url, user)
         self._locks: dict = {}
@@ -1596,7 +1358,7 @@ class MyRssPlugin(Star):
                 except Exception:
                     pass
 
-        return self.card.make(
+        return await self.card.make(
             channel=item.chan_title,
             title=item.title,
             desc=item.description,
@@ -1689,7 +1451,7 @@ class MyRssPlugin(Star):
                     pass
 
         try:
-            b64 = self.card.make(
+            b64 = await self.card.make(
                 channel=item.chan_title, title=item.title, desc=item.description,
                 link="" if self.hide_url else item.link, ts=item.pubDate or "", thumb=tb,
                 avatar=avt_data,
