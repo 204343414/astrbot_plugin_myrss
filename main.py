@@ -1138,7 +1138,8 @@ class MyRssPlugin(Star):
                 self._save_recs()
                 reject_count = len(gs["rejects"])
 
-                if reject_count >= 3 or voter in ("admin", "owner"):
+                is_admin = await self._is_group_admin(group_id, voter)
+                if reject_count >= 3 or is_admin:
                     gs["status"] = "rejected"
                     self._save_recs()
                     await self.ctx.send_message(group_id, MessageChain(chain=[
@@ -2859,3 +2860,19 @@ class MyRssPlugin(Star):
                         ]))
                 except Exception as e:
                     self.logger.error("[MyRSS] auto-approve failed for %s: %s", gid, e)
+    async def _is_group_admin(self, group_id: str, user_id: str) -> bool:
+        """判断用户是否为群主或管理员"""
+        if not self._aiocqhttp_bot:
+            return False
+        try:
+            gid = int(group_id.split(":")[-1]) if ":" in group_id else int(group_id)
+            uid = int(user_id)
+            info = await self._aiocqhttp_bot.get_group_member_info(
+                group_id=gid, user_id=uid, no_cache=True
+            )
+            if isinstance(info, dict):
+                return info.get("role", "member") in ("owner", "admin")
+            return False
+        except Exception as e:
+            self.logger.warning("[MyRSS] get member info failed: %s", e)
+            return False
