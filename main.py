@@ -471,8 +471,7 @@ body{
 
         # v1 和 v2 端点都试一下，谁通用谁
         endpoints = [
-            f"{self.browserless_url}/screenshot",            # v1
-            f"{self.browserless_url}/chromium/screenshot",   # v2
+            f"{self.browserless_url}/chromium/screenshot",
         ]
 
         conn = aiohttp.TCPConnector(ssl=False)
