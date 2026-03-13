@@ -132,5 +132,10 @@
     "description": "全局推送冷却期（分钟）：同一个群在此时间内最多收到一次全局推送",
     "type": "int",
     "default": 60
+  },
+  "browserless_url": {
+    "description": "Browserless 截图服务地址（Docker容器名:端口）",
+    "type": "string",
+    "default": "http://browserless:3000"
   }
 }
