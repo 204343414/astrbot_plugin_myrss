@@ -444,7 +444,7 @@ body{
         try:
             return await self._screenshot(html)
         except Exception as e:
-            self.logger.error("[CardGen] browserless 截图失败: %s", e)
+            self.logger.error("[CardGen] browserless 截图失败: %s (%s)", type(e).__name__, e)
             return ""
 
     async def _screenshot(self, html: str) -> str:
@@ -560,6 +560,8 @@ class MyRssPlugin(Star):
         self._locks: dict = {}
         self._data_lock = asyncio.Lock()  # 保护 dh.data 读写
         self._aiocqhttp_bot = None  # 缓存 aiocqhttp 的 bot client，用于直连发送
+        self._bot_ready = False  # 收到第一条消息后才开始全局推送
+        self._push_lock = asyncio.Lock()  # 全局推送发送锁，防止多源同时推同一个群
         # [防冲突] 在创建新调度器前，先杀掉模块级残留的老调度器
         # 场景：插件热更新时框架直接创建新实例，老实例的destroy()可能未被调用
         # 如果不杀，老调度器继续运行老代码的job，和新调度器同时推送→双推
@@ -933,8 +935,11 @@ class MyRssPlugin(Star):
                 if hasattr(event, 'bot') and event.bot is not None:
                     self._aiocqhttp_bot = event.bot
                     self.logger.info("[MyRSS] cached aiocqhttp bot client")
+                    self._bot_ready = True
             except Exception:
                 pass
+        if not self._bot_ready:
+            self._bot_ready = True
     # ============================================================
     #  全局订阅
     # ============================================================
@@ -1022,7 +1027,10 @@ class MyRssPlugin(Star):
         # 退避检查：是否跳过本次
         if self._should_skip_this_tick(url):
             return
-
+        # 等 bot 就绪（收到过至少一条消息）
+        if not self._bot_ready:
+            self.logger.info("[MyRSS] bot not ready yet (no message received since startup), skip")
+            return
         current_interval = self._get_current_interval(url)
         miss = self._feed_miss_count.get(url, 0)
         self.logger.info("[MyRSS] global feed job: %s (miss=%d, interval=%dmin)", url, miss, current_interval)
@@ -1151,64 +1159,66 @@ class MyRssPlugin(Star):
         push_comps = list(comps)  # 复制一份，不污染原始 comps
         push_comps.append(Comp.Plain("\n💡 如需退订本群推送，请@我说「屏蔽xxx」"))
 
-        for group_id in push_groups:
-            try:
-                pn = group_id.split(":")[0]
-                ret = None
-                
-                # 先尝试 ctx.send_message
+        async with self._push_lock:
+            for group_id in push_groups:
+                # 再次检查冷却（可能被另一个源刚设上）
+                if time.time() - self._group_cooldown.get(group_id, 0) < self.group_cooldown_seconds:
+                    self.logger.info("[MyRSS] group %s cooldown set by another source, skip", group_id)
+                    continue
                 try:
-                    if pn == "aiocqhttp" and self.compose:
-                        node = Comp.Node(uin=0, name="Astrbot", content=push_comps)
-                        ret = await self.ctx.send_message(group_id, MessageChain(chain=[node], use_t2i_=self.t2i))
-                    else:
-                        ret = await self.ctx.send_message(group_id, MessageChain(chain=push_comps, use_t2i_=self.t2i))
-                except Exception:
-                    ret = False
+                    pn = group_id.split(":")[0]
+                    ret = None
 
-                # ctx.send_message 失败 → 用 aiocqhttp 底层 API 直连
-                if (ret is None or ret is False) and pn == "aiocqhttp" and self._aiocqhttp_bot:
                     try:
-                        gid_num = int(group_id.split(":")[-1])
-                        # 构造消息段：图片用base64，文字用text
-                        segments = []
-                        for comp in push_comps:
-                            if hasattr(comp, 'file') and comp.file and comp.file.startswith("base64://"):
-                                segments.append({"type": "image", "data": {"file": comp.file}})
-                            elif hasattr(comp, 'text'):
-                                segments.append({"type": "text", "data": {"text": comp.text}})
-                        
-                        if self.compose:
-                            # 合并转发
-                            forward_node = {
-                                "type": "node",
-                                "data": {"uin": "0", "name": "Astrbot", "content": segments}
-                            }
-                            await self._aiocqhttp_bot.send_group_forward_msg(
-                                group_id=gid_num, messages=[forward_node]
-                            )
+                        if pn == "aiocqhttp" and self.compose:
+                            node = Comp.Node(uin=0, name="Astrbot", content=push_comps)
+                            ret = await self.ctx.send_message(group_id, MessageChain(chain=[node], use_t2i_=self.t2i))
                         else:
-                            await self._aiocqhttp_bot.send_group_msg(
-                                group_id=gid_num, message=segments
-                            )
-                        ret = True
-                        self.logger.info("[MyRSS] push ok (direct API) to %s", group_id)
-                    except Exception as e2:
-                        self.logger.error("[MyRSS] direct API push also failed to %s: %s", group_id, e2)
+                            ret = await self.ctx.send_message(group_id, MessageChain(chain=push_comps, use_t2i_=self.t2i))
+                    except Exception:
                         ret = False
 
-                if ret is not None and ret is not False:
-                    self._group_cooldown[group_id] = time.time()
-                    if ret is not True:
-                        self.logger.info("[MyRSS] push ok to %s", group_id)
-                else:
-                    self.logger.warning("[MyRSS] push to %s failed all methods", group_id)
+                    # ctx.send_message 失败 → 用 aiocqhttp 底层 API 直连
+                    if (ret is None or ret is False) and pn == "aiocqhttp" and self._aiocqhttp_bot:
+                        try:
+                            gid_num = int(group_id.split(":")[-1])
+                            segments = []
+                            for comp in push_comps:
+                                if hasattr(comp, 'file') and comp.file and comp.file.startswith("base64://"):
+                                    segments.append({"type": "image", "data": {"file": comp.file}})
+                                elif hasattr(comp, 'text'):
+                                    segments.append({"type": "text", "data": {"text": comp.text}})
 
-                delay = random.uniform(self.push_delay_min, self.push_delay_max)
-                await asyncio.sleep(delay)
+                            if self.compose:
+                                forward_node = {
+                                    "type": "node",
+                                    "data": {"uin": "0", "name": "Astrbot", "content": segments}
+                                }
+                                await self._aiocqhttp_bot.send_group_forward_msg(
+                                    group_id=gid_num, messages=[forward_node]
+                                )
+                            else:
+                                await self._aiocqhttp_bot.send_group_msg(
+                                    group_id=gid_num, message=segments
+                                )
+                            ret = True
+                            self.logger.info("[MyRSS] push ok (direct API) to %s", group_id)
+                        except Exception as e2:
+                            self.logger.error("[MyRSS] direct API push also failed to %s: %s", group_id, e2)
+                            ret = False
 
-            except Exception as e:
-                self.logger.error("[MyRSS] global push failed to %s: %s", group_id, e)
+                    if ret is not None and ret is not False:
+                        self._group_cooldown[group_id] = time.time()
+                        if ret is not True:
+                            self.logger.info("[MyRSS] push ok to %s", group_id)
+                    else:
+                        self.logger.warning("[MyRSS] push to %s failed all methods", group_id)
+
+                    delay = random.uniform(self.push_delay_min, self.push_delay_max)
+                    await asyncio.sleep(delay)
+
+                except Exception as e:
+                    self.logger.error("[MyRSS] global push failed to %s: %s", group_id, e)
         # 有新内容推送了，重置退避
         self._feed_miss_count[url] = 0
         self._feed_tick[url] = 0
