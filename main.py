@@ -685,6 +685,12 @@ class MyRssPlugin(Star):
         _ALL_SCHEDS.add(self.sched)
         self.sched.start()
         self._reload_jobs()
+        # 推荐超时检查：每10分钟检查一次
+        self.sched.add_job(
+            self._check_rec_timeout, "interval", minutes=10,
+            id="myrss_rec_timeout", replace_existing=True,
+            misfire_grace_time=120,
+        )
     async def destroy(self):
         """插件卸载/禁用时停止调度器"""
         global _ACTIVE_SCHED
@@ -1084,6 +1090,23 @@ class MyRssPlugin(Star):
 
         if not target_rec:
             return
+        
+        # 检查是否超时自动通过（1小时无人拒绝）
+        elapsed = time.time() - target_rec.get("created_at", 0)
+        if elapsed > 3600:
+            gs = target_rec["groups"][group_id]
+            if gs.get("status") == "pending":
+                gs["status"] = "approved"
+                self._save_recs()
+                ok = await self._auto_subscribe(
+                    target_rec["url"], group_id, target_rec.get("interval", 30)
+                )
+                title = target_rec.get("title", "未知")
+                if ok:
+                    await self.ctx.send_message(group_id, MessageChain(chain=[
+                        Comp.Plain(f"✅ 推荐「{title}」1小时无人拒绝，已自动订阅！")
+                    ]))
+                return
 
         gs = target_rec["groups"][group_id]
 
@@ -1115,7 +1138,7 @@ class MyRssPlugin(Star):
                 self._save_recs()
                 reject_count = len(gs["rejects"])
 
-                if reject_count >= 3:
+                if reject_count >= 3 or voter in ("admin", "owner"):
                     gs["status"] = "rejected"
                     self._save_recs()
                     await self.ctx.send_message(group_id, MessageChain(chain=[
@@ -2814,3 +2837,25 @@ class MyRssPlugin(Star):
                 self.logger.error("[MyRSS] recommend send failed: %s", e)
 
         yield event.plain_result(f"✅ 推荐已发送到 {sent_count}/{len(target_groups)} 个群\n编号: {rec_id}\n群友回复「同意」或「拒绝」投票")
+    async def _check_rec_timeout(self):
+        """检查超时的推荐，1小时无人拒绝自动通过"""
+        now = time.time()
+        for rec_id, rec in list(self._pending_recs.items()):
+            if now - rec.get("created_at", 0) < 3600:
+                continue
+            for gid, gs in rec.get("groups", {}).items():
+                if gs.get("status") != "pending":
+                    continue
+                gs["status"] = "approved"
+                self._save_recs()
+                try:
+                    ok = await self._auto_subscribe(
+                        rec["url"], gid, rec.get("interval", 30)
+                    )
+                    title = rec.get("title", "未知")
+                    if ok:
+                        await self.ctx.send_message(gid, MessageChain(chain=[
+                            Comp.Plain(f"✅ 推荐「{title}」1小时无人拒绝，已自动订阅！\n⏰ 每{rec.get('interval', 30)}分钟检查更新")
+                        ]))
+                except Exception as e:
+                    self.logger.error("[MyRSS] auto-approve failed for %s: %s", gid, e)
