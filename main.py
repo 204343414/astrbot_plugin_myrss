@@ -1006,6 +1006,11 @@ class MyRssPlugin(Star):
         return (tick % skip_ratio) != 0
     async def _global_feed_job(self, url: str):
         """全局订阅的定时推送（带指数退避）"""
+        async with self._data_lock:
+            await self._global_feed_job_inner(url)
+
+    async def _global_feed_job_inner(self, url: str):
+        """全局推送实际逻辑（被 _data_lock 保护）"""
         # tick自增：每次触发都+1，用于退避skip计数
         self._feed_tick[url] = self._feed_tick.get(url, 0) + 1
 
@@ -1514,9 +1519,11 @@ class MyRssPlugin(Star):
             await self._cron_cb_inner(url, user)
 
     async def _cron_cb_inner(self, url: str, user: str, prefetched_items=None) -> None:
+        async with self._data_lock:
+            await self._cron_cb_inner_impl(url, user, prefetched_items)
+
+    async def _cron_cb_inner_impl(self, url: str, user: str, prefetched_items=None) -> None:
         # [防冲突] 每次推送前从磁盘重载数据，拿到最新的seen_links
-        # 原因：新老实例各持有独立的内存副本(self.dh.data)，
-        # 如果只读内存，老实例看不到新实例写入的seen_links→重复推送
         self.dh.data = self.dh._load()
 
         if url not in self.dh.data or user not in self.dh.data[url].get("subscribers", {}):
