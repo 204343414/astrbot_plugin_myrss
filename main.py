@@ -2875,3 +2875,244 @@ class MyRssPlugin(Star):
         except Exception as e:
             self.logger.warning("[MyRSS] get member info failed: %s", e)
             return False
+    @myrss.command("recs")
+    async def cmd_recs(self, event: AstrMessageEvent):
+        """查看所有待处理的推荐"""
+        if not self._pending_recs:
+            yield event.plain_result("当前没有待处理的推荐。")
+            return
+        lines = ["📋 推荐列表："]
+        now = time.time()
+        for rec_id, rec in sorted(self._pending_recs.items(), key=lambda x: x[1].get("created_at", 0), reverse=True):
+            title = rec.get("title", "未知")
+            route = rec.get("route", "")
+            elapsed = int((now - rec.get("created_at", 0)) / 60)
+            remaining = max(0, 60 - elapsed)
+            groups_info = []
+            for gid, gs in rec.get("groups", {}).items():
+                status = gs.get("status", "pending")
+                gid_short = gid.split(":")[-1]
+                if status == "pending":
+                    groups_info.append(f"  {gid_short} ⏳待定")
+                elif status == "approved":
+                    groups_info.append(f"  {gid_short} ✅已订阅")
+                elif status == "rejected":
+                    groups_info.append(f"  {gid_short} ❌已拒绝")
+                elif status == "cancelled":
+                    groups_info.append(f"  {gid_short} 🚫已撤回")
+            lines.append(f"\n🆔 {rec_id} | {title}")
+            lines.append(f"  路由: {route}")
+            lines.append(f"  已过{elapsed}分钟 | {'已超时' if remaining == 0 else f'剩{remaining}分钟自动通过'}")
+            lines.extend(groups_info)
+        yield event.plain_result("\n".join(lines))
+
+    @myrss.command("cancelrec")
+    async def cmd_cancelrec(self, event: AstrMessageEvent, rec_id: str = ""):
+        """撤回推荐（取消所有待定群的订阅）
+        用法：/myrss cancelrec R78813
+              /myrss cancelrec all
+        """
+        if not rec_id:
+            yield event.plain_result("用法: /myrss cancelrec <编号或all>\n先用 /myrss recs 查看编号")
+            return
+
+        if rec_id.lower() == "all":
+            count = 0
+            for rid, rec in self._pending_recs.items():
+                for gid, gs in rec.get("groups", {}).items():
+                    if gs.get("status") == "pending":
+                        gs["status"] = "cancelled"
+                        count += 1
+            self._save_recs()
+            yield event.plain_result(f"✅ 已撤回所有待定推荐（{count}个群）")
+            return
+
+        if rec_id not in self._pending_recs:
+            yield event.plain_result(f"找不到编号 {rec_id}，用 /myrss recs 查看")
+            return
+
+        rec = self._pending_recs[rec_id]
+        cancelled = []
+        for gid, gs in rec.get("groups", {}).items():
+            if gs.get("status") == "pending":
+                gs["status"] = "cancelled"
+                cancelled.append(gid.split(":")[-1])
+        self._save_recs()
+
+        if cancelled:
+            yield event.plain_result(f"✅ 已撤回推荐 {rec_id}「{rec.get('title', '')}」\n取消了 {len(cancelled)} 个群: {', '.join(cancelled)}")
+        else:
+            yield event.plain_result(f"推荐 {rec_id} 没有待定的群（可能已全部通过/拒绝）")
+    @myrss.command("subs")
+    async def cmd_subs(self, event: AstrMessageEvent):
+        """查看所有订阅源及其订阅群列表"""
+        lines = ["📋 所有订阅源："]
+        idx = 0
+        for url, info in self.dh.data.items():
+            if url in ("rsshub_endpoints", "settings"):
+                continue
+            subs = info.get("subscribers", {})
+            if not subs and not info.get("global"):
+                continue
+            title = info.get("info", {}).get("title", url)
+            lines.append(f"\n{idx}. 📡 {title}")
+            lines.append(f"   路由: {url.split(':1200')[-1] if ':1200' in url else url}")
+            if subs:
+                for sub_id in subs:
+                    gid_short = sub_id.split(":")[-1]
+                    platform = sub_id.split(":")[0]
+                    cron = subs[sub_id].get("cron_expr", "?")
+                    lines.append(f"   └ {gid_short} ({platform}) [{cron}]")
+            else:
+                lines.append(f"   └ (无订阅者)")
+            idx += 1
+        if idx == 0:
+            yield event.plain_result("当前没有任何订阅源。")
+            return
+        yield event.plain_result("\n".join(lines))
+
+    @myrss.command("unsub")
+    async def cmd_unsub(self, event: AstrMessageEvent, route: str = "", group_ids: str = ""):
+        """从指定源批量退订群
+        用法：/myrss unsub /bilibili/user/dynamic/2107422684 721058477,123456
+              /myrss unsub /bilibili/user/dynamic/2107422684 all
+        """
+        if not route:
+            yield event.plain_result(
+                "用法: /myrss unsub <路由> <群号列表>\n"
+                "  群号用逗号分隔，或填 all 退订所有群\n"
+                "  先用 /myrss subs 查看路由和群号"
+            )
+            return
+
+        # 找到匹配的URL
+        target_url = None
+        for url in self.dh.data:
+            if url in ("rsshub_endpoints", "settings"):
+                continue
+            if route in url:
+                target_url = url
+                break
+
+        if not target_url:
+            yield event.plain_result(f"找不到包含 '{route}' 的订阅源\n用 /myrss subs 查看")
+            return
+
+        subs = self.dh.data[target_url].get("subscribers", {})
+        if not subs:
+            yield event.plain_result("该源没有订阅者。")
+            return
+
+        title = self.dh.data[target_url].get("info", {}).get("title", route)
+
+        if not group_ids or group_ids.strip().lower() == "all":
+            removed = list(subs.keys())
+            subs.clear()
+        else:
+            gids = [g.strip() for g in re.split(r'[,，\s]+', group_ids) if g.strip()]
+            removed = []
+            for gid in gids:
+                # 模糊匹配：群号可能只传了数字
+                to_del = [k for k in subs if gid in k]
+                for k in to_del:
+                    del subs[k]
+                    removed.append(k.split(":")[-1])
+
+        if removed:
+            self.dh.save()
+            self._reload_jobs()
+            yield event.plain_result(
+                f"✅ 已从「{title}」退订 {len(removed)} 个群:\n" +
+                "\n".join(f"  - {g}" for g in removed)
+            )
+        else:
+            yield event.plain_result("没有匹配的群号，请检查输入。")
+    @filter.llm_tool(name="myrss_cancel_recommend")
+    async def tool_cancel_rec(self, event: AstrMessageEvent, rec_id: str = "all"):
+        """用户想撤回/取消之前发出的推荐时调用。
+
+        Args:
+            rec_id(string): 推荐编号如R78813，或"all"撤回全部
+        """
+        if not self._pending_recs:
+            yield event.plain_result("当前没有待处理的推荐。")
+            return
+
+        if rec_id.lower() == "all":
+            count = 0
+            titles = []
+            for rid, rec in self._pending_recs.items():
+                for gid, gs in rec.get("groups", {}).items():
+                    if gs.get("status") == "pending":
+                        gs["status"] = "cancelled"
+                        count += 1
+                titles.append(rec.get("title", "未知"))
+            self._save_recs()
+            yield event.plain_result(f"✅ 已撤回所有待定推荐（{count}个群）\n涉及: {', '.join(set(titles))}")
+        else:
+            if rec_id not in self._pending_recs:
+                yield event.plain_result(f"找不到编号 {rec_id}")
+                return
+            rec = self._pending_recs[rec_id]
+            count = 0
+            for gid, gs in rec.get("groups", {}).items():
+                if gs.get("status") == "pending":
+                    gs["status"] = "cancelled"
+                    count += 1
+            self._save_recs()
+            yield event.plain_result(f"✅ 已撤回推荐「{rec.get('title', '')}」（{count}个群）")
+
+    @filter.llm_tool(name="myrss_batch_unsub")
+    async def tool_batch_unsub(self, event: AstrMessageEvent, keyword: str = "", group_ids: str = "all"):
+        """用户想从某个源批量退订群时调用。如"取消道爷张志顺在所有群的订阅""退订B站xxx的123群和456群"。
+
+        Args:
+            keyword(string): 源名称关键词，如"道爷""张至顺""AnthropicAI"
+            group_ids(string): 群号逗号分隔，或"all"退订所有群
+        """
+        if not keyword:
+            yield event.plain_result("请告诉我要退订哪个源。")
+            return
+
+        # 模糊匹配源
+        target_url = None
+        target_title = None
+        for url, info in self.dh.data.items():
+            if url in ("rsshub_endpoints", "settings"):
+                continue
+            title = info.get("info", {}).get("title", "")
+            if keyword.lower() in title.lower() or keyword.lower() in url.lower():
+                target_url = url
+                target_title = title
+                break
+
+        if not target_url:
+            yield event.plain_result(f"找不到包含「{keyword}」的订阅源。\n用 /myrss subs 查看所有源。")
+            return
+
+        subs = self.dh.data[target_url].get("subscribers", {})
+        if not subs:
+            yield event.plain_result(f"「{target_title}」没有订阅者。")
+            return
+
+        if group_ids.strip().lower() == "all":
+            removed = [k.split(":")[-1] for k in subs]
+            subs.clear()
+        else:
+            gids = [g.strip() for g in re.split(r'[,，\s]+', group_ids) if g.strip()]
+            removed = []
+            for gid in gids:
+                to_del = [k for k in subs if gid in k]
+                for k in to_del:
+                    del subs[k]
+                    removed.append(k.split(":")[-1])
+
+        if removed:
+            self.dh.save()
+            self._reload_jobs()
+            yield event.plain_result(
+                f"✅ 已从「{target_title}」退订 {len(removed)} 个群:\n" +
+                "\n".join(f"  - {g}" for g in removed)
+            )
+        else:
+            yield event.plain_result("没有匹配的群号。")
