@@ -2181,9 +2181,15 @@ class MyRssPlugin(Star):
         full_url = eps[0].rstrip("/") + route
         yield event.plain_result(f"📡 正在获取频道信息...")
 
-        text = await self._fetch(full_url)
+        text = None
+        for _attempt in range(3):
+            raw = await self._fetch(full_url)
+            if raw and b'<item>' in raw[:10000]:
+                text = raw
+                break
+            await asyncio.sleep(3)
         if not text:
-            yield event.plain_result("❌ 无法访问该源，请检查路由是否正确。")
+            yield event.plain_result("❌ 无法访问该源（已重试3次），请稍后再试。")
             return
 
         try:
