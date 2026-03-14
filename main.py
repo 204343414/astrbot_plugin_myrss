@@ -782,7 +782,21 @@ class MyRssPlugin(Star):
             except Exception:
                 return None
 
-        data = await _try(url)
+        for attempt in range(3):
+            data = await _try(url)
+            if data is not None:
+                # 检查是否返回了HTML错误页而非XML
+                if data[:5] == b'<?xml' or data[:1] == b'<' and b'<item>' in data[:5000]:
+                    return data
+                if b'<html>' not in data[:500].lower():
+                    return data
+                # 拿到HTML错误页，等几秒重试（等RSSHub内部缓存刷新）
+                if attempt < 2:
+                    await asyncio.sleep(3)
+                    continue
+                return data  # 第3次不管什么都返回
+            if attempt < 2:
+                await asyncio.sleep(3)
         if data is not None:
             return data
 
