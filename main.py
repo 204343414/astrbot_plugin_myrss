@@ -1,5 +1,6 @@
 import os
 import json
+import shutil
 import re
 import time
 import random
@@ -62,17 +63,24 @@ class DataHandler:
                 pass
             return json.load(f)
 
-    def save(self):
-        # [防冲突] 文件排他锁，防止新老实例同时写JSON导致数据丢失
-        # 场景：老实例的job推送完更新seen_links写文件，同时新实例也在写→后写的覆盖前面的
-        # fcntl仅Linux/Mac可用，Windows环境静默跳过
-        with open(self.config_path, "w", encoding="utf-8") as f:
-            try:
-                import fcntl
-                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-            except (ImportError, OSError):
-                pass
-            json.dump(self.data, f, indent=2, ensure_ascii=False)
+    def _save(self):
+        # 1. 先生成一个临时文件名 (例如 data.json.tmp)
+        tmp_path = self.path + ".tmp"
+        try:
+            # 2. 将数据写入临时文件
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(self.data, f, indent=4, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno()) # 强制把缓冲区数据推入磁盘
+            
+            # 3. 写入成功后，原子性地替换原文件
+            # 这样即使这一步崩溃，原文件也还是完整的旧版本，不会变残缺
+            os.replace(tmp_path, self.path)
+            
+        except Exception as e:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            raise e
 
     def get_subs(self, user_id):
         urls = []
