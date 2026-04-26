@@ -64,10 +64,14 @@ class DataHandler:
             return json.load(f)
 
     def _save(self):
-        # 1. 先生成一个临时文件名 (例如 data.json.tmp)
-        tmp_path = self.path + ".tmp"
-        try:
-            # 2. 将数据写入临时文件
+        # 1. 先生成一个临时文件名 ...
+        # ... ...（原有实现完全不动）...
+
+        # ↓↓↓ 在 _save 方法后面新增这一段 ↓↓↓
+        def save(self):
+            """公开的保存接口（内部委托给原子写的 _save）"""
+            self._save()
+                # 2. 将数据写入临时文件
             with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(self.data, f, indent=4, ensure_ascii=False)
                 f.flush()
