@@ -69,17 +69,16 @@ class DataHandler:
 
     def _save(self):
         # 1. 先生成一个临时文件名 (例如 data.json.tmp)
-        tmp_path = self.path + ".tmp"
+        tmp_path = self.config_path + ".tmp"   # ← 这里原来是 self.path，改掉
         try:
             # 2. 将数据写入临时文件
             with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(self.data, f, indent=4, ensure_ascii=False)
                 f.flush()
-                os.fsync(f.fileno()) # 强制把缓冲区数据推入磁盘
+                os.fsync(f.fileno())
             
-            # 3. 写入成功后，原子性地替换原文件
-            # 这样即使这一步崩溃，原文件也还是完整的旧版本，不会变残缺
-            os.replace(tmp_path, self.path)
+            # 3. 原子替换原文件
+            os.replace(tmp_path, self.config_path)   # ← 这里也改
             
         except Exception as e:
             if os.path.exists(tmp_path):
