@@ -63,6 +63,10 @@ class DataHandler:
                 pass
             return json.load(f)
 
+    def save(self):
+        """公开的保存接口（内部委托给 _save）"""
+        self._save()
+
     def _save(self):
         # 1. 先生成一个临时文件名 (例如 data.json.tmp)
         tmp_path = self.path + ".tmp"
