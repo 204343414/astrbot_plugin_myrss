@@ -64,12 +64,11 @@ class DataHandler:
             return json.load(f)
 
     def save(self):
-        """公开的保存接口（内部委托给 _save）"""
         self._save()
 
     def _save(self):
         # 1. 先生成一个临时文件名 (例如 data.json.tmp)
-        tmp_path = self.config_path + ".tmp"   # ← 这里原来是 self.path，改掉
+        tmp_path = self.config_path + ".tmp"          # ← 改这里
         try:
             # 2. 将数据写入临时文件
             with open(tmp_path, "w", encoding="utf-8") as f:
@@ -78,7 +77,7 @@ class DataHandler:
                 os.fsync(f.fileno())
             
             # 3. 原子替换原文件
-            os.replace(tmp_path, self.config_path)   # ← 这里也改
+            os.replace(tmp_path, self.config_path)    # ← 改这里
             
         except Exception as e:
             if os.path.exists(tmp_path):
