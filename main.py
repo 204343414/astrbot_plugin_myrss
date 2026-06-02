@@ -2611,11 +2611,25 @@ class MyRssPlugin(Star):
                     "subscribers": {},
                     "is_test": True,
                 }
-        except Exception:
-            pass
+            else:
+                last_err = getattr(self, "_last_fetch_error", "无响应数据")
+                yield event.plain_result(f"⚠️ [1/4] 预抓取频道信息失败，后台报错：{last_err}")
+        except Exception as e:
+            yield event.plain_result(f"⚠️ [1/4] 预抓取频道信息异常：{type(e).__name__}: {e}")
+
         items = await self._poll(url, num=1)
         if not items:
-            yield event.plain_result("❌ 拉取失败，源无内容或不可访问。")
+            last_err = getattr(self, "_last_fetch_error", "未知错误")
+            yield event.plain_result(
+                f"❌ 拉取失败，源无内容或不可访问。\n\n"
+                f"🔍 调试排错信息：\n"
+                f"  - 请求 URL: {url}\n"
+                f"  - 错误详情: {last_err}\n\n"
+                f"💡 修复建议：\n"
+                f"  1. 如果错误提示为 ConnectError / HTTP 502/504：\n"
+                f"     通常为全局代理污染了内网请求。请在启动配置或容器环境变量中，为内网主机 rsshub 额外设置 NO_PROXY。\n"
+                f"  2. 我们的全新 main.py 已经针对本地/内网容器通信自动禁用了 proxy，请确保该更新正确应用并重启了 Bot。"
+            )
             return
         item = items[0]
         # [Hack] 临时把测试源的信息注入 data，让 _make_card_b64 能查到头像/标题
