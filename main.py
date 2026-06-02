@@ -548,7 +548,8 @@ body{
             conn = aiohttp.TCPConnector(ssl=False)
             timeout = aiohttp.ClientTimeout(total=30)
 
-            async with aiohttp.ClientSession(connector=conn, timeout=timeout) as session:
+            # Explicitly set trust_env=False to bypass global proxy for internal browserless container
+            async with aiohttp.ClientSession(trust_env=False, connector=conn, timeout=timeout) as session:
                 for ep in endpoints:
                     # 429 重试（最多 3 次，间隔递增）
                     for attempt in range(3):
@@ -1593,6 +1594,13 @@ class MyRssPlugin(Star):
         """检查内容是否安全，不安全返回False"""
         if not self.content_filter:
             return True
+        # 智能免审：国内平台已有完备的内容审核，无需LLM重复过滤，省心省钱
+        link_lower = (item.link or "").lower()
+        domestic_keywords = ["bilibili.com", "weibo.com", "weibo.cn", "zhihu.com", "xiaohongshu.com", "douyin.com", "sspai.com"]
+        if any(dk in link_lower for dk in domestic_keywords):
+            self.logger.info(f"[MyRSS] 智能免审：检测到国内安全平台 {item.chan_title}，直接放行以节省LLM额度。")
+            return True
+
         norm_link = item.link.split("#", 1)[0].split("?", 1)[0] if item.link else ""
         cache_key = norm_link or (item.title + "|" + str(item.pubDate_timestamp))
         if cache_key in self._safe_cache:
