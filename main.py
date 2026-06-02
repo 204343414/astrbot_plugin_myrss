@@ -779,19 +779,35 @@ class MyRssPlugin(Star):
 
     async def _fetch(self, url: str):
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-        conn = aiohttp.TCPConnector(ssl=False)
         to = aiohttp.ClientTimeout(total=30, connect=10)
+
+        def is_local_url(u: str) -> bool:
+            try:
+                parsed = urlparse(u)
+                host = parsed.hostname or ""
+                if host.lower() in ("localhost", "127.0.0.1", "rsshub", "browserless"):
+                    return True
+                if "." not in host:
+                    return True
+                return False
+            except Exception:
+                return False
 
         async def _try(u: str):
             try:
-                async with aiohttp.ClientSession(trust_env=True, connector=conn, timeout=to, headers=headers) as s:
+                conn = aiohttp.TCPConnector(ssl=False)
+                use_trust_env = not is_local_url(u)
+                async with aiohttp.ClientSession(trust_env=use_trust_env, connector=conn, timeout=to, headers=headers) as s:
                     async with s.get(u) as r:
                         if r.status != 200:
+                            self.logger.warning(f"[MyRSS] HTTP {r.status} when fetching {u}")
                             return None
                         return await r.read()
-            except Exception:
+            except Exception as e:
+                self.logger.error(f"[MyRSS] Error fetching {u}: {e}")
                 return None
 
+        data = None
         for attempt in range(3):
             data = await _try(url)
             if data is not None:
@@ -802,6 +818,7 @@ class MyRssPlugin(Star):
                     return data
                 # 拿到HTML错误页，等几秒重试（等RSSHub内部缓存刷新）
                 if attempt < 2:
+                    self.logger.warning(f"[MyRSS] HTML error from RSSHub. Retrying {attempt+1}/3 in 3s...")
                     await asyncio.sleep(3)
                     continue
                 return data  # 第3次不管什么都返回
@@ -866,13 +883,14 @@ class MyRssPlugin(Star):
             return []
         try:
             root = etree.fromstring(text)
-        except ValueError:
+        except Exception:
             try:
                 root = etree.fromstring(
                     text.replace(b'encoding="gb2312"', b'')
                         .replace(b'encoding="GB2312"', b'')
                 )
-            except Exception:
+            except Exception as e:
+                self.logger.error(f"[MyRSS] XML syntax error when parsing feed from {url}: {e}")
                 return []
 
         items = root.xpath("//item")
