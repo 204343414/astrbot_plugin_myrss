@@ -541,6 +541,7 @@ body{
         }
 
         endpoints = [
+            f"{self.browserless_url}/screenshot",
             f"{self.browserless_url}/chromium/screenshot",
         ]
 
