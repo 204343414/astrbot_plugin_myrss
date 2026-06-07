@@ -49,6 +49,10 @@ class DataHandler:
     def _load(self):
         if not os.path.exists(self.config_path):
             d = {"rsshub_endpoints": []}
+            # 确保目录存在
+            dir_path = os.path.dirname(self.config_path)
+            if dir_path and not os.path.exists(dir_path):
+                os.makedirs(dir_path, exist_ok=True)
             with open(self.config_path, "w", encoding="utf-8") as f:
                 json.dump(d, f, indent=2, ensure_ascii=False)
             return d
@@ -982,6 +986,10 @@ class MyRssPlugin(Star):
 
     def _save_group_data(self):
         try:
+            # 确保目录存在
+            dir_path = os.path.dirname(self._group_data_file)
+            if dir_path and not os.path.exists(dir_path):
+                os.makedirs(dir_path, exist_ok=True)
             with open(self._group_data_file, "w", encoding="utf-8") as f:
                 json.dump(self._group_data, f, indent=2, ensure_ascii=False)
         except Exception as e:
@@ -1003,6 +1011,10 @@ class MyRssPlugin(Star):
 
     def _save_recs(self):
         try:
+            # 确保目录存在
+            dir_path = os.path.dirname(self._recs_file)
+            if dir_path and not os.path.exists(dir_path):
+                os.makedirs(dir_path, exist_ok=True)
             with open(self._recs_file, "w", encoding="utf-8") as f:
                 json.dump(self._pending_recs, f, indent=2, ensure_ascii=False)
         except Exception as e:
