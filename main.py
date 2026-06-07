@@ -60,11 +60,14 @@ class DataHandler:
         self.data = self._load()
 
     def _load(self):
-        """加载数据，支持从旧路径迁移"""
+        """加载数据，支持从旧路径迁移，并自动备份已有数据"""
         # 尝试新路径
         if os.path.exists(self.config_path):
             d = self._read_json(self.config_path)
             if d is not None:
+                # 自动备份（仅当数据非空时）
+                if len(d) > 1 or d.get("rsshub_endpoints"):
+                    self._backup_data(d)
                 return d
         
         # 迁移：从旧路径（AstrBot data 目录）迁移数据
@@ -72,10 +75,14 @@ class DataHandler:
         if os.path.exists(old_path):
             old_data = self._read_json(old_path)
             if old_data is not None:
-                # 确保新目录存在并写入
                 os.makedirs(self.data_dir, exist_ok=True)
                 with open(self.config_path, "w", encoding="utf-8") as f:
                     json.dump(old_data, f, indent=2, ensure_ascii=False)
+                # 同时保留旧路径备份
+                try:
+                    shutil.copy2(old_path, old_path + ".migrated_bak")
+                except Exception:
+                    pass
                 return old_data
         
         # 初始化空数据
@@ -84,6 +91,16 @@ class DataHandler:
         with open(self.config_path, "w", encoding="utf-8") as f:
             json.dump(d, f, indent=2, ensure_ascii=False)
         return d
+
+    def _backup_data(self, data: dict):
+        """自动备份已有数据到带时间戳的文件"""
+        try:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_path = os.path.join(self.data_dir, f"_data_backup_{ts}.json")
+            with open(backup_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
 
     def _read_json(self, path):
         try:
@@ -261,6 +278,8 @@ class URLMapper:
         # [原规则] 通用用户规则放在最后作为兜底
         (r"youtube\.com/@([\\w.-]+)", "/youtube/user/@{0}", "YouTube用户"),
         (r"youtube\.com/playlist\\?list=([\\w-]+)", "/youtube/playlist/{0}", "YouTube播放列表"),
+        # 专门匹配 x.com（优先级高于通用的 twitter|x 正则）
+        (r"x\.com/(?!home|explore|search|settings|i/)([\\w]+)", "/twitter/user/{0}", "X.com"),
         (r"(?:twitter|x)\.com/(?!home|explore|search|settings|i/)([\\w]+)", "/twitter/user/{0}", "Twitter/X"),
         (r"weibo\.com/u/(\d+)", "/weibo/user/{0}", "微博"),
         (r"zhihu\.com/people/([\\w-]+)", "/zhihu/people/activities/{0}", "知乎"),
@@ -381,11 +400,12 @@ class CardGen:
     CARD_HTML = r"""
 <!DOCTYPE html><html><head><meta charset="utf-8"><style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
-    body { font-family: -apple-system, "Segoe UI", sans-serif; width: {{width}}px; background: #fff; }
-    .card { padding: 16px; border-bottom: 1px solid #e5e7eb; }
-    .header { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+    body { font-family: -apple-system, "Segoe UI", sans-serif; width: {{width}}px; background: #fff; min-width: {{width}}px; }
+    .card { padding: 16px; border-bottom: 1px solid #e5e7eb; min-width: 0; }
+    .header { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; min-width: 0; }
     .avatar { width: 36px; height: 36px; border-radius: 50%; background: #667eea; display: flex; align-items: center; justify-content: center; color: white; font-size: 16px; font-weight: 600; overflow: hidden; flex-shrink: 0; }
     .avatar img { width: 100%; height: 100%; object-fit: cover; }
+    .chan-wrap { min-width: 0; flex: 1; overflow: hidden; }
     .chan { font-size: 14px; font-weight: 600; color: #1f2937; }
     .time { font-size: 12px; color: #9ca3af; }
     .title { font-size: 15px; font-weight: 600; color: #111827; margin-bottom: 6px; line-height: 1.4; }
@@ -402,8 +422,8 @@ class CardGen:
 </style></head><body>
 <div class="card">
     <div class="header">
-        <div class="avatar">{% if avatar_b64 %}<img src="data:image/jpeg;base64,{{avatar_b64}}" />{% else %}{{avatar_char}}{% endif %}</div>
-        <div><div class="chan">{{channel}}</div>{% if time_str %}<div class="time">· {{time_str}}</div>{% endif %}</div>
+        <div class="avatar" style="flex-shrink:0">{% if avatar_b64 %}<img src="data:image/jpeg;base64,{{avatar_b64}}" />{% else %}{{avatar_char}}{% endif %}</div>
+        <div class="chan-wrap"><div class="chan">{{channel}}</div>{% if time_str %}<div class="time">· {{time_str}}</div>{% endif %}</div>
     </div>
     {% if title %}<div class="title">{{title}}</div>{% endif %}
     {% if desc %}<div class="desc">{{desc}}</div>{% endif %}
@@ -2636,7 +2656,8 @@ class MyRssPlugin(Star):
                 yield event.plain_result(f"🔄 识别为 {platform_name}，转换路由: {converted_route}")
                 route = converted_route
             else:
-                yield event.plain_result("❌ 无法识别该链接。\\n\\n" + URLMapper.suggest(route) + "\\n\\n请用 /开头的路由重试。")
+                suggest = URLMapper.suggest(route)
+                yield event.plain_result(f"❌ 无法识别该链接: {route}\\n\\n{suggest}\\n\\n请用 /开头的路由重试，例如 /twitter/user/用户名。")
                 return
 
         if not route.startswith("/"):
