@@ -42,45 +42,87 @@ class RSSItem:
     pic_urls: list
 
 class DataHandler:
-    def __init__(self, config_path="data/astrbot_plugin_myrss/_data.json"):
-        self.config_path = config_path
+    """数据管理：文件存储在插件目录下，避免 git pull 时数据丢失。
+    
+    迁移：如果检测到旧路径 `data/astrbot_plugin_myrss/` 存在数据，自动迁移到插件目录。
+    """
+    def __init__(self, plugin_dir=None, seen_links_max_days=7):
+        # 确定数据目录
+        if plugin_dir:
+            self.data_dir = os.path.join(plugin_dir, "_data")
+            self._use_plugin_dir = True
+        else:
+            self.data_dir = "data/astrbot_plugin_myrss"
+            self._use_plugin_dir = False
+        
+        self.seen_links_max_days = seen_links_max_days
+        self.config_path = os.path.join(self.data_dir, "_data.json")
         self.data = self._load()
 
     def _load(self):
-        if not os.path.exists(self.config_path):
-            d = {"rsshub_endpoints": []}
-            # 确保目录存在
-            dir_path = os.path.dirname(self.config_path)
-            if dir_path and not os.path.exists(dir_path):
-                os.makedirs(dir_path, exist_ok=True)
-            with open(self.config_path, "w", encoding="utf-8") as f:
-                json.dump(d, f, indent=2, ensure_ascii=False)
-            return d
-        # [防冲突] 共享读锁，等待排他写锁释放后再读，避免读到写了一半的JSON
-        with open(self.config_path, "r", encoding="utf-8") as f:
-            try:
-                import fcntl
-                fcntl.flock(f.fileno(), fcntl.LOCK_SH)
-            except (ImportError, OSError):
-                pass
-            return json.load(f)
+        """加载数据，支持从旧路径迁移"""
+        # 尝试新路径
+        if os.path.exists(self.config_path):
+            d = self._read_json(self.config_path)
+            if d is not None:
+                return d
+        
+        # 迁移：从旧路径（AstrBot data 目录）迁移数据
+        old_path = "data/astrbot_plugin_myrss/_data.json"
+        if os.path.exists(old_path):
+            old_data = self._read_json(old_path)
+            if old_data is not None:
+                # 确保新目录存在并写入
+                os.makedirs(self.data_dir, exist_ok=True)
+                with open(self.config_path, "w", encoding="utf-8") as f:
+                    json.dump(old_data, f, indent=2, ensure_ascii=False)
+                return old_data
+        
+        # 初始化空数据
+        d = {"rsshub_endpoints": []}
+        os.makedirs(self.data_dir, exist_ok=True)
+        with open(self.config_path, "w", encoding="utf-8") as f:
+            json.dump(d, f, indent=2, ensure_ascii=False)
+        return d
+
+    def _read_json(self, path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                try:
+                    import fcntl
+                    fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+                except (ImportError, OSError):
+                    pass
+                return json.load(f)
+        except Exception:
+            return None
 
     def save(self):
         self._save()
 
     def _save(self):
-        # 1. 先生成一个临时文件名 (例如 data.json.tmp)
-        tmp_path = self.config_path + ".tmp" # ← 改这里
+        """保存数据，同时清理过期的 seen_links"""
+        # 清理 seen_links（按订阅者的 last_update 判断是否过期）
+        max_age_seconds = self.seen_links_max_days * 86400
+        now = time.time()
+        for url, info in list(self.data.items()):
+            if url in ("rsshub_endpoints", "settings"):
+                continue
+            subscribers = info.get("subscribers", {})
+            for sub_id, sub_data in list(subscribers.items()):
+                last_update = sub_data.get("last_update", 0)
+                if last_update > 0 and (now - last_update) > max_age_seconds:
+                    # 超过 N 天没更新的订阅者，清空 seen_links 防膨胀
+                    sub_data["seen_links"] = []
+
+        # 原子写入
+        tmp_path = self.config_path + ".tmp"
         try:
-            # 2. 将数据写入临时文件
             with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(self.data, f, indent=4, ensure_ascii=False)
                 f.flush()
                 os.fsync(f.fileno())
-
-            # 3. 原子替换原文件
-            os.replace(tmp_path, self.config_path) # ← 改这里
-
+            os.replace(tmp_path, self.config_path)
         except Exception as e:
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
@@ -556,7 +598,23 @@ class MyRssPlugin(Star):
         self.logger = logging.getLogger("astrbot")
         self.ctx = context
         self.cfg = config
-        self.dh = DataHandler()
+        
+        # 插件目录（用于存储数据文件，避免 git pull 时丢失）
+        # main.py 在 astrbot_plugin_myrss/main.py，数据目录在 astrbot_plugin_myrss/_data/
+        _plugin_dir = os.path.dirname(os.path.abspath(__file__))
+        _data_subdir = os.path.join(_plugin_dir, "_data")
+        
+        # 初始化 DataHandler（插件目录 + 迁移 + 清理）
+        seen_links_max_days = max(config.get("seen_links_max_days", 7), 1)
+        self.dh = DataHandler(plugin_dir=_plugin_dir, seen_links_max_days=seen_links_max_days)
+
+        # 活跃群数据文件（插件目录下）
+        self._group_data_file = os.path.join(_data_subdir, "_groups.json")
+        self._group_data = self._load_group_data()
+
+        # 推荐数据文件（插件目录下）
+        self._recs_file = os.path.join(_data_subdir, "_recs.json")
+        self._pending_recs = self._load_recs()
 
         self.title_max = config.get("title_max_length", 60)
         self.desc_max = config.get("description_max_length", 200)
@@ -582,8 +640,6 @@ class MyRssPlugin(Star):
 
         # 活跃群检测（学新闻插件）
         self._active_groups = set() # 内存中记录有人说话的群
-        self._group_data_file = "data/astrbot_plugin_myrss/_groups.json"
-        self._group_data = self._load_group_data()
 
         # 全局订阅
         self.global_feeds = [
@@ -611,7 +667,6 @@ class MyRssPlugin(Star):
         self._locks: dict = {}
         self._data_lock = asyncio.Lock() # 保护 dh.data 读写
         # 推荐系统
-        self._recs_file = "data/astrbot_plugin_myrss/_recs.json"
         self._pending_recs = self._load_recs()
         self._last_preview = {}
         self._aiocqhttp_bot = None # 缓存 aiocqhttp 的 bot client，用于直连发送
@@ -975,10 +1030,24 @@ class MyRssPlugin(Star):
     # ============================================================
 
     def _load_group_data(self) -> dict:
+        # 优先从新路径加载
         if os.path.exists(self._group_data_file):
             try:
                 with open(self._group_data_file, "r", encoding="utf-8") as f:
                     return json.load(f)
+            except Exception:
+                pass
+        # 迁移：从旧路径迁移
+        old_path = "data/astrbot_plugin_myrss/_groups.json"
+        if os.path.exists(old_path):
+            try:
+                with open(old_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                os.makedirs(os.path.dirname(self._group_data_file), exist_ok=True)
+                with open(self._group_data_file, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2, ensure_ascii=False)
+                self.logger.info("[MyRSS] 迁移群数据: %s -> %s", old_path, self._group_data_file)
+                return data
             except Exception:
                 pass
         return {"groups": {}, "blocked_feeds": {}}
@@ -986,16 +1055,14 @@ class MyRssPlugin(Star):
 
     def _save_group_data(self):
         try:
-            # 确保目录存在
-            dir_path = os.path.dirname(self._group_data_file)
-            if dir_path and not os.path.exists(dir_path):
-                os.makedirs(dir_path, exist_ok=True)
+            os.makedirs(os.path.dirname(self._group_data_file), exist_ok=True)
             with open(self._group_data_file, "w", encoding="utf-8") as f:
                 json.dump(self._group_data, f, indent=2, ensure_ascii=False)
         except Exception as e:
             self.logger.error("[MyRSS] save group data failed: %s", e)
 
     def _load_recs(self) -> dict:
+        # 优先从新路径加载
         if os.path.exists(self._recs_file):
             try:
                 with open(self._recs_file, "r", encoding="utf-8") as f:
@@ -1007,14 +1074,24 @@ class MyRssPlugin(Star):
                 return data
             except Exception:
                 pass
+        # 迁移：从旧路径迁移
+        old_path = "data/astrbot_plugin_myrss/_recs.json"
+        if os.path.exists(old_path):
+            try:
+                with open(old_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                os.makedirs(os.path.dirname(self._recs_file), exist_ok=True)
+                with open(self._recs_file, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2, ensure_ascii=False)
+                self.logger.info("[MyRSS] 迁移推荐数据: %s -> %s", old_path, self._recs_file)
+                return data
+            except Exception:
+                pass
         return {}
 
     def _save_recs(self):
         try:
-            # 确保目录存在
-            dir_path = os.path.dirname(self._recs_file)
-            if dir_path and not os.path.exists(dir_path):
-                os.makedirs(dir_path, exist_ok=True)
+            os.makedirs(os.path.dirname(self._recs_file), exist_ok=True)
             with open(self._recs_file, "w", encoding="utf-8") as f:
                 json.dump(self._pending_recs, f, indent=2, ensure_ascii=False)
         except Exception as e:

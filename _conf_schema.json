@@ -142,5 +142,10 @@
     "description": "Browserless 截图服务地址（Docker容器名:端口）",
     "type": "string",
     "default": "http://browserless:3000"
+  },
+  "seen_links_max_days": {
+    "description": "seen_links 缓存保留天数（防止数据膨胀），超过此天数的订阅者缓存会被清空",
+    "type": "int",
+    "default": 7
   }
 }
