@@ -2647,9 +2647,9 @@ class MyRssPlugin(Star):
         if not eps:
             yield event.plain_result("没有配置 RSSHub 端点，无法测试。")
             return
-
-        # 支持传入完整URL，自动转成RSSHub路由
-        if route.startswith("http"):
+        # 支持传入完整URL（含Markdown链接格式 [url](url)），自动转成RSSHub路由
+        # 不只检查 http 开头，因为QQ的Markdown链接可能是 [url](url) 格式
+        if not route.startswith("/"):
             matched = URLMapper.match(route)
             if matched:
                 converted_route, platform_name = matched
@@ -2660,10 +2660,8 @@ class MyRssPlugin(Star):
                 yield event.plain_result(f"❌ 无法识别该链接: {route}\\n\\n{suggest}\\n\\n请用 /开头的路由重试，例如 /twitter/user/用户名。")
                 return
 
-        if not route.startswith("/"):
-            route = "/" + route
-
         url = eps[0].rstrip("/") + route
+
         yield event.plain_result(f"⏳ 开始测试推送流程...\\n源: {route}\\n10秒后拉取（模拟真实延迟）")
 
         await asyncio.sleep(10)
@@ -2870,8 +2868,6 @@ class MyRssPlugin(Star):
             yield event.plain_result("未配置RSSHub端点。")
             return
 
-        if not route.startswith("/"):
-            route = "/" + route
 
         full_url = eps[0].rstrip("/") + route
         pn = event.unified_msg_origin.split(":")[0]
