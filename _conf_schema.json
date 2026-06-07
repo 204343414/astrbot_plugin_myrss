@@ -87,6 +87,11 @@
     "default": "",
     "_special": "select_provider"
   },
+  "filter_prompt": {
+    "description": "内容审核提示词（{content}会被替换为实际内容）。只要涉及政治内容就判定为UNSAFE，不予推送。",
+    "type": "string",
+    "default": "你是内容安全审核员。请严格审核以下内容是否涉及政治敏感话题。\n\n判断标准：\n1. 涉及中国政治领导人（习近平、毛泽东等）、中国共产党、共产主义意识形态的讨论\n2. 涉及台湾、香港、澳门、西藏、新疆等政治话题\n3. 涉及国际政治敏感话题、领土争议、政治运动等\n4. 任何形式的政治评论、时事评论、政治新闻\n5. 涉及任何政府政策、政治人物的正面或负面评价\n\n只要内容涉及上述任何一种情况，就必须判定为 UNSAFE。\n\n注意：\n- 正常的科技新闻、商业动态、AI讨论、游戏娱乐等不算政治内容\n- 天气预报、纯粹的商业广告等不算政治内容\n- 如果无法确定，倾向于判定为 UNSAFE（宁可误杀也不放过）\n\n待审核内容：\n{content}\n\n请只回答 SAFE 或 UNSAFE，不要解释。"
+  },
   "image_caption_provider_id": {
     "description": "识图用的LLM（如gemini）",
     "type": "string",
