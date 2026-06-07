@@ -1494,16 +1494,20 @@ class MyRssPlugin(Star):
                     pn = group_id.split(":")[0]
                     ret = None
 
+                    send_ok = False
                     try:
                         if pn == "aiocqhttp" and self.compose:
                             node = Comp.Node(uin=0, name="Astrbot", content=push_comps)
                             ret = await self.ctx.send_message(group_id, MessageChain(chain=[node], use_t2i_=self.t2i))
                         else:
                             ret = await self.ctx.send_message(group_id, MessageChain(chain=push_comps, use_t2i_=self.t2i))
+                        send_ok = True  # 没抛异常 = 发送成功
                     except Exception:
                         ret = False
 
                     # ctx.send_message 失败 → 用 aiocqhttp 底层 API 直连
+                    if send_ok:
+                        ret = True  # 明确标记成功，确保冷却时间被记录
                     if (ret is None or ret is False) and pn == "aiocqhttp" and self._aiocqhttp_bot:
                         try:
                             gid_num = int(group_id.split(":")[-1])
@@ -2647,8 +2651,11 @@ class MyRssPlugin(Star):
         if not eps:
             yield event.plain_result("没有配置 RSSHub 端点，无法测试。")
             return
-        # 支持传入完整URL（含Markdown链接格式 [url](url)），自动转成RSSHub路由
-        # 不只检查 http 开头，因为QQ的Markdown链接可能是 [url](url) 格式
+        # 健壮的URL提取：不管什么格式（[url](url)、++格式、纯URL），先提取真实URL再匹配
+        urls = re.findall(r'https?://[^\s)\]]+', route)
+        if urls:
+            route = urls[0]  # 取第一个提取到的URL
+
         if not route.startswith("/"):
             matched = URLMapper.match(route)
             if matched:
@@ -2657,7 +2664,7 @@ class MyRssPlugin(Star):
                 route = converted_route
             else:
                 suggest = URLMapper.suggest(route)
-                yield event.plain_result(f"❌ 无法识别该链接: {route}\\n\\n{suggest}\\n\\n请用 /开头的路由重试，例如 /twitter/user/用户名。")
+                yield event.plain_result(f"❌ 无法识别该链接: {route}\n\n{suggest}\n\n请用 /开头的路由重试，例如 /twitter/user/用户名。")
                 return
 
         url = eps[0].rstrip("/") + route
