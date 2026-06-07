@@ -144,8 +144,8 @@
     "default": "http://browserless:3000"
   },
   "seen_links_max_days": {
-    "description": "seen_links 缓存保留天数（防止数据膨胀），超过此天数的订阅者缓存会被清空",
+    "description": "seen_links 缓存保留天数（防膨胀兜底）。默认365≈关闭此功能，不会干扰月更/年更博主。设为较小值(如7)可自动清理长期不更新的订阅缓存。",
     "type": "int",
-    "default": 7
+    "default": 365
   }
 }

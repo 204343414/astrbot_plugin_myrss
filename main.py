@@ -101,8 +101,17 @@ class DataHandler:
         self._save()
 
     def _save(self):
-        """保存数据，同时清理过期的 seen_links"""
-        # 清理 seen_links（按订阅者的 last_update 判断是否过期）
+        """保存数据，清理超大 seen_links
+        
+        清理策略：只在大缓存时清理，不按时间自动清。
+        seen_links 已在各处写入时限制到 [:200]，正常不会膨胀。
+        此清理是兜底，防止某些路径意外累积超过 500 条的订阅。
+        如果需要时间维度的清理（如彻底废弃的订阅），可将 seen_links_max_days
+        设为较小的正整数（默认 365，即一年，基本等于关闭此功能）。
+        """
+        if self.seen_links_max_days >= 365:
+            return  # 默认不按时间清理，等同关闭
+        
         max_age_seconds = self.seen_links_max_days * 86400
         now = time.time()
         for url, info in list(self.data.items()):
@@ -111,8 +120,9 @@ class DataHandler:
             subscribers = info.get("subscribers", {})
             for sub_id, sub_data in list(subscribers.items()):
                 last_update = sub_data.get("last_update", 0)
-                if last_update > 0 and (now - last_update) > max_age_seconds:
-                    # 超过 N 天没更新的订阅者，清空 seen_links 防膨胀
+                seen = sub_data.get("seen_links", [])
+                # 只有超过 N 天没更新 AND seen_links 超过 500 条才清理（双重条件）
+                if last_update > 0 and (now - last_update) > max_age_seconds and len(seen) > 500:
                     sub_data["seen_links"] = []
 
         # 原子写入
