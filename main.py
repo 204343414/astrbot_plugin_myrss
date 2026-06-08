@@ -3152,6 +3152,49 @@ class MyRssPlugin(Star):
             return
         yield event.plain_result("\\n".join(lines))
 
+    @myrss.command("unbind")
+    async def cmd_unbind(self, event: AstrMessageEvent, group_id: str = ""):
+        """把指定群从**所有订阅源**中踢掉（跨群退订）。
+        用法：/myrss unbind 721058477
+        """
+        if not group_id:
+            yield event.plain_result(
+                "用法: /myrss unbind <群号>\\n"
+                " 先用 /myrss subs 查看所有群号和订阅关系"
+            )
+            return
+
+        gids = [g.strip() for g in re.split(r'[,，\\s]+', group_id) if g.strip()]
+        total_removed = 0
+        removed_per_group = {}
+
+        for target_gid in gids:
+            removed = 0
+            for url, info in self.dh.data.items():
+                if url in ("rsshub_endpoints", "settings"):
+                    continue
+                subs = info.get("subscribers", {})
+                # 模糊匹配：群号可能只传了数字
+                to_del = [k for k in subs if target_gid in k]
+                for k in to_del:
+                    del subs[k]
+                    removed += 1
+            removed_per_group[target_gid] = removed
+            total_removed += removed
+
+        if total_removed > 0:
+            self.dh.save()
+            self._reload_jobs()
+            details = "\\n".join(
+                f" 群 {gid}: 退订 {cnt} 个源"
+                for gid, cnt in removed_per_group.items() if cnt > 0
+            )
+            yield event.plain_result(
+                f"✅ 已从所有订阅源中踢出指定群，共 {total_removed} 条：\\n{details}"
+            )
+        else:
+            yield event.plain_result(f"没有在任何源中找到群 {group_id}，可能已经退过了。")
+
     @myrss.command("unsub")
     async def cmd_unsub(self, event: AstrMessageEvent, route: str = "", group_ids: str = ""):
         """从指定源批量退订群
