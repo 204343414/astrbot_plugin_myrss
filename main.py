@@ -1216,6 +1216,12 @@ class MyRssPlugin(Star):
         """标记某个群有人说话"""
         if "GroupMessage" not in unified_id:
             return
+        # 已禁用的群不记录活跃
+        if self._group_data["groups"].get(unified_id, {}).get("disabled", False):
+            return
+        # 双重检查：disabled_groups 列表
+        if unified_id in self._group_data.get("disabled_groups", []):
+            return
         self._active_groups.add(unified_id)
         if unified_id not in self._group_data["groups"]:
             self._group_data["groups"][unified_id] = {
@@ -1230,9 +1236,12 @@ class MyRssPlugin(Star):
 
     def _get_active_groups(self) -> list:
         """获取所有活跃群的unified_id列表"""
+        disabled = set(self._group_data.get("disabled_groups", []))
         result = []
         for uid, info in self._group_data["groups"].items():
-            if info.get("active") and not info.get("dormant"):
+            if uid in disabled:
+                continue
+            if info.get("active") and not info.get("dormant") and not info.get("disabled", False):
                 result.append(uid)
         return result
 
@@ -1458,7 +1467,8 @@ class MyRssPlugin(Star):
                 break
 
         blocked = self._group_data.get("blocked_feeds", {})
-        push_groups = [g for g in active_groups if feed_route not in blocked.get(g, [])]
+        disabled = set(self._group_data.get("disabled_groups", []))
+        push_groups = [g for g in active_groups if feed_route not in blocked.get(g, []) and g not in disabled]
         # 如果某群已经"自己订阅"了同一个源，就不再给它推全局，避免重复
         personal_subs = set(self.dh.data.get(url, {}).get("subscribers", {}).keys())
         push_groups = [g for g in push_groups if g not in personal_subs]
@@ -3154,7 +3164,7 @@ class MyRssPlugin(Star):
 
     @myrss.command("unbind")
     async def cmd_unbind(self, event: AstrMessageEvent, group_id: str = ""):
-        """把指定群从**所有订阅源**中踢掉（跨群退订）。
+        """把指定群从**所有订阅源+全局推送**中踢掉，并禁用该群的推送。
         用法：/myrss unbind 721058477
         """
         if not group_id:
@@ -3170,6 +3180,10 @@ class MyRssPlugin(Star):
 
         for target_gid in gids:
             removed = 0
+            # 构造该群的 unified_id
+            target_unified = f"aiocqhttp:GroupMessage:{target_gid}"
+            
+            # 1. 从所有订阅源中移除该群
             for url, info in self.dh.data.items():
                 if url in ("rsshub_endpoints", "settings"):
                     continue
@@ -3182,18 +3196,77 @@ class MyRssPlugin(Star):
             removed_per_group[target_gid] = removed
             total_removed += removed
 
+            # 2. [关键修复] 强制标记为 disabled，无论是否找到订阅者
+            #    防止 _mark_active 和 _get_active_groups 继续处理该群
+            if target_unified not in self._group_data.get("groups", {}):
+                self._group_data.setdefault("groups", {})[target_unified] = {
+                    "active": False, "dormant": True, "disabled": True,
+                    "last_activity": 0
+                }
+            else:
+                self._group_data["groups"][target_unified]["disabled"] = True
+                self._group_data["groups"][target_unified]["active"] = False
+                self._group_data["groups"][target_unified]["dormant"] = True
+            
+            # 3. 从内存活跃集合中移除
+            self._active_groups.discard(target_unified)
+            
+            # 4. 从 disabled_groups 列表中也记录（双重保险）
+            if target_unified not in self._group_data.get("disabled_groups", []):
+                self._group_data.setdefault("disabled_groups", []).append(target_unified)
+            
+            # 5. 清除该群的冷却时间（防止冷却过期后又推送）
+            self._group_cooldown.pop(target_unified, None)
+
+        # 6. 保存所有数据
+        self.dh.save()
+        self._save_group_data()
+        self._reload_jobs()
+        
         if total_removed > 0:
-            self.dh.save()
-            self._reload_jobs()
             details = "\\n".join(
-                f" 群 {gid}: 退订 {cnt} 个源"
+                f" 群 {gid}: 退订 {cnt} 个源，已禁用全局推送，清除活跃状态"
                 for gid, cnt in removed_per_group.items() if cnt > 0
             )
             yield event.plain_result(
-                f"✅ 已从所有订阅源中踢出指定群，共 {total_removed} 条：\\n{details}"
+                f"✅ 已从所有订阅源中踢出指定群，共 {total_removed} 条：\\n{details}\\n\\n"
+                f"该群已被永久禁用推送，直到你使用 /myrss enable <群号> 恢复。"
             )
         else:
-            yield event.plain_result(f"没有在任何源中找到群 {group_id}，可能已经退过了。")
+            yield event.plain_result(
+                f"✅ 已禁用指定群的全局推送：{', '.join(gids)}\\n"
+                f"(未发现个人订阅，但已设置禁用标记)\\n"
+                f"如需恢复，使用 /myrss enable {','.join(gids)}"
+            )
+
+    @myrss.command("enable")
+    async def cmd_enable(self, event: AstrMessageEvent, group_id: str = ""):
+        """恢复被 /myrss unbind 禁用的群的推送。
+        用法：/myrss enable 721058477
+        """
+        if not group_id:
+            yield event.plain_result("用法: /myrss enable <群号>")
+            return
+
+        gids = [g.strip() for g in re.split(r'[,，\s]+', group_id) if g.strip()]
+        enabled = []
+        for target_gid in gids:
+            target_unified = f"aiocqhttp:GroupMessage:{target_gid}"
+            if target_unified in self._group_data.get("groups", {}):
+                if self._group_data["groups"][target_unified].get("disabled", False):
+                    self._group_data["groups"][target_unified]["disabled"] = False
+                    enabled.append(target_gid)
+            disabled_list = self._group_data.get("disabled_groups", [])
+            if target_unified in disabled_list:
+                disabled_list.remove(target_unified)
+                if target_gid not in enabled:
+                    enabled.append(target_gid)
+
+        if enabled:
+            self._save_group_data()
+            yield event.plain_result(f"✅ 已恢复以下群的推送：{', '.join(enabled)}")
+        else:
+            yield event.plain_result(f"群 {group_id} 未被禁用，无需恢复。")
 
     @myrss.command("unsub")
     async def cmd_unsub(self, event: AstrMessageEvent, route: str = "", group_ids: str = ""):
