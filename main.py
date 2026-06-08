@@ -46,7 +46,7 @@ class DataHandler:
     
     迁移：如果检测到旧路径 `data/astrbot_plugin_myrss/` 存在数据，自动迁移到插件目录。
     """
-    def __init__(self, plugin_dir=None, seen_links_max_days=7):
+    def __init__(self, plugin_dir=None, seen_links_max_days=365):
         # 确定数据目录
         if plugin_dir:
             self.data_dir = os.path.join(plugin_dir, "_data")
@@ -279,8 +279,8 @@ class URLMapper:
         (r"youtube\.com/@([\\w.-]+)", "/youtube/user/@{0}", "YouTube用户"),
         (r"youtube\.com/playlist\\?list=([\\w-]+)", "/youtube/playlist/{0}", "YouTube播放列表"),
         # 专门匹配 x.com（优先级高于通用的 twitter|x 正则）
-        (r"x\.com/(?!home|explore|search|settings|i/)([\\w]+)", "/twitter/user/{0}", "X.com"),
-        (r"(?:twitter|x)\.com/(?!home|explore|search|settings|i/)([\\w]+)", "/twitter/user/{0}", "Twitter/X"),
+        (r"x\.com/(?:@)?([A-Za-z0-9_]+)(?:/(?:posts|media|with_replies|likes|followers|following)?(?:$|\?))?", "/twitter/user/{0}", "X.com"),
+        (r"(?:twitter|x)\.com/(?:@)?([A-Za-z0-9_]+)(?:/(?:posts|media|with_replies|likes|followers|following)?(?:$|\?))?", "/twitter/user/{0}", "Twitter/X"),
         (r"weibo\.com/u/(\d+)", "/weibo/user/{0}", "微博"),
         (r"zhihu\.com/people/([\\w-]+)", "/zhihu/people/activities/{0}", "知乎"),
         (r"zhihu\.com/column/([\\w-]+)", "/zhihu/zhuanlan/{0}", "知乎专栏"),
@@ -414,9 +414,9 @@ class CardGen:
     .link { font-size: 12px; color: #3b82f6; margin-bottom: 8px; }
     .divider { border-top: 1px dashed #e5e7eb; margin: 12px 0; }
     .comment { background: #f9fafb; border-radius: 8px; padding: 10px; margin-top: 8px; }
-    .comment-header { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
-    .bot-avatar { width: 24px; height: 24px; border-radius: 50%; background: #764ba2; display: flex; align-items: center; justify-content: center; color: white; font-size: 12px; overflow: hidden; }
-    .bot-avatar img { width: 100%; height: 100%; object-fit: cover; }
+    .comment-header { display: flex; align-items: flex-start; gap: 8px; margin-bottom: 6px; }
+    .bot-avatar { width: 24px; height: 24px; border-radius: 50%; background: #764ba2; display: flex; align-items: center; justify-content: center; color: white; font-size: 12px; overflow: hidden; flex-shrink: 0; margin-top: 1px; }
+    .bot-avatar img { width: 100%; height: 100%; object-fit: cover; display: block; }
     .comment-text { font-size: 13px; color: #374151; line-height: 1.5; }
     .comment-provider { font-size: 11px; color: #9ca3af; margin-top: 4px; }
 </style></head><body>
@@ -635,7 +635,7 @@ class MyRssPlugin(Star):
         _data_subdir = os.path.join(_plugin_dir, "_data")
         
         # 初始化 DataHandler（插件目录 + 迁移 + 清理）
-        seen_links_max_days = max(config.get("seen_links_max_days", 7), 1)
+        seen_links_max_days = max(config.get("seen_links_max_days", 365), 1)
         self.dh = DataHandler(plugin_dir=_plugin_dir, seen_links_max_days=seen_links_max_days)
 
         # 活跃群数据文件（插件目录下）
@@ -1949,6 +1949,9 @@ class MyRssPlugin(Star):
                 after_link=si["latest_link"],
             )
         if not items:
+            # [修复] 无新内容也更新last_update到当前时间，防止seen_links被时间清理后重推
+            si["last_update"] = int(time.time())
+            self.dh.save()
             return
 
         def item_key(it: RSSItem) -> str:
@@ -1961,7 +1964,9 @@ class MyRssPlugin(Star):
         new_items = [it for it in items if item_key(it) not in seen]
 
         if not new_items:
+            # [修复] 即使没有新条目，也更新last_update，防止seen_links被时间清理后重推
             si["latest_link"] = items[0].link
+            si["last_update"] = max(si.get("last_update", 0), int(time.time()))
             self.dh.save()
             return
 
@@ -2637,6 +2642,60 @@ class MyRssPlugin(Star):
         self._safe_cache.clear()
         self._comment_cache.clear()
         yield event.plain_result(f"✅ 缓存已清空\\n 过滤缓存: {safe_count} 条已清除\\n 锐评缓存: {comment_count} 条已清除")
+
+    @myrss.command("clear")
+    async def cmd_clear(self, event: AstrMessageEvent, target: str = "all"):
+        """清空所有/指定源的已推送历史记录，从今天开始重新计数（不会重复推旧内容）。
+        用法：
+        /myrss clear          清空当前用户所有订阅的推送历史
+        /myrss clear all      清空当前用户所有订阅
+        /myrss clear 0,2,3    清空指定编号的订阅源
+        /myrss clear 推特      清空包含关键词的订阅源
+        """
+        user = event.unified_msg_origin
+        urls = self.dh.get_subs(user)
+        if not urls:
+            yield event.plain_result("当前没有任何订阅，无需清空。")
+            return
+
+        target_urls = []
+        t = target.strip().lower()
+
+        if t in ("all", "全部", "清空", ""):
+            target_urls = urls
+        else:
+            # 尝试解析为编号列表（逗号/空格分隔）
+            nums = [int(x) for x in re.findall(r"\d+", t)]
+            if nums and all(0 <= n < len(urls) for n in nums):
+                target_urls = [urls[n] for n in nums]
+            else:
+                # 模糊匹配关键词
+                for u in urls:
+                    info = self.dh.data.get(u, {}).get("info", {})
+                    title = info.get("title", "")
+                    if t in title.lower() or t in u.lower():
+                        target_urls.append(u)
+
+        if not target_urls:
+            yield event.plain_result(f"没找到匹配的订阅源。用 /myrss list 查看当前订阅。")
+            return
+
+        cleared = []
+        for u in target_urls:
+            if u in self.dh.data:
+                subs = self.dh.data[u].get("subscribers", {})
+                if user in subs:
+                    subs[user]["seen_links"] = []
+                    subs[user]["latest_link"] = ""
+                    # last_update 保持原值，不清空（避免下次全量拉取）
+                    cleared.append(self.dh.data[u].get("info", {}).get("title", u))
+
+        self.dh.save()
+        yield event.plain_result(
+            f"✅ 已清空以下源的推送历史记录：\\n" +
+            "\\n".join(f" - {x}" for x in cleared) +
+            "\\n\\n从此刻开始的新内容才会被推送，历史旧内容不会重推。"
+        )
 
     @myrss.command("test")
     async def cmd_test(self, event: AstrMessageEvent, route: str = "/twitter/user/AnthropicAI"):
