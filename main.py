@@ -835,6 +835,7 @@ class MyRssPlugin(Star):
                     async with s.get(u) as r:
                         if r.status != 200:
                             self.logger.warning(f"[MyRSS] HTTP {r.status} when fetching {u}")
+                            self._last_fetch_error = f"HTTP {r.status} from {u}"
                             return None
                         return await r.read()
             except Exception as e:
@@ -872,6 +873,7 @@ class MyRssPlugin(Star):
 
         eps = self.dh.data.get("rsshub_endpoints", [])
         if not eps:
+            self._last_fetch_error = "No rsshub_endpoints configured"
             return None
 
         parsed = urlparse(url)
@@ -2786,16 +2788,26 @@ class MyRssPlugin(Star):
         items = await self._poll(url, num=1)
         if not items:
             last_err = getattr(self, "_last_fetch_error", "未知错误")
+            # Try to get more context from recent logs or the actual exception during this test
+            debug_extra = ""
+            try:
+                # If the last operation raised, it may have been caught higher; show what we have
+                if last_err == "未知错误" or "All fetch attempts" in str(last_err):
+                    debug_extra = "\n注意：本次失败没有抛出 Python 异常（可能是 HTTP 非200、超时、或返回空/错误页）。请查看 AstrBot 容器日志获取 aiohttp 详细错误。"
+            except:
+                pass
+
             yield event.plain_result(f"""❌ 拉取失败，源无内容或不可访问。
 
 🔍 调试排错信息：
  - 请求 URL: {url}
- - 错误详情: {last_err}
+ - 错误详情: {last_err}{debug_extra}
 
 💡 修复建议：
  1. 代理问题（最常见）：为内网 rsshub 设置 NO_PROXY=rsshub,localhost,127.0.0.1 在容器环境变量或 docker run -e。
  2. Docker 网络问题：如果容器是单独 docker run 启动的，"rsshub" 主机名可能无法解析。请使用 docker-compose 把 astrbot 和 rsshub 放在同一个 network，或把端点改成宿主机 IP:1200（如 http://172.17.0.1:1200）。
  3. 本插件已对 rsshub 等内网地址自动 trust_env=False 禁用代理，请确认更新已应用并重启 Bot。
+ 4. 临时绕过：把 rsshub_endpoints 改成能从 astrbot 容器直达的地址测试（例如宿主机 IP）。
 """)
             return
         item = items[0]
