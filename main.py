@@ -185,22 +185,23 @@ class DataHandler:
         self._save()
 
     def _save(self):
-        """保存数据，清理超大 seen_links"""
-        if self.seen_links_max_days >= 365:
-            return
+        """保存数据，清理超大 seen_links（仅当配置了较小 max_days 时才做时间清理）。
+        写入操作始终执行，保证 reset/clear 等命令能真正更新文件。
+        """
+        if self.seen_links_max_days < 365:
+            max_age_seconds = self.seen_links_max_days * 86400
+            now = time.time()
+            for url, info in list(self.data.items()):
+                if url in ("rsshub_endpoints", "settings"):
+                    continue
+                subscribers = info.get("subscribers", {})
+                for sub_id, sub_data in list(subscribers.items()):
+                    last_update = sub_data.get("last_update", 0)
+                    seen = sub_data.get("seen_links", [])
+                    if last_update > 0 and (now - last_update) > max_age_seconds and len(seen) > 500:
+                        sub_data["seen_links"] = []
 
-        max_age_seconds = self.seen_links_max_days * 86400
-        now = time.time()
-        for url, info in list(self.data.items()):
-            if url in ("rsshub_endpoints", "settings"):
-                continue
-            subscribers = info.get("subscribers", {})
-            for sub_id, sub_data in list(subscribers.items()):
-                last_update = sub_data.get("last_update", 0)
-                seen = sub_data.get("seen_links", [])
-                if last_update > 0 and (now - last_update) > max_age_seconds and len(seen) > 500:
-                    sub_data["seen_links"] = []
-
+        # 始终执行原子写入，保证数据持久化
         tmp_path = self.config_path + ".tmp"
         try:
             with open(tmp_path, "w", encoding="utf-8") as f:
