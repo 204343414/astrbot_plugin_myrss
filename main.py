@@ -3294,7 +3294,7 @@ class MyRssPlugin(Star):
             items = await self._poll(url, num=1)
             if items:
                 item = items[0]
-                # 构造归一化 Key (与 item_key 逻辑一致)
+                # 构造归一化 Key
                 ik = item.link.split("#", 1)[0].split("?", 1)[0] if item.link else f"{item.title}|{item.pubDate_timestamp}"
                 
                 for user, sub_data in subs.items():
@@ -3309,7 +3309,9 @@ class MyRssPlugin(Star):
         
         self.dh.save()
         self._reload_jobs()
-        yield event.plain_result(f"✅ 已重置 {count} 个订阅源的基准。\n所有群将从此刻起只接收新动态，旧内容不再推送。")
+        
+        # [关键] 输出实际写入的文件路径
+        yield event.plain_result(f"✅ 已重置 {count} 个订阅源的基准。\n📂 实际写入路径：{self.dh.config_path}\n请检查此路径下的文件确认 seen_links 是否已更新。")
     @myrss.command("unsub")
     async def cmd_unsub(self, event: AstrMessageEvent, route: str = "", group_ids: str = ""):
         """从指定源批量退订群
