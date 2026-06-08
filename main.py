@@ -42,35 +42,104 @@ class RSSItem:
     pic_urls: list
 
 class DataHandler:
-    """数据管理：文件存储在插件目录下，避免 git pull 时数据丢失。
-    
-    迁移：如果检测到旧路径 `data/astrbot_plugin_myrss/` 存在数据，自动迁移到插件目录。
+    """数据管理（大幅改进版）：
+
+    解决 Docker/容器 vs 主机路径混乱问题。
+
+    路径优先级（从高到低）：
+    1. 插件配置里的 custom_data_dir （推荐 Docker 用户直接填绝对路径）
+    2. 环境变量 MYRSS_DATA_DIR
+    3. 插件源码所在目录下的 _data/ （默认，git pull 安全）
+    4. 旧的 data/astrbot_plugin_myrss 兜底
+
+    每次启动都会在日志里明确打印实际使用的完整路径。
     """
-    def __init__(self, plugin_dir=None, seen_links_max_days=365):
-        # 确定数据目录
-        if plugin_dir:
-            self.data_dir = os.path.join(plugin_dir, "_data")
-            self._use_plugin_dir = True
-        else:
-            self.data_dir = "data/astrbot_plugin_myrss"
-            self._use_plugin_dir = False
-        
+
+    def __init__(self, plugin_dir=None, seen_links_max_days=365, custom_data_dir=None):
+        self.logger = logging.getLogger("astrbot")
         self.seen_links_max_days = seen_links_max_days
+
+        self.data_dir = self._resolve_data_dir(plugin_dir, custom_data_dir)
         self.config_path = os.path.join(self.data_dir, "_data.json")
+
+        is_container = self._is_running_in_container()
+        env_type = "容器环境 (Docker/AstrBot容器)" if is_container else "主机/本地文件系统"
+        self.logger.info(f"[MyRSS] 运行环境检测: {env_type}")
+        self.logger.info(f"[MyRSS] 数据目录已解析: {self.data_dir}")
+        self.logger.info(f"[MyRSS] 数据文件路径: {self.config_path}")
+
         self.data = self._load()
+
+    def _is_running_in_container(self) -> bool:
+        """自动检测是否在容器（Docker / AstrBot 常见容器）内运行。
+        这样代码能自己判断“容器里面”还是“本地主机文件系统”，
+        并在日志中明确报告，方便用户排查路径问题。
+        """
+        if os.path.exists("/.dockerenv"):
+            return True
+        try:
+            with open("/proc/1/cgroup", "r") as f:
+                c = f.read().lower()
+                if any(x in c for x in ["docker", "kubepods", "containerd", "lxc"]):
+                    return True
+        except Exception:
+            pass
+        cwd = os.getcwd().lower()
+        if cwd.startswith("/astrbot") or "/astrbot/" in cwd:
+            return True
+        if os.environ.get("ASTRBOT_DOCKER") or os.environ.get("IN_DOCKER"):
+            return True
+        if os.path.exists("/.containerenv") or os.path.exists("/run/.containerenv"):
+            return True
+        return False
+
+    def _resolve_data_dir(self, plugin_dir: str | None, custom_data_dir: str | None) -> str:
+        # 1. 最高优先级：用户在 AstrBot 配置界面填的 custom_data_dir
+        if custom_data_dir and str(custom_data_dir).strip():
+            d = os.path.abspath(str(custom_data_dir).strip())
+            os.makedirs(d, exist_ok=True)
+            self.logger.info("[MyRSS] 使用用户自定义数据目录 (custom_data_dir)")
+            return d
+
+        # 2. 环境变量（方便 Docker compose 覆盖）
+        env_dir = os.environ.get("MYRSS_DATA_DIR", "").strip()
+        if env_dir:
+            d = os.path.abspath(env_dir)
+            os.makedirs(d, exist_ok=True)
+            self.logger.info("[MyRSS] 使用环境变量 MYRSS_DATA_DIR")
+            return d
+
+        # 3. 插件目录 _data （最推荐的默认方式）
+        if plugin_dir:
+            d = os.path.join(os.path.abspath(plugin_dir), "_data")
+            os.makedirs(d, exist_ok=True)
+            if self._is_running_in_container():
+                self.logger.info("[MyRSS] 检测到容器环境，使用插件目录下的 _data")
+            return d
+
+        # 4. 最后兜底（旧行为）
+        d = os.path.abspath("data/astrbot_plugin_myrss")
+        os.makedirs(d, exist_ok=True)
+        self.logger.warning("[MyRSS] 使用兜底数据目录 data/astrbot_plugin_myrss")
+        return d
+
+    def get_data_path(self) -> str:
+        """返回当前实际使用的数据文件完整路径（给命令显示用）"""
+        return self.config_path
+
+    def get_data_dir(self) -> str:
+        return self.data_dir
 
     def _load(self):
         """加载数据，支持从旧路径迁移，并自动备份已有数据"""
-        # 尝试新路径
         if os.path.exists(self.config_path):
             d = self._read_json(self.config_path)
             if d is not None:
-                # 自动备份（仅当数据非空时）
                 if len(d) > 1 or d.get("rsshub_endpoints"):
                     self._backup_data(d)
                 return d
-        
-        # 迁移：从旧路径（AstrBot data 目录）迁移数据
+
+        # 迁移旧路径
         old_path = "data/astrbot_plugin_myrss/_data.json"
         if os.path.exists(old_path):
             old_data = self._read_json(old_path)
@@ -78,14 +147,13 @@ class DataHandler:
                 os.makedirs(self.data_dir, exist_ok=True)
                 with open(self.config_path, "w", encoding="utf-8") as f:
                     json.dump(old_data, f, indent=2, ensure_ascii=False)
-                # 同时保留旧路径备份
                 try:
                     shutil.copy2(old_path, old_path + ".migrated_bak")
                 except Exception:
                     pass
                 return old_data
-        
-        # 初始化空数据
+
+        # 初始化
         d = {"rsshub_endpoints": []}
         os.makedirs(self.data_dir, exist_ok=True)
         with open(self.config_path, "w", encoding="utf-8") as f:
@@ -93,7 +161,6 @@ class DataHandler:
         return d
 
     def _backup_data(self, data: dict):
-        """自动备份已有数据到带时间戳的文件"""
         try:
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             backup_path = os.path.join(self.data_dir, f"_data_backup_{ts}.json")
@@ -118,17 +185,10 @@ class DataHandler:
         self._save()
 
     def _save(self):
-        """保存数据，清理超大 seen_links
-        
-        清理策略：只在大缓存时清理，不按时间自动清。
-        seen_links 已在各处写入时限制到 [:200]，正常不会膨胀。
-        此清理是兜底，防止某些路径意外累积超过 500 条的订阅。
-        如果需要时间维度的清理（如彻底废弃的订阅），可将 seen_links_max_days
-        设为较小的正整数（默认 365，即一年，基本等于关闭此功能）。
-        """
+        """保存数据，清理超大 seen_links"""
         if self.seen_links_max_days >= 365:
-            return  # 默认不按时间清理，等同关闭
-        
+            return
+
         max_age_seconds = self.seen_links_max_days * 86400
         now = time.time()
         for url, info in list(self.data.items()):
@@ -138,11 +198,9 @@ class DataHandler:
             for sub_id, sub_data in list(subscribers.items()):
                 last_update = sub_data.get("last_update", 0)
                 seen = sub_data.get("seen_links", [])
-                # 只有超过 N 天没更新 AND seen_links 超过 500 条才清理（双重条件）
                 if last_update > 0 and (now - last_update) > max_age_seconds and len(seen) > 500:
                     sub_data["seen_links"] = []
 
-        # 原子写入
         tmp_path = self.config_path + ".tmp"
         try:
             with open(tmp_path, "w", encoding="utf-8") as f:
@@ -153,6 +211,7 @@ class DataHandler:
         except Exception as e:
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
+            self.logger.error(f"[MyRSS] 保存数据失败: {e}")
             raise e
 
     def get_subs(self, user_id):
@@ -175,65 +234,6 @@ class DataHandler:
             avatar = img_nodes[0].text
         return title, desc or "", avatar
 
-    def strip_html_pic(self, html):
-        """从HTML中提取所有图片URL，包含暴力正则匹配YouTube封面"""
-        if not html:
-            return []
-
-        soup = BeautifulSoup(html, "html.parser")
-        urls = []
-
-        # 1. 常规 ![](https://raw.githubusercontent.com/204343414/astrbot_plugin_myrss/master...)
-        for img in soup.find_all("img"):
-            src = img.get("src")
-            if src and src not in urls:
-                urls.append(src)
-
-        # 2.
-        for vid in soup.find_all("video"):
-            poster = vid.get("poster")
-            if poster and poster not in urls:
-                urls.append(poster)
-
-        # 3. [暴力增强] 直接正则扫描整个HTML文本匹配YouTube ID
-        # 因为有时候 RSSHub 返回的 description 里只有纯文本链接，没有 <img> 标签
-        # 匹配 youtube.com/watch?v=xxx 或 youtu.be/xxx
-        patterns = [
-            r'youtube\\.com/watch\\?v=([\\w-]{11})',
-            r'youtu\\.be/([\\w-]{11})',
-            r'youtube\\.com/embed/([\\w-]{11})',
-            r'youtube\\.com/v/([\\w-]{11})'
-        ]
-
-        found_ids = set()
-        # 先搜 soup 里的 a 标签
-        for a in soup.find_all("a", href=True):
-            for pat in patterns:
-                m = re.search(pat, a["href"])
-                if m: found_ids.add(m.group(1))
-
-        # 再暴力搜全文（兜底）
-        for pat in patterns:
-            for vid_id in re.findall(pat, html):
-                found_ids.add(vid_id)
-
-        # 构造封面地址
-        for vid_id in found_ids:
-            # 存两个分辨率，优先高清(maxres)，其次中等(hq)，防止maxres不存在
-            u1 = f"https://i.ytimg.com/vi/{vid_id}/maxresdefault.jpg"
-            u2 = f"https://i.ytimg.com/vi/{vid_id}/hqdefault.jpg"
-            if u1 not in urls: urls.append(u1)
-            if u2 not in urls: urls.append(u2)
-
-        return urls
-
-    def strip_html(self, html):
-        soup = BeautifulSoup(html, "html.parser")
-        return re.sub(r"\\n+", "\\n", soup.get_text())
-
-    def get_root_url(self, url):
-        p = urlparse(url)
-        return f"{p.scheme}://{p.netloc}"
 
 class PicHandler:
     def __init__(self, adjust=False):
@@ -636,7 +636,12 @@ class MyRssPlugin(Star):
         
         # 初始化 DataHandler（插件目录 + 迁移 + 清理）
         seen_links_max_days = max(config.get("seen_links_max_days", 365), 1)
-        self.dh = DataHandler(plugin_dir=_plugin_dir, seen_links_max_days=seen_links_max_days)
+        custom_data_dir = config.get("custom_data_dir", "") or ""
+        self.dh = DataHandler(
+            plugin_dir=_plugin_dir, 
+            seen_links_max_days=seen_links_max_days,
+            custom_data_dir=custom_data_dir
+        )
 
         # 活跃群数据文件（插件目录下）
         self._group_data_file = os.path.join(_data_subdir, "_groups.json")
@@ -3277,18 +3282,23 @@ class MyRssPlugin(Star):
             yield event.plain_result(f"群 {group_id} 未被禁用，无需恢复。")
     @myrss.command("reset")
     async def cmd_reset(self, event: AstrMessageEvent):
-        """重置所有订阅源的推送基准，并清空内存缓存。
-        执行后会回传文件内容截图/文本作为证据。
+        """重置所有订阅源的推送基准。
+        根据配置 force_reset_without_poll 决定是否依赖 poll 拉取最新内容。
+        默认（推荐）使用强制模式：直接把每个订阅的 seen_links 重置为只有当前 latest_link 的一条。
+        执行后会回传实际使用的数据文件路径和证据。
         """
-        yield event.plain_result("⏳ 正在重置...（清理缓存+重写基准+强制保存）")
+        use_force = self.cfg.get("force_reset_without_poll", True)
         
-        # 1. 清空内存缓存（防止旧逻辑干扰）
+        mode = "强制模式（不依赖网络，拉当前 latest_link）" if use_force else "智能模式（尝试拉最新 RSS 作为基准）"
+        yield event.plain_result(f"⏳ 正在重置...（{mode} + 清理缓存 + 强制保存）")
+        
+        # 1. 清空内存缓存
         self._safe_cache.clear()
         self._comment_cache.clear()
         self.logger.info("[MyRSS] 内存缓存已清空")
         
         count = 0
-        evidence = [] # 用于回传的证据
+        force_count = 0
         
         for url, info in self.dh.data.items():
             if url in ("rsshub_endpoints", "settings"):
@@ -3297,42 +3307,85 @@ class MyRssPlugin(Star):
             if not subs:
                 continue
             
-            # 拉取最新 1 条作为基准
-            items = await self._poll(url, num=1)
-            if items:
-                item = items[0]
-                # 归一化 Key
-                ik = item.link.split("#", 1)[0].split("?", 1)[0] if item.link else f"{item.title}|{item.pubDate_timestamp}"
-                
+            did_update = False
+            
+            if not use_force:
+                # 智能模式：尝试拉最新
+                try:
+                    items = await self._poll(url, num=1)
+                    if items:
+                        item = items[0]
+                        ik = item.link.split("#", 1)[0].split("?", 1)[0] if item.link else f"{item.title}|{item.pubDate_timestamp}"
+                        for user, sub_data in subs.items():
+                            if item.pubDate_timestamp > 0:
+                                sub_data["last_update"] = item.pubDate_timestamp
+                            sub_data["latest_link"] = item.link
+                            sub_data["seen_links"] = [ik]
+                        did_update = True
+                except Exception as e:
+                    self.logger.warning(f"[MyRSS] reset poll failed for {url}: {e}")
+            
+            if not did_update or use_force:
+                # 强制模式或 poll 失败时：直接用已有的 latest_link 设为单条
                 for user, sub_data in subs.items():
-                    if item.pubDate_timestamp > 0:
-                        sub_data["last_update"] = item.pubDate_timestamp
-                    sub_data["latest_link"] = item.link
-                    # [关键] 强制覆盖为仅一条基准
-                    sub_data["seen_links"] = [ik]
-                
+                    latest = sub_data.get("latest_link", "")
+                    sub_data["seen_links"] = [latest] if latest else []
+                force_count += 1
+                did_update = True
+            
+            if did_update:
                 count += 1
-                # 收集证据
-                title = info.get("info", {}).get("title", "Unknown")
-                evidence.append(f"📡 {title} → {item.title[:20]}...")
 
         # 2. 强制保存
         self.dh.save()
         self._reload_jobs()
         
-        # 3. 验证文件是否真的变了（读回一部分发给你看）
+        # 3. 读回文件发证据（关键：用 dh.get_data_path() 确保显示真实路径）
+        actual_path = self.dh.get_data_path()
         try:
-            with open(self.dh.config_path, "r", encoding="utf-8") as f:
+            with open(actual_path, "r", encoding="utf-8") as f:
                 content = f.read()
-            # 截取前 500 字符作为证据
-            sample = content[:500] 
-            yield event.plain_result(
-                f"✅ 重置成功！共 {count} 个源。\n"
-                f"📂 文件路径：{self.dh.config_path}\n"
+            sample = content[:600]
+            msg = (
+                f"✅ 重置完成！共影响 {count} 个源（其中 {force_count} 个使用强制单条模式）。\n"
+                f"📂 实际数据文件路径：{actual_path}\n"
                 f"📋 证据（文件内容片段）：\n{sample}..."
             )
+            yield event.plain_result(msg)
         except Exception as e:
-            yield event.plain_result(f"✅ 重置完成，但读取文件失败：{e}")
+            yield event.plain_result(f"✅ 重置完成，但读取文件失败：{e}\n实际路径应为：{actual_path}")
+    @myrss.command("datapath")
+    async def cmd_datapath(self, event: AstrMessageEvent):
+        """显示当前实际使用的数据文件路径和基本统计。强烈建议每次遇到路径问题时先跑这个。"""
+        try:
+            path = self.dh.get_data_path()
+            data_dir = self.dh.get_data_dir()
+            total_sources = len([k for k in self.dh.data if k not in ("rsshub_endpoints", "settings")])
+            
+            total_subs = 0
+            for url, info in self.dh.data.items():
+                if url in ("rsshub_endpoints", "settings"):
+                    continue
+                total_subs += len(info.get("subscribers", {}))
+            
+            import os, time
+            size = os.path.getsize(path) if os.path.exists(path) else 0
+            mtime = ""
+            if os.path.exists(path):
+                mtime = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(os.path.getmtime(path)))
+            
+            msg = (
+                f"📂 当前实际数据文件路径：\n{path}\n\n"
+                f"📁 数据目录：{data_dir}\n"
+                f"📊 统计：{total_sources} 个订阅源，{total_subs} 个订阅记录\n"
+                f"📦 文件大小：{size} bytes\n"
+                f"🕒 最后修改：{mtime}\n\n"
+                "提示：如果这个路径和你手动查看的不一样，说明是容器挂载导致的，请优先使用这个路径。"
+            )
+            yield event.plain_result(msg)
+        except Exception as e:
+            yield event.plain_result(f"获取数据路径失败: {e}")
+
     @myrss.command("unsub")
     async def cmd_unsub(self, event: AstrMessageEvent, route: str = "", group_ids: str = ""):
         """从指定源批量退订群

@@ -147,5 +147,15 @@
     "description": "seen_links 缓存保留天数（防膨胀兜底）。默认365≈关闭此功能，不会干扰月更/年更博主。设为较小值(如7)可自动清理长期不更新的订阅缓存。",
     "type": "int",
     "default": 365
+  },
+  "custom_data_dir": {
+    "description": "自定义数据目录（强烈推荐 Docker 用户填写绝对路径，例如 /data/myrss 或 /mnt/hdd/bot/astrbot/data/plugins/astrbot_plugin_myrss/_data）。留空则自动检测。",
+    "type": "string",
+    "default": ""
+  },
+  "force_reset_without_poll": {
+    "description": "reset 命令是否默认使用强制模式（不依赖拉取最新RSS，直接用当前 latest_link 重置为单条）。推荐开启，解决 poll 失败导致 reset 无效的问题。",
+    "type": "bool",
+    "default": true
   }
 }
