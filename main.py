@@ -3275,7 +3275,41 @@ class MyRssPlugin(Star):
             yield event.plain_result(f"✅ 已恢复以下群的推送：{', '.join(enabled)}")
         else:
             yield event.plain_result(f"群 {group_id} 未被禁用，无需恢复。")
-
+    @myrss.command("reset")
+    async def cmd_reset(self, event: AstrMessageEvent):
+        """重置所有订阅源的推送基准为当前最新的一条内容。
+        修复因缓存丢失/混乱导致的重复推送。
+        订阅关系不会丢失，只会更新 last_update 和 seen_links 为最新的一条。
+        """
+        yield event.plain_result("⏳ 正在重置所有订阅源基准...请稍候")
+        count = 0
+        for url, info in self.dh.data.items():
+            if url in ("rsshub_endpoints", "settings"):
+                continue
+            subs = info.get("subscribers", {})
+            if not subs:
+                continue
+            
+            # 拉取最新 1 条作为基准
+            items = await self._poll(url, num=1)
+            if items:
+                item = items[0]
+                # 构造归一化 Key (与 item_key 逻辑一致)
+                ik = item.link.split("#", 1)[0].split("?", 1)[0] if item.link else f"{item.title}|{item.pubDate_timestamp}"
+                
+                for user, sub_data in subs.items():
+                    # 更新时间戳
+                    if item.pubDate_timestamp > 0:
+                        sub_data["last_update"] = item.pubDate_timestamp
+                    # 更新最新链接
+                    sub_data["latest_link"] = item.link
+                    # 重置 seen_links 仅保留这一条基准，防止旧内容重推
+                    sub_data["seen_links"] = [ik]
+                count += 1
+        
+        self.dh.save()
+        self._reload_jobs()
+        yield event.plain_result(f"✅ 已重置 {count} 个订阅源的基准。\n所有群将从此刻起只接收新动态，旧内容不再推送。")
     @myrss.command("unsub")
     async def cmd_unsub(self, event: AstrMessageEvent, route: str = "", group_ids: str = ""):
         """从指定源批量退订群
