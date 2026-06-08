@@ -839,22 +839,31 @@ class MyRssPlugin(Star):
                         return await r.read()
             except Exception as e:
                 self.logger.error(f"[MyRSS] Error fetching {u}: {e}")
+                self._last_fetch_error = f"{type(e).__name__}: {e}"
                 return None
 
         data = None
         for attempt in range(3):
             data = await _try(url)
             if data is not None:
-                # 检查是否返回了HTML错误页而非XML
-                if data[:5] == b'' in data[:5000]:
-                    return data
-                if b'' not in data[:500].lower():
-                    return data
-                # 拿到HTML错误页，等几秒重试（等RSSHub内部缓存刷新）
-                if attempt < 2:
-                    self.logger.warning(f"[MyRSS] HTML error from RSSHub. Retrying {attempt+1}/3 in 3s...")
-                    await asyncio.sleep(3)
-                    continue
+                # 检查是否返回了HTML错误页而非XML（修复了之前损坏的检测逻辑）
+                content_head = data[:500].lower()
+                is_html_error = (
+                    b'<!doctype html' in content_head or
+                    b'<html' in content_head or
+                    (b'<head>' in content_head and b'rss' not in content_head[:100])
+                )
+                if is_html_error:
+                    # 拿到HTML错误页，等几秒重试（等RSSHub内部缓存刷新）
+                    if attempt < 2:
+                        self.logger.warning(f"[MyRSS] HTML error from RSSHub. Retrying {attempt+1}/3 in 3s...")
+                        await asyncio.sleep(3)
+                        continue
+                    else:
+                        self._last_fetch_error = "RSSHub returned HTML error page (可能配置或代理问题)"
+                        return None
+                # 看起来像XML，直接返回
+                return data
             if attempt < 2:
                 await asyncio.sleep(3)
 
@@ -2783,9 +2792,9 @@ class MyRssPlugin(Star):
                 f" - 请求 URL: {url}\\n"
                 f" - 错误详情: {last_err}\\n\\n"
                 f"💡 修复建议：\\n"
-                f" 1. 如果错误提示为 ConnectError / HTTP 502/504：\\n"
-                f" 通常为全局代理污染了内网请求。请在启动配置或容器环境变量中，为内网主机 rsshub 额外设置 NO_PROXY。\\n"
-                f" 2. 我们的全新 main.py 已经针对本地/内网容器通信自动禁用了 proxy，请确保该更新正确应用并重启了 Bot。"
+                f" 1. 代理问题（最常见）：为内网 rsshub 设置 NO_PROXY=rsshub,localhost,127.0.0.1 在容器环境变量或 docker run -e。\\n"
+                f" 2. Docker 网络问题：如果容器是单独 docker run 启动的，"rsshub" 主机名可能无法解析。请使用 docker-compose 把 astrbot 和 rsshub 放在同一个 network，或把端点改成宿主机 IP:1200（如 http://172.17.0.1:1200）。\\n"
+                f" 3. 本插件已对 rsshub 等内网地址自动 trust_env=False 禁用代理，请确认更新已应用并重启 Bot。"
             )
             return
         item = items[0]
