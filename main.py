@@ -2786,16 +2786,17 @@ class MyRssPlugin(Star):
         items = await self._poll(url, num=1)
         if not items:
             last_err = getattr(self, "_last_fetch_error", "未知错误")
-            yield event.plain_result(
-                f"❌ 拉取失败，源无内容或不可访问。\\n\\n"
-                f"🔍 调试排错信息：\\n"
-                f" - 请求 URL: {url}\\n"
-                f" - 错误详情: {last_err}\\n\\n"
-                f"💡 修复建议：\\n"
-                f" 1. 代理问题（最常见）：为内网 rsshub 设置 NO_PROXY=rsshub,localhost,127.0.0.1 在容器环境变量或 docker run -e。\\n"
-                f" 2. Docker 网络问题：如果容器是单独 docker run 启动的，"rsshub" 主机名可能无法解析。请使用 docker-compose 把 astrbot 和 rsshub 放在同一个 network，或把端点改成宿主机 IP:1200（如 http://172.17.0.1:1200）。\\n"
-                f" 3. 本插件已对 rsshub 等内网地址自动 trust_env=False 禁用代理，请确认更新已应用并重启 Bot。"
-            )
+            yield event.plain_result(f"""❌ 拉取失败，源无内容或不可访问。
+
+🔍 调试排错信息：
+ - 请求 URL: {url}
+ - 错误详情: {last_err}
+
+💡 修复建议：
+ 1. 代理问题（最常见）：为内网 rsshub 设置 NO_PROXY=rsshub,localhost,127.0.0.1 在容器环境变量或 docker run -e。
+ 2. Docker 网络问题：如果容器是单独 docker run 启动的，"rsshub" 主机名可能无法解析。请使用 docker-compose 把 astrbot 和 rsshub 放在同一个 network，或把端点改成宿主机 IP:1200（如 http://172.17.0.1:1200）。
+ 3. 本插件已对 rsshub 等内网地址自动 trust_env=False 禁用代理，请确认更新已应用并重启 Bot。
+""")
             return
         item = items[0]
         # [Hack] 临时把测试源的信息注入 data，让 _make_card_b64 能查到头像/标题
