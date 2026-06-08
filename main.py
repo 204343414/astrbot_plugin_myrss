@@ -1450,11 +1450,19 @@ class MyRssPlugin(Star):
             if not self.safe_mode_groups:
                 self.logger.warning("[MyRSS] safe_mode ON but no test groups configured, skip push")
                 return
-            # 构造测试群的 unified_id
+            # [修复] 过滤掉被 unbind 禁用的群
+            disabled = set(self._group_data.get("disabled_groups", []))
             active_groups = []
             for gid in self.safe_mode_groups:
-                active_groups.append(f"aiocqhttp:GroupMessage:{gid}")
-            self.logger.info("[MyRSS] safe_mode ON, only pushing to test groups: %s", self.safe_mode_groups)
+                unified = f"aiocqhttp:GroupMessage:{gid}"
+                if unified not in disabled:
+                    active_groups.append(unified)
+                else:
+                    self.logger.info("[MyRSS] safe_mode: 跳过已禁用的群 %s", gid)
+            if not active_groups:
+                self.logger.info("[MyRSS] safe_mode: 所有测试群都被禁用，跳过本次推送")
+                return
+            self.logger.info("[MyRSS] safe_mode ON, pushing to test groups: %s", active_groups)
         else:
             active_groups = self._get_active_groups()
         # 从URL提取路由部分用于匹配屏蔽列表
