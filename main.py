@@ -2763,9 +2763,9 @@ class MyRssPlugin(Star):
 
         url = eps[0].rstrip("/") + route
 
-        yield event.plain_result(f"⏳ 开始测试推送流程...\\n源: {route}\\n10秒后拉取（模拟真实延迟）")
+        yield event.plain_result(f"⏳ 开始测试推送流程...\\n源: {route}\\n3秒后拉取（模拟真实延迟）")
 
-        await asyncio.sleep(10)
+        await asyncio.sleep(3)
 
         # 第1步：拉取
         yield event.plain_result("📡 [1/4] 正在拉取 RSS...")
