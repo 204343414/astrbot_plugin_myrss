@@ -3277,12 +3277,19 @@ class MyRssPlugin(Star):
             yield event.plain_result(f"群 {group_id} 未被禁用，无需恢复。")
     @myrss.command("reset")
     async def cmd_reset(self, event: AstrMessageEvent):
-        """重置所有订阅源的推送基准为当前最新的一条内容。
-        修复因缓存丢失/混乱导致的重复推送。
-        订阅关系不会丢失，只会更新 last_update 和 seen_links 为最新的一条。
+        """重置所有订阅源的推送基准，并清空内存缓存。
+        执行后会回传文件内容截图/文本作为证据。
         """
-        yield event.plain_result("⏳ 正在重置所有订阅源基准...请稍候")
+        yield event.plain_result("⏳ 正在重置...（清理缓存+重写基准+强制保存）")
+        
+        # 1. 清空内存缓存（防止旧逻辑干扰）
+        self._safe_cache.clear()
+        self._comment_cache.clear()
+        self.logger.info("[MyRSS] 内存缓存已清空")
+        
         count = 0
+        evidence = [] # 用于回传的证据
+        
         for url, info in self.dh.data.items():
             if url in ("rsshub_endpoints", "settings"):
                 continue
@@ -3294,24 +3301,38 @@ class MyRssPlugin(Star):
             items = await self._poll(url, num=1)
             if items:
                 item = items[0]
-                # 构造归一化 Key
+                # 归一化 Key
                 ik = item.link.split("#", 1)[0].split("?", 1)[0] if item.link else f"{item.title}|{item.pubDate_timestamp}"
                 
                 for user, sub_data in subs.items():
-                    # 更新时间戳
                     if item.pubDate_timestamp > 0:
                         sub_data["last_update"] = item.pubDate_timestamp
-                    # 更新最新链接
                     sub_data["latest_link"] = item.link
-                    # 重置 seen_links 仅保留这一条基准，防止旧内容重推
+                    # [关键] 强制覆盖为仅一条基准
                     sub_data["seen_links"] = [ik]
+                
                 count += 1
-        
+                # 收集证据
+                title = info.get("info", {}).get("title", "Unknown")
+                evidence.append(f"📡 {title} → {item.title[:20]}...")
+
+        # 2. 强制保存
         self.dh.save()
         self._reload_jobs()
         
-        # [关键] 输出实际写入的文件路径
-        yield event.plain_result(f"✅ 已重置 {count} 个订阅源的基准。\n📂 实际写入路径：{self.dh.config_path}\n请检查此路径下的文件确认 seen_links 是否已更新。")
+        # 3. 验证文件是否真的变了（读回一部分发给你看）
+        try:
+            with open(self.dh.config_path, "r", encoding="utf-8") as f:
+                content = f.read()
+            # 截取前 500 字符作为证据
+            sample = content[:500] 
+            yield event.plain_result(
+                f"✅ 重置成功！共 {count} 个源。\n"
+                f"📂 文件路径：{self.dh.config_path}\n"
+                f"📋 证据（文件内容片段）：\n{sample}..."
+            )
+        except Exception as e:
+            yield event.plain_result(f"✅ 重置完成，但读取文件失败：{e}")
     @myrss.command("unsub")
     async def cmd_unsub(self, event: AstrMessageEvent, route: str = "", group_ids: str = ""):
         """从指定源批量退订群
