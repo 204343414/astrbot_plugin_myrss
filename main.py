@@ -676,6 +676,7 @@ class MyRssPlugin(Star):
 
         # 活跃群检测（学新闻插件）
         self._active_groups = set() # 内存中记录有人说话的群
+        self._last_fetch_error = None  # 拉取错误追踪（新版本 _fetch 使用）
 
         # 全局订阅
         self.global_feeds = [
