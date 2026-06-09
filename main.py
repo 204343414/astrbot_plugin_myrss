@@ -235,58 +235,6 @@ class DataHandler:
             avatar = img_nodes[0].text
         return title, desc or "", avatar
 
-    def strip_html_pic(self, html):
-        """从HTML中提取所有图片URL，包含暴力正则匹配YouTube封面"""
-        if not html:
-            return []
-
-        soup = BeautifulSoup(html, "html.parser")
-        urls = []
-
-        # 1. 常规 ![]()
-        for img in soup.find_all("img"):
-            src = img.get("src")
-            if src and src not in urls:
-                urls.append(src)
-
-        # 2. video poster
-        for vid in soup.find_all("video"):
-            poster = vid.get("poster")
-            if poster and poster not in urls:
-                urls.append(poster)
-
-        # 3. [暴力增强] 直接正则扫描整个HTML文本匹配YouTube ID
-        # 因为有时候 RSSHub 返回的 description 里只有纯文本链接，没有 <img> 标签
-        # 匹配 youtube.com/watch?v=xxx 或 youtu.be/xxx
-        patterns = [
-            r'youtube\.com/watch\?v=([\w-]{11})',
-            r'youtu\.be/([\w-]{11})',
-            r'youtube\.com/embed/([\w-]{11})',
-            r'youtube\.com/v/([\w-]{11})'
-        ]
-
-        found_ids = set()
-        # 先搜 soup 里的 a 标签
-        for a in soup.find_all("a", href=True):
-            for pat in patterns:
-                m = re.search(pat, a["href"])
-                if m: found_ids.add(m.group(1))
-
-        # 再暴力搜全文（兜底）
-        for pat in patterns:
-            for vid_id in re.findall(pat, html):
-                found_ids.add(vid_id)
-
-        # 构造封面地址
-        for vid_id in found_ids:
-            # 存两个分辨率，优先高清(maxres)，其次中等(hq)，防止maxres不存在
-            u1 = f"https://i.ytimg.com/vi/{vid_id}/maxresdefault.jpg"
-            u2 = f"https://i.ytimg.com/vi/{vid_id}/hqdefault.jpg"
-            if u1 not in urls: urls.append(u1)
-            if u2 not in urls: urls.append(u2)
-
-        return urls
-
 
 class PicHandler:
     def __init__(self, adjust=False):
@@ -882,11 +830,8 @@ class MyRssPlugin(Star):
         async def _try(u: str):
             try:
                 conn = aiohttp.TCPConnector(ssl=False)
-                use_trust_env = not is_local_url(u)
-                async with aiohttp.ClientSession(trust_env=use_trust_env, connector=conn, timeout=to, headers=headers) as s:
-                    # For local/internal services (rsshub etc.), explicitly disable proxy even if trust_env has quirks
-                    req_proxy = None if is_local_url(u) else None
-                    async with s.get(u, proxy=req_proxy) as r:
+                async with aiohttp.ClientSession(trust_env=True, connector=conn, timeout=to, headers=headers) as s:
+                    async with s.get(u) as r:
                         if r.status != 200:
                             self.logger.warning(f"[MyRSS] HTTP {r.status} when fetching {u}")
                             self._last_fetch_error = f"HTTP {r.status} from {u}"
@@ -901,24 +846,16 @@ class MyRssPlugin(Star):
         for attempt in range(3):
             data = await _try(url)
             if data is not None:
-                # 检查是否返回了HTML错误页而非XML（修复了之前损坏的检测逻辑）
-                content_head = data[:500].lower()
-                is_html_error = (
-                    b'<!doctype html' in content_head or
-                    b'<html' in content_head or
-                    (b'<head>' in content_head and b'rss' not in content_head[:100])
-                )
-                if is_html_error:
-                    # 拿到HTML错误页，等几秒重试（等RSSHub内部缓存刷新）
-                    if attempt < 2:
-                        self.logger.warning(f"[MyRSS] HTML error from RSSHub. Retrying {attempt+1}/3 in 3s...")
-                        await asyncio.sleep(3)
-                        continue
-                    else:
-                        self._last_fetch_error = "RSSHub returned HTML error page (可能配置或代理问题)"
-                        return None
-                # 看起来像XML，直接返回
-                return data
+                # 检查是否返回了HTML错误页而非XML (exact from old working commit)
+                if data[:5] == b'<?xml' or (data[:1] == b'<' and b'<item>' in data[:5000]):
+                    return data
+                if b'<html>' not in data[:500].lower():
+                    return data
+                # 拿到HTML错误页，等几秒重试（等RSSHub内部缓存刷新）
+                if attempt < 2:
+                    await asyncio.sleep(3)
+                    continue
+                return data  # 第3次不管什么都返回
             if attempt < 2:
                 await asyncio.sleep(3)
 
@@ -2817,9 +2754,9 @@ class MyRssPlugin(Star):
 
         url = eps[0].rstrip("/") + route
 
-        yield event.plain_result(f"⏳ 开始测试推送流程...\\n源: {route}\\n3秒后拉取（模拟真实延迟）")
+        yield event.plain_result(f"⏳ 开始测试推送流程...\\n源: {route}\\n10秒后拉取（模拟真实延迟）")
 
-        await asyncio.sleep(3)
+        await asyncio.sleep(10)
 
         # 第1步：拉取
         yield event.plain_result("📡 [1/4] 正在拉取 RSS...")
