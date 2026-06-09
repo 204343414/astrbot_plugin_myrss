@@ -884,7 +884,9 @@ class MyRssPlugin(Star):
                 conn = aiohttp.TCPConnector(ssl=False)
                 use_trust_env = not is_local_url(u)
                 async with aiohttp.ClientSession(trust_env=use_trust_env, connector=conn, timeout=to, headers=headers) as s:
-                    async with s.get(u) as r:
+                    # For local/internal services (rsshub etc.), explicitly disable proxy even if trust_env has quirks
+                    req_proxy = None if is_local_url(u) else None
+                    async with s.get(u, proxy=req_proxy) as r:
                         if r.status != 200:
                             self.logger.warning(f"[MyRSS] HTTP {r.status} when fetching {u}")
                             self._last_fetch_error = f"HTTP {r.status} from {u}"
