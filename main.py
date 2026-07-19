@@ -406,50 +406,6 @@ class CardGen:
     - CSS 排版，不用手算像素坐标
     - 图片/头像用 data URI，不怕防盗链
     """
-    REC_CARD_HTML = r"""
-<!DOCTYPE html><html><head><meta charset="utf-8"><style>
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    body { font-family: -apple-system, "Segoe UI", sans-serif; width: {{width}}px; background: #fff; }
-    .rec-card { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); border-radius: 16px; padding: 24px; color: white; }
-    .header { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
-    .avatar { width: 48px; height: 48px; border-radius: 50%; background: rgba(255,255,255,0.2); display: flex; align-items: center; justify-content: center; font-size: 24px; overflow: hidden; }
-    .avatar img { width: 100%; height: 100%; object-fit: cover; }
-    .info { flex: 1; }
-    .title { font-size: 18px; font-weight: 600; }
-    .route { font-size: 12px; opacity: 0.8; margin-top: 2px; }
-    .desc { font-size: 13px; opacity: 0.9; margin-bottom: 16px; line-height: 1.5; }
-    .previews { background: rgba(255,255,255,0.1); border-radius: 12px; padding: 12px; }
-    .prev-title { font-size: 12px; opacity: 0.7; margin-bottom: 8px; }
-    .preview-item { padding: 8px 0; border-bottom: 1px solid rgba(255,255,255,0.1); }
-    .preview-item:last-child { border-bottom: none; }
-    .preview-item .p-title { font-size: 14px; }
-    .preview-item .p-time { font-size: 11px; opacity: 0.6; margin-top: 2px; }
-    .rec-id { text-align: center; font-size: 11px; opacity: 0.6; margin-top: 12px; }
-    .footer { text-align: center; font-size: 12px; opacity: 0.8; margin-top: 16px; }
-</style></head><body>
-<div class="rec-card">
-    <div style="text-align:center;font-size:14px;opacity:0.9;margin-bottom:16px;">📢 频道推荐</div>
-    <div class="header">
-        <div class="avatar">{% if avatar_b64 %}<img src="data:image/jpeg;base64,{{avatar_b64}}" />{% else %}{{avatar_char}}{% endif %}</div>
-        <div class="info"><div class="title">{{title}}</div><div class="route">{{route}}</div></div>
-    </div>
-    {% if description %}<div class="desc">{{description}}</div>{% endif %}
-    {% if previews %}
-    <div class="previews">
-        <div class="prev-title">* * * 📋 最近动态预览 * * *</div>
-        {% for p in previews %}
-        <div class="preview-item">
-            <div class="p-title">{{p.title}}</div>
-            {% if p.time %}<div class="p-time">{{p.time}}</div>{% endif %}
-        </div>
-        {% endfor %}
-    </div>
-    {% endif %}
-    <div class="rec-id">推荐编号: {{rec_id}}</div>
-    <div class="footer">回复「同意」订阅 / 回复「拒绝」取消<br>1人回复即生效 · 1小时无人回复自动订阅</div>
-</div>
-</body></html>"""
-
     CARD_HTML = r"""
 <!DOCTYPE html><html><head><meta charset="utf-8"><style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -638,41 +594,7 @@ class CardGen:
 
         raise RuntimeError("browserless 不可用")
 
-    async def make_rec_card(self, title="", description="", avatar=None,
-                            route="", previews=None, rec_id=""):
-        """生成推荐卡片"""
-        avatar_b64 = ""
-        avatar_char = "?"
-        if avatar and isinstance(avatar, bytes) and len(avatar) > 100:
-            avatar_b64 = base64.b64encode(avatar).decode()
-            for c in (title or ""):
-                if c.strip():
-                    avatar_char = c
-                    break
 
-        preview_data = []
-        if previews:
-            for p in previews[:3]:
-                preview_data.append({
-                    "title": (p.get("title", "") or "")[:80],
-                    "time": p.get("time", ""),
-                })
-
-        html = self._rec_tpl.render(
-            width=self.w,
-            title=title or "未知频道",
-            description=(description or "")[:200],
-            avatar_b64=avatar_b64,
-            avatar_char=avatar_char,
-            route=route,
-            previews=preview_data,
-            rec_id=rec_id,
-        )
-        try:
-            return await self._screenshot(html)
-        except Exception as e:
-            self.logger.error("[CardGen] 推荐卡片截图失败: %s", e)
-            return ""
 
 @register("astrbot_plugin_myrss", "MyRSS", "RSS订阅插件(LLM增强版)", "1.0.0", "")
 class MyRssPlugin(Star):
@@ -699,10 +621,6 @@ class MyRssPlugin(Star):
         # 活跃群数据文件（插件目录下）
         self._group_data_file = os.path.join(_data_subdir, "_groups.json")
         self._group_data = self._load_group_data()
-
-        # 推荐数据文件（插件目录下）
-        self._recs_file = os.path.join(_data_subdir, "_recs.json")
-        self._pending_recs = self._load_recs()
 
         self.title_max = config.get("title_max_length", 60)
         self.desc_max = config.get("description_max_length", 200)
@@ -755,9 +673,7 @@ class MyRssPlugin(Star):
         # 防并发锁，key = (url, user)
         self._locks: dict = {}
         self._data_lock = asyncio.Lock() # 保护 dh.data 读写
-        # 推荐系统
-        self._pending_recs = self._load_recs()
-        self._last_preview = {}
+        # 推荐系统已移除
         self._aiocqhttp_bot = None # 缓存 aiocqhttp 的 bot client，用于直连发送
         self._bot_ready = False # 收到第一条消息后才开始全局推送
         self._push_lock = asyncio.Lock() # 全局推送发送锁，防止多源同时推同一个群
@@ -781,12 +697,6 @@ class MyRssPlugin(Star):
         _ALL_SCHEDS.add(self.sched)
         self.sched.start()
         self._reload_jobs()
-        # 推荐超时检查：每10分钟检查一次
-        self.sched.add_job(
-            self._check_rec_timeout, "interval", minutes=10,
-            id="myrss_rec_timeout", replace_existing=True,
-            misfire_grace_time=120,
-        )
     
     async def destroy(self):
         """插件卸载/禁用时停止调度器"""
@@ -1387,11 +1297,7 @@ class MyRssPlugin(Star):
         if not self._bot_ready:
             self._bot_ready = True
         # 投票检测
-        if self._pending_recs and "GroupMessage" in getattr(event, 'unified_msg_origin', ''):
-            try:
-                await self._process_vote(event)
-            except Exception as e:
-                self.logger.error("[MyRSS] vote error: %s", e)
+        # 推荐投票已移除
     # ============================================================
     # 全局订阅
     # ============================================================
@@ -2209,6 +2115,12 @@ class MyRssPlugin(Star):
                 "详见 https://docs.rsshub.app"
             )
             return
+
+        # 黑名单早检查（节省资源）
+        if self._is_blacklisted(event.unified_msg_origin):
+            yield event.plain_result("❌ 您已被加入全局黑名单，无法使用订阅功能。")
+            return
+
         eps = self.dh.data.get("rsshub_endpoints", [])
         if not eps:
             yield event.plain_result(
@@ -2760,6 +2672,54 @@ class MyRssPlugin(Star):
         self.dh.save()
         yield event.plain_result("✅ 已删除: " + removed)
 
+    # ============================================================
+    # 黑名单管理命令（仅管理员）
+    # ============================================================
+    @myrss.group("blacklist")
+    def blacklist(self, event: AstrMessageEvent):
+        pass
+
+    @blacklist.command("list")
+    async def blacklist_list(self, event: AstrMessageEvent):
+        """查看全局黑名单（仅管理员）"""
+        admin_check = self._require_admin(event, "查看黑名单")
+        if admin_check:
+            yield admin_check
+            return
+        settings = self.dh.data.setdefault("settings", {})
+        bl = settings.get("blacklisted_users", [])
+        if not bl:
+            yield event.plain_result("当前黑名单为空。")
+            return
+        txt = "🚫 全局黑名单用户：\n" + "\n".join(f"  - {uid}" for uid in bl)
+        yield event.plain_result(txt)
+
+    @blacklist.command("add")
+    async def blacklist_add(self, event: AstrMessageEvent, user_id: str):
+        """添加用户到全局黑名单（仅管理员）"""
+        admin_check = self._require_admin(event, "添加黑名单")
+        if admin_check:
+            yield admin_check
+            return
+        if not user_id:
+            yield event.plain_result("用法: /myrss blacklist add <用户ID>")
+            return
+        self._add_to_blacklist(user_id, "管理员手动添加")
+        yield event.plain_result(f"✅ 已将 {user_id} 加入全局黑名单。")
+
+    @blacklist.command("remove")
+    async def blacklist_remove(self, event: AstrMessageEvent, user_id: str):
+        """从全局黑名单移除用户（仅管理员）"""
+        admin_check = self._require_admin(event, "移除黑名单")
+        if admin_check:
+            yield admin_check
+            return
+        if not user_id:
+            yield event.plain_result("用法: /myrss blacklist remove <用户ID>")
+            return
+        self._remove_from_blacklist(user_id)
+        yield event.plain_result(f"✅ 已将 {user_id} 从黑名单移除。")
+
     @myrss.command("list")
     async def cmd_list(self, event: AstrMessageEvent):
         """列出当前订阅"""
@@ -3272,7 +3232,10 @@ class MyRssPlugin(Star):
     def _is_blacklisted(self, user_id: str) -> bool:
         settings = self.dh.data.setdefault("settings", {})
         bl = settings.get("blacklisted_users", [])
-        return str(user_id) in [str(x) for x in bl]
+        is_bl = str(user_id) in [str(x) for x in bl]
+        if is_bl:
+            self.logger.info("[MyRSS] 黑名单命中: %s", user_id)
+        return is_bl
 
     def _add_to_blacklist(self, user_id: str, reason: str = ""):
         settings = self.dh.data.setdefault("settings", {})
