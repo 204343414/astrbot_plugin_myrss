@@ -1152,6 +1152,64 @@ class MyRssPlugin(Star):
         except Exception as e:
             self.logger.error("[MyRSS] save group data failed: %s", e)
 
+    # ============================================================
+    # 无效群自动清理（保守模式：仅匹配明确“群不存在/被踢”错误字符串）
+    # ============================================================
+    _INVALID_GROUP_KEYWORDS = [
+        "group not found", "群不存在", "群号不存在", "not a member", "你已不在该群",
+        "kicked", "已被踢出", "not in group", "群被踢", "群已解散", "群不存在或已解散"
+    ]
+
+    def _is_invalid_group_error(self, err: Exception) -> bool:
+        """保守判断：只有错误消息中包含明确无效群关键词才触发清理"""
+        if not err:
+            return False
+        msg = str(err).lower()
+        return any(kw.lower() in msg for kw in self._INVALID_GROUP_KEYWORDS)
+
+    def _prune_invalid_group(self, group_id: str, reason: str = ""):
+        """检测到群无效（被踢/不存在）时，从所有订阅和全局数据中移除该群。
+        使用已有原子保存方法（dh.save + _save_group_data），绝不影响 seen_links 去重逻辑。
+        """
+        if not group_id:
+            return
+        target_unified = group_id if ":" in group_id else f"aiocqhttp:GroupMessage:{group_id}"
+
+        removed_count = 0
+        # 1. 从所有个人订阅源移除
+        for url, info in list(self.dh.data.items()):
+            if url in ("rsshub_endpoints", "settings"):
+                continue
+            subs = info.get("subscribers", {})
+            to_del = [k for k in subs if group_id in k or target_unified in k]
+            for k in to_del:
+                del subs[k]
+                removed_count += 1
+
+        # 2. 清理群活跃/禁用状态
+        if target_unified in self._group_data.get("groups", {}):
+            self._group_data["groups"][target_unified]["disabled"] = True
+            self._group_data["groups"][target_unified]["active"] = False
+            self._group_data["groups"][target_unified]["dormant"] = True
+
+        if target_unified in self._group_data.get("disabled_groups", []):
+            # already disabled ok
+            pass
+        else:
+            self._group_data.setdefault("disabled_groups", []).append(target_unified)
+
+        self._active_groups.discard(target_unified)
+        self._group_cooldown.pop(target_unified, None)
+
+        # 3. 原子保存（已有实现）
+        try:
+            self.dh.save()
+            self._save_group_data()
+            self._reload_jobs()
+            self.logger.info("[MyRSS] 已自动清理无效群 %s (原因: %s)，共移除 %d 条订阅", target_unified, reason or "推送失败", removed_count)
+        except Exception as e:
+            self.logger.error("[MyRSS] prune group failed: %s", e)
+
     def _load_recs(self) -> dict:
         # 优先从新路径加载
         if os.path.exists(self._recs_file):
@@ -1621,12 +1679,17 @@ class MyRssPlugin(Star):
                             self.logger.info("[MyRSS] push ok to %s", group_id)
                     else:
                         self.logger.warning("[MyRSS] push to %s failed all methods", group_id)
+                        # 保守清理：仅在明确“群不存在/被踢”错误时移除
+                        if self._is_invalid_group_error(e) if 'e' in locals() else False:
+                            self._prune_invalid_group(group_id, "global push error")
 
                     delay = random.uniform(self.push_delay_min, self.push_delay_max)
                     await asyncio.sleep(delay)
 
                 except Exception as e:
                     self.logger.error("[MyRSS] global push failed to %s: %s", group_id, e)
+                    if self._is_invalid_group_error(e):
+                        self._prune_invalid_group(group_id, "global push exception")
         # 有新内容推送了，重置退避
         self._feed_miss_count[url] = 0
         self._feed_tick[url] = 0
