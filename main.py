@@ -1516,14 +1516,18 @@ class MyRssPlugin(Star):
             self._feed_miss_count[url] = self._feed_miss_count.get(url, 0) + 1
             return
 
-        # 内容过滤
+        # 内容过滤（增强版）
         safe_items = []
         for it in new_items:
             if self.content_filter:
-                if await self._check_content_safe(it):
+                status = await self._check_content_safe(it)
+                if status == "SAFE":
                     safe_items.append(it)
+                elif status == "MALICIOUS":
+                    self.logger.warning("[MyRSS] MALICIOUS global feed filtered: %s", it.title[:30])
+                    # 可在此处触发自动取关逻辑（可选）
                 else:
-                    self.logger.info("[MyRSS] global feed filtered: %s", it.title[:30])
+                    self.logger.info("[MyRSS] REJECT global feed filtered: %s", it.title[:30])
             else:
                 safe_items.append(it)
 
@@ -1779,58 +1783,65 @@ class MyRssPlugin(Star):
             self.logger.error("[MyRSS] comment generation failed: %s", e)
             return ""
 
-    async def _check_content_safe(self, item: RSSItem) -> bool:
-        """检查内容是否安全，不安全返回False"""
+    async def _check_content_safe(self, item: RSSItem) -> str:
+        """
+        增强版内容审核（三种状态）：
+        返回值：
+          - "SAFE"       正常内容
+          - "REJECT"     驳回（不严重但可能导致 bot 封号的内容）
+          - "MALICIOUS"  违规（故意抹黑、恶俗政治、色情暴力等）
+        """
         if not self.content_filter:
-            return True
-        # 智能免审：国内平台已有完备的内容审核，无需LLM重复过滤，省心省钱
+            return "SAFE"
+
+        # 智能免审
         link_lower = (item.link or "").lower()
         domestic_keywords = ["bilibili.com", "weibo.com", "weibo.cn", "zhihu.com", "xiaohongshu.com", "douyin.com", "sspai.com"]
         if any(dk in link_lower for dk in domestic_keywords):
-            self.logger.info(f"[MyRSS] 智能免审：检测到国内安全平台 {item.chan_title}，直接放行以节省LLM额度。")
-            return True
+            self.logger.info(f"[MyRSS] 智能免审：检测到国内安全平台 {item.chan_title}，直接放行。")
+            return "SAFE"
 
         norm_link = item.link.split("#", 1)[0].split("?", 1)[0] if item.link else ""
         cache_key = norm_link or (item.title + "|" + str(item.pubDate_timestamp))
         if cache_key in self._safe_cache:
-            return self._safe_cache[cache_key]
-        # 硬编码关键词兜底（不依赖LLM）
+            cached = self._safe_cache[cache_key]
+            if isinstance(cached, str):
+                return cached
+            return "SAFE" if cached else "REJECT"
+
+        # 硬编码关键词兜底
         check_text = (item.title + " " + (item.description or "")).lower()
-        unsafe_words = ["习近平", "共产党", "六四", "天安门", "法轮", "台独",
-                        "藏独", "疆独", "反共", "颠覆", "推翻政权", "轮子功"]
-        for w in unsafe_words:
+        malicious_keywords = [
+            "习近平", "共产党", "六四", "天安门", "法轮", "台独", "藏独", "疆独",
+            "反共", "颠覆", "推翻政权", "轮子功", "习近平", "毛泽东", "共产主义",
+            "色情", "裸露", "暴力", "血腥", "虐待", "毒品", "赌博"
+        ]
+        for w in malicious_keywords:
             if w in check_text:
-                self.logger.warning("[MyRSS] content hard-filter hit '%s': %s", w, item.title[:30])
-                self._safe_cache[cache_key] = False
-                return False
+                self.logger.warning("[MyRSS] MALICIOUS hard-filter hit '%s': %s", w, item.title[:30])
+                self._safe_cache[cache_key] = "MALICIOUS"
+                return "MALICIOUS"
+
         provider_id = self.filter_provider_id if self.filter_provider_id else await self._get_provider_id()
         if not provider_id:
-            self._safe_cache[cache_key] = True
-            return True # 没有provider就不过滤，放行
+            self._safe_cache[cache_key] = "SAFE"
+            return "SAFE"
 
-        content = (item.title + " " + (item.description or ""))[:300]
+        content = (item.title + " " + (item.description or ""))[:400]
 
-        # 使用自定义审核提示词（如果配置了）
-        if self.filter_prompt:
-            prompt = self.filter_prompt.replace("{content}", content)
-        else:
-            # 默认提示词：严格的政治审核
-            prompt = (
-                "你是内容安全审核员。请严格审核以下内容是否涉及政治敏感话题。\n\n"
-                "判断标准：\n"
-                "1. 涉及中国政治领导人（习近平、毛泽东等）、中国共产党、共产主义意识形态的讨论\n"
-                "2. 涉及台湾、香港、澳门、西藏、新疆等政治话题\n"
-                "3. 涉及国际政治敏感话题、领土争议、政治运动等\n"
-                "4. 任何形式的政治评论、时事评论、政治新闻\n"
-                "5. 涉及任何政府政策、政治人物的正面或负面评价\n\n"
-                "只要内容涉及上述任何一种情况，就必须判定为 UNSAFE。\n\n"
-                "注意：\n"
-                "- 正常的科技新闻、商业动态、AI讨论、游戏娱乐等不算政治内容\n"
-                "- 天气预报、纯粹的商业广告等不算政治内容\n"
-                "- 如果无法确定，倾向于判定为 UNSAFE（宁可误杀也不放过）\n\n"
-                f"待审核内容：\n{content}\n\n"
-                "请只回答 SAFE 或 UNSAFE，不要解释。"
-            )
+        # 增强提示词：三种状态
+        prompt = (
+            "你是内容安全审核员。请严格审核以下内容，返回三种状态之一：\n\n"
+            "1. SAFE      —— 正常内容（科技、娱乐、商业、日常等）\n"
+            "2. REJECT    —— 可能导致 bot 封号的内容（轻微政治敏感、争议话题、边缘擦边球）\n"
+            "3. MALICIOUS —— 绝对违规内容（故意抹黑中国政治、恶俗政治攻击、色情暴力、恐怖主义等）\n\n"
+            "判断标准：\n"
+            "- 只要涉及中国政治领导人（习近平等）、六四、天安门、台独、反共、颠覆等 → MALICIOUS\n"
+            "- 涉及敏感政治但不极端 → REJECT\n"
+            "- 正常内容 → SAFE\n\n"
+            f"待审核内容：\n{content}\n\n"
+            "请只返回 SAFE / REJECT / MALICIOUS 其中一个词，不要解释。"
+        )
 
         try:
             resp = await self.ctx.llm_generate(
@@ -1838,16 +1849,26 @@ class MyRssPlugin(Star):
                 prompt=prompt,
             )
             result = (resp.completion_text or "").strip().upper()
-            if "UNSAFE" in result:
-                self.logger.warning("[MyRSS] content filtered: %s", item.title[:50])
-                self._safe_cache[cache_key] = False
-                return False
-            self._safe_cache[cache_key] = True
-            return True
+            if "MALICIOUS" in result:
+                status = "MALICIOUS"
+            elif "REJECT" in result:
+                status = "REJECT"
+            else:
+                status = "SAFE"
+
+            self._safe_cache[cache_key] = status
+            if status != "SAFE":
+                self.logger.warning("[MyRSS] content %s: %s", status, item.title[:50])
+            return status
         except Exception as e:
-            self.logger.error("[MyRSS] content filter failed, blocking for safety: %s", e)
-            self._safe_cache[cache_key] = False
-            return False # 过滤出错时拦截，宁可不推也不冒险
+            self.logger.error("[MyRSS] content filter failed, treat as REJECT: %s", e)
+            self._safe_cache[cache_key] = "REJECT"
+            return "REJECT"
+
+    # 兼容旧布尔调用（保持向后兼容）
+    async def _check_content_safe_bool(self, item: RSSItem) -> bool:
+        status = await self._check_content_safe(item)
+        return status == "SAFE"
 
     def _get_avatar_url(self, item: RSSItem) -> str:
         """从存储的订阅数据里获取频道头像URL"""
@@ -2120,14 +2141,17 @@ class MyRssPlugin(Star):
         if ts_candidates:
             si["last_update"] = max(ts_candidates)
         self.dh.save()
-        # 内容过滤（去重后、推送前）
+        # 内容过滤（增强版）
         if self.content_filter:
             filtered = []
             for it in new_items:
-                if await self._check_content_safe(it):
+                status = await self._check_content_safe(it)
+                if status == "SAFE":
                     filtered.append(it)
+                elif status == "MALICIOUS":
+                    self.logger.warning("[MyRSS] MALICIOUS filtered: %s", it.title[:30])
                 else:
-                    self.logger.info("[MyRSS] filtered: %s", it.title[:30])
+                    self.logger.info("[MyRSS] REJECT filtered: %s", it.title[:30])
             new_items = filtered
         if not new_items:
             return
@@ -2695,7 +2719,11 @@ class MyRssPlugin(Star):
 
     @rsshub.command("add")
     async def rsshub_add(self, event: AstrMessageEvent, url: str):
-        """添加RSSHub端点"""
+        """添加RSSHub端点（仅管理员）"""
+        admin_check = self._require_admin(event, "添加 RSSHub 端点")
+        if admin_check:
+            yield admin_check
+            return
         if url.endswith("/"):
             url = url[:-1]
         if url in self.dh.data["rsshub_endpoints"]:
@@ -2719,7 +2747,11 @@ class MyRssPlugin(Star):
 
     @rsshub.command("remove")
     async def rsshub_rm(self, event: AstrMessageEvent, idx: int):
-        """删除RSSHub端点"""
+        """删除RSSHub端点（仅管理员）"""
+        admin_check = self._require_admin(event, "删除 RSSHub 端点")
+        if admin_check:
+            yield admin_check
+            return
         eps = self.dh.data["rsshub_endpoints"]
         if idx < 0 or idx >= len(eps):
             yield event.plain_result("编号越界")
@@ -3208,6 +3240,57 @@ class MyRssPlugin(Star):
             self.logger.warning("[MyRSS] get member info failed: %s", e)
             return False
 
+    # ============================================================
+    # AstrBot 管理员权限 + 全局恶意黑名单
+    # ============================================================
+    def _is_astrbot_admin(self, event: AstrMessageEvent) -> bool:
+        """检查是否为 AstrBot 管理员（bot 主人）"""
+        try:
+            # 优先使用 AstrBot 官方 is_admin
+            if hasattr(event, "is_admin") and event.is_admin():
+                return True
+            # 其次检查配置中的 admin_ids
+            admin_ids = self.cfg.get("admin_ids", []) or []
+            sender_id = str(event.get_sender_id())
+            if sender_id in [str(a) for a in admin_ids]:
+                return True
+            # 兜底：私聊或群内发送者是 bot 自己
+            if hasattr(event, "message_obj") and event.message_obj and event.message_obj.sender:
+                if str(event.message_obj.sender.user_id) == str(self.bot_qq):
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def _require_admin(self, event: AstrMessageEvent, action: str = "此操作"):
+        """管理员权限检查，失败时直接 yield 回复"""
+        if not self._is_astrbot_admin(event):
+            return event.plain_result(f"⚠️ {action}仅 AstrBot 管理员可用。\n普通用户请用自然语言对我说「关注 xxx」或「订阅 xxx」。")
+        return None
+
+    # 全局黑名单（存在 dh.data["settings"]["blacklisted_users"]）
+    def _is_blacklisted(self, user_id: str) -> bool:
+        settings = self.dh.data.setdefault("settings", {})
+        bl = settings.get("blacklisted_users", [])
+        return str(user_id) in [str(x) for x in bl]
+
+    def _add_to_blacklist(self, user_id: str, reason: str = ""):
+        settings = self.dh.data.setdefault("settings", {})
+        bl = settings.setdefault("blacklisted_users", [])
+        uid = str(user_id)
+        if uid not in bl:
+            bl.append(uid)
+            self.dh.save()
+            self.logger.warning("[MyRSS] 用户 %s 已被加入全局黑名单，原因: %s", uid, reason)
+
+    def _remove_from_blacklist(self, user_id: str):
+        settings = self.dh.data.setdefault("settings", {})
+        bl = settings.get("blacklisted_users", [])
+        uid = str(user_id)
+        if uid in bl:
+            bl.remove(uid)
+            self.dh.save()
+
     @myrss.command("recs")
     async def cmd_recs(self, event: AstrMessageEvent):
         """查看所有待处理的推荐"""
@@ -3416,7 +3499,12 @@ class MyRssPlugin(Star):
         根据配置 force_reset_without_poll 决定是否依赖 poll 拉取最新内容。
         默认（推荐）使用强制模式：直接把每个订阅的 seen_links 重置为只有当前 latest_link 的一条。
         执行后会回传实际使用的数据文件路径和证据。
+        （仅管理员）
         """
+        admin_check = self._require_admin(event, "重置推送记录")
+        if admin_check:
+            yield admin_check
+            return
         use_force = self.cfg.get("force_reset_without_poll", True)
         
         mode = "强制模式（不依赖网络，拉当前 latest_link）" if use_force else "智能模式（尝试拉最新 RSS 作为基准）"
@@ -3487,6 +3575,10 @@ class MyRssPlugin(Star):
     @myrss.command("datapath")
     async def cmd_datapath(self, event: AstrMessageEvent):
         """显示当前实际使用的数据文件路径和基本统计。强烈建议每次遇到路径问题时先跑这个。"""
+        admin_check = self._require_admin(event, "查看数据路径")
+        if admin_check:
+            yield admin_check
+            return
         try:
             path = self.dh.get_data_path()
             data_dir = self.dh.get_data_dir()
