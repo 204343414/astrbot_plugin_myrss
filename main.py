@@ -456,7 +456,6 @@ class CardGen:
         self.browserless_url = browserless_url.rstrip("/")
         self._env = Environment(loader=BaseLoader(), autoescape=True)
         self._tpl = self._env.from_string(self.CARD_HTML)
-        self._rec_tpl = self._env.from_string(self.REC_CARD_HTML)
         self.logger = logging.getLogger("astrbot")
         self._sema = asyncio.Semaphore(2) # 最多同时 2 个截图请求
 
