@@ -1514,10 +1514,28 @@ class MyRssPlugin(Star):
 
     @filter.llm_tool(name="myrss_preview")
     async def tool_preview(self, event: AstrMessageEvent, url: str = ""):
-        """安全预览一个动态源。只预览，不订阅；成功后返回一次性 preview_id。
+        """生成“可订阅动态源”的安全预览卡片，并为后续确认订阅创建 preview_id。
+
+        这是 RSS 订阅工作流工具，不是通用联网搜索、新闻搜索或事实查询工具。
+        它通过已配置的 RSSHub 读取某个账号/UP主/频道的 RSS，审核最新一条动态，
+        然后生成包含动态主头像、频道名、最新动态标题、摘要、图片和时间的订阅预览卡片。
+
+        应当调用本工具的情况：
+        - 用户想关注、订阅、推荐某个 B站UP主、Twitter/X 账号、YouTube 频道等动态源；
+        - 用户想先看看某个账号是否适合订阅；
+        - 用户要求生成订阅卡片、频道卡片或订阅前预览；
+        - 用户说“把某人的动态推荐到群”，此时应先调用本工具生成安全预览，不能直接订阅。
+
+        不应调用本工具的情况：
+        - 用户只是询问“某人最近发生了什么”“搜索最新消息”“查一下新闻”；
+        - 用户要求普通网页搜索、资料检索、事实核查或总结实时事件；
+        - 用户没有订阅、关注、取关、推荐动态源或生成订阅卡片的意图。
+
+        本工具只生成预览，不会建立订阅、不会向目标群发送动态，也不会修改 seen_links。
+        审核通过后会返回一次性 preview_id；必须等待用户明确确认，再调用 myrss_manage。
 
         Args:
-            url(string): 网站链接或 / 开头的 RSSHub 路由
+            url(string): 用户准备订阅的账号/UP主/频道链接，或 / 开头的 RSSHub 路由。不是搜索关键词。
         """
         full_url, route, error = self._resolve_feed_url(url)
         if not full_url:
@@ -1574,14 +1592,31 @@ class MyRssPlugin(Star):
     async def tool_manage(self, event: AstrMessageEvent, action: str = "list",
                           preview_id: str = "", target_group: str = "",
                           keyword: str = "", confirm: bool = False):
-        """管理订阅。订阅必须先安全预览并由用户明确确认；也可列出或取关。
+        """执行 RSS 动态订阅管理：确认新增订阅、列出订阅或取关动态源。
+
+        这是订阅数据库管理工具，不是联网搜索、内容预览、即时转发或新闻查询工具。
+        新增订阅后，插件只会在该动态源以后出现新内容时按原有防重机制推送；
+        本工具不会把刚才的预览卡片或历史最新动态立即重复发送到目标群。
+
+        action 使用规则：
+        - list：用户询问“我订阅了什么”“当前关注列表”时使用；不需要 preview_id。
+        - subscribe：只能在 myrss_preview 已成功生成安全卡片后使用。用户必须明确说
+          “确认订阅/确认关注”，并提供同一会话内有效的 preview_id。仅发送群号不算确认。
+        - unsubscribe：用户明确要求取消关注、退订、取关某个现有动态源时使用；
+          使用订阅列表编号或能唯一匹配的标题/URL关键词。
+
+        不应调用本工具的情况：
+        - 用户只是想搜索或了解某账号的最新动态；
+        - 用户尚未进行安全预览，却要求直接新增订阅；
+        - 用户只是看完预览、发送群号，但没有明确确认订阅；
+        - 用户要求立即转发某一条消息，而不是持续订阅未来更新。
 
         Args:
-            action(string): list、subscribe 或 unsubscribe
-            preview_id(string): subscribe 时使用预览返回的编号
-            target_group(string): 可选目标群号；跨群仅 AstrBot 管理员
-            keyword(string): unsubscribe 时使用标题、URL关键词或列表编号
-            confirm(bool): 只有用户明确说“确认订阅”时才传 true
+            action(string): 必须是 list、subscribe 或 unsubscribe。
+            preview_id(string): subscribe 必填，必须来自当前会话最近一次 myrss_preview。
+            target_group(string): 订阅/取关的可选目标群号；跨群仅 AstrBot 管理员可操作。
+            keyword(string): unsubscribe 使用的唯一标题、URL关键词或订阅列表编号。
+            confirm(bool): 仅当用户明确表达“确认订阅/确认关注”时传 true；不得自行推断。
         """
         action = (action or "list").strip().lower()
         origin = event.unified_msg_origin
