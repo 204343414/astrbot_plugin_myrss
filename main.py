@@ -70,6 +70,10 @@ class DataHandler:
 
         self.data = self._load()
 
+        # 强提示：推荐用户配置 custom_data_dir 防止重装丢数据
+        if not custom_data_dir:
+            self.logger.warning("[MyRSS] ⚠️ 强烈建议在插件配置中设置 custom_data_dir（绝对路径），否则重装/更新插件可能导致 seen_links 丢失，引发重复推送！")
+
     def _is_running_in_container(self) -> bool:
         """自动检测是否在容器（Docker / AstrBot 常见容器）内运行。
         这样代码能自己判断“容器里面”还是“本地主机文件系统”，
@@ -1155,90 +1159,7 @@ class MyRssPlugin(Star):
         except Exception as e:
             self.logger.error("[MyRSS] save recs failed: %s", e)
 
-    async def _auto_subscribe(self, url: str, group_id: str, interval: int = 30) -> bool:
-        """投票通过后自动订阅"""
-        try:
-            items = await self._poll(url, num=5)
-            cron_expr = f"*/{interval} * * * *" if interval < 60 else f"0 */{interval // 60} * * *"
-
-            if url not in self.dh.data:
-                text = await self._fetch(url)
-                if text:
-                    t, d, a = self.dh.parse_channel_info(text)
-                    self.dh.data[url] = {
-                        "info": {"title": t, "description": d, "avatar": a},
-                        "subscribers": {},
-                    }
-                else:
-                    return False
-
-            self.dh.data[url].setdefault("subscribers", {})
-            self.dh.data[url]["subscribers"][group_id] = {
-                "cron_expr": cron_expr,
-                "last_update": items[0].pubDate_timestamp if items else 0,
-                "latest_link": items[0].link if items else "",
-                "seen_links": [it.link for it in items if it.link][:200] if items else [],
-            }
-            self.dh.save()
-            self._reload_jobs()
-            return True
-        except Exception as e:
-            self.logger.error("[MyRSS] auto subscribe failed: %s", e)
-            return False
-
-    async def _process_vote(self, event: AstrMessageEvent):
-        """处理群友对推荐的投票：1人同意即订阅，1人拒绝即取消"""
-        group_id = event.unified_msg_origin
-        text = ""
-        try:
-            text = (event.message_str or "").strip()
-        except Exception:
-            return
-        if not text:
-            return
-
-        is_agree = text in ("同意", "订阅", "可以", "好", "好的", "赞成", "支持", "ok", "OK")
-        is_reject = text in ("拒绝", "反对", "不要", "不行", "取消", "不")
-        if not is_agree and not is_reject:
-            return
-
-        target_rec_id = None
-        target_rec = None
-        for rec_id, rec in sorted(self._pending_recs.items(), key=lambda x: x[1].get("created_at", 0), reverse=True):
-            if group_id in rec.get("groups", {}):
-                gs = rec["groups"][group_id]
-                if gs.get("status") == "pending":
-                    target_rec_id = rec_id
-                    target_rec = rec
-                    break
-
-        if not target_rec:
-            return
-
-        gs = target_rec["groups"][group_id]
-        title = target_rec.get("title", "未知")
-
-        if is_agree:
-            gs["status"] = "approved"
-            self._save_recs()
-            ok = await self._auto_subscribe(
-                target_rec["url"], group_id, target_rec.get("interval", 30)
-            )
-            if ok:
-                await self.ctx.send_message(group_id, MessageChain(chain=[
-                    Comp.Plain(f"✅ 已订阅「{title}」\\n⏰ 每{target_rec.get('interval', 30)}分钟检查更新")
-                ]))
-            else:
-                await self.ctx.send_message(group_id, MessageChain(chain=[
-                    Comp.Plain(f"⚠️ 订阅失败，请手动订阅: {target_rec.get('route', '')}")
-                ]))
-
-        elif is_reject:
-            gs["status"] = "rejected"
-            self._save_recs()
-            await self.ctx.send_message(group_id, MessageChain(chain=[
-                Comp.Plain(f"❌ 推荐「{title}」已取消")
-            ]))
+    
 
     def _mark_active(self, unified_id: str):
         """标记某个群有人说话"""
@@ -2420,147 +2341,7 @@ class MyRssPlugin(Star):
         else:
             yield event.plain_result(f"📡 {title}\\n📝 {desc[:100]}\\n🔗 {route}\\n\\n（卡片生成失败，但信息已获取）")
 
-    @filter.llm_tool(name="myrss_recommend")
-    async def tool_recommend(self, event: AstrMessageEvent, route: str = "", group_ids: str = "", interval: int = 30):
-        """用户说"推荐到群""发到群""推到群"时调用此工具（不是preview）。把上次预览的频道推荐到指定群，群友投票同意后自动订阅。
-        route参数可以留空，会自动使用上次预览的频道。
-
-        Args:
-            route(string): RSSHub路由，留空则用上次预览的。如 /twitter/user/hachi_08
-            group_ids(string): 目标群号，逗号分隔，如 "721058477,123456"。传"all"推到所有群
-            interval(int): 订阅间隔分钟数，默认30
-        """
-        if not route:
-            if hasattr(self, '_last_preview') and self._last_preview:
-                route = self._last_preview["route"]
-                yield event.plain_result(f"📡 使用上次预览的频道: {route}")
-            else:
-                yield event.plain_result("请先预览一个频道，或直接提供路由。")
-                return
-
-        eps = self.dh.data.get("rsshub_endpoints", [])
-        if not eps:
-            yield event.plain_result("未配置RSSHub端点。")
-            return
-
-        if not route.startswith("/"):
-            matched = URLMapper.match(route)
-            if matched:
-                route = matched[0]
-            else:
-                route = "/" + route
-
-        full_url = eps[0].rstrip("/") + route
-
-        if not group_ids:
-            yield event.plain_result("请指定目标群号（逗号分隔），或说「all」推到所有群。\\n可以先用 /myrss groups 查看群列表。")
-            return
-
-        pn = event.unified_msg_origin.split(":")[0]
-
-        if group_ids.strip().lower() == "all":
-            target_groups = self._get_active_groups()
-            if not target_groups:
-                yield event.plain_result("没有活跃群。需要群里有人说过话。")
-                return
-        else:
-            gids = [g.strip() for g in re.split(r'[,，\\s]+', group_ids) if g.strip()]
-            target_groups = [f"{pn}:GroupMessage:{gid}" for gid in gids]
-
-        if not target_groups:
-            yield event.plain_result("没有有效的目标群。")
-            return
-
-        yield event.plain_result(f"📡 正在准备推荐卡片...")
-
-        text = await self._fetch(full_url)
-        title, desc, avatar_url = "未知", "", ""
-        if text:
-            try:
-                title, desc, avatar_url = self.dh.parse_channel_info(text)
-            except Exception:
-                pass
-
-        if hasattr(self, '_last_preview') and self._last_preview and self._last_preview.get("route") == route:
-            lp = self._last_preview
-            title = lp.get("title", title)
-            desc = lp.get("description", desc)
-            avatar_url = lp.get("avatar_url", avatar_url)
-
-        items = await self._poll(full_url, num=3)
-        previews = [{"title": it.title, "time": self.card._format_time(it.pubDate) if it.pubDate else ""} for it in items]
-
-        avt_data = None
-        if avatar_url:
-            try:
-                conn = aiohttp.TCPConnector(ssl=False)
-                async with aiohttp.ClientSession(trust_env=True, connector=conn) as s:
-                    async with s.get(avatar_url, timeout=aiohttp.ClientTimeout(total=5)) as r:
-                        if r.status == 200:
-                            avt_data = await r.read()
-            except Exception:
-                pass
-
-        rec_id = f"R{int(time.time()) % 100000:05d}"
-
-        b64 = await self.card.make(
-            title=title, desc=desc, avatar=avt_data,
-            link=route,
-        )
-
-        if not b64:
-            yield event.plain_result("❌ 推荐卡片生成失败。")
-            return
-
-        groups_state = {}
-        for gid in target_groups:
-            groups_state[gid] = {"agrees": [], "rejects": [], "status": "pending"}
-
-        self._pending_recs[rec_id] = {
-            "route": route, "url": full_url, "title": title,
-            "description": desc, "avatar_url": avatar_url,
-            "recommender": event.unified_msg_origin,
-            "groups": groups_state,
-            "interval": max(interval, 15),
-            "created_at": time.time(),
-        }
-        self._save_recs()
-
-        card_comps = [
-            Comp.Image.fromBase64(b64),
-            Comp.Plain(f"\\n📢 有人推荐订阅「{title}」\\n回复「同意」订阅 / 回复「拒绝」取消\\n（1人回复即生效，1小时无人回复自动订阅）"),
-        ]
-
-        sent_count = 0
-        fail_count = 0
-        for gid in target_groups:
-            try:
-                gpn = gid.split(":")[0]
-                if gpn == "aiocqhttp" and self.compose:
-                    node = Comp.Node(uin=0, name="频道推荐", content=card_comps)
-                    ret = await self.ctx.send_message(gid, MessageChain(chain=[node]))
-                else:
-                    ret = await self.ctx.send_message(gid, MessageChain(chain=card_comps))
-
-                if ret is not None and ret is not False:
-                    sent_count += 1
-                else:
-                    fail_count += 1
-
-                await asyncio.sleep(random.uniform(2, 4))
-            except Exception as e:
-                fail_count += 1
-                self.logger.error("[MyRSS] recommend send failed to %s: %s", gid, e)
-
-        yield event.plain_result(
-            f"✅ 推荐已发送！\\n"
-            f" 📡 频道: {title}\\n"
-            f" 🔗 路由: {route}\\n"
-            f" 📮 成功: {sent_count}群 / 失败: {fail_count}群\\n"
-            f" 🆔 编号: {rec_id}\\n"
-            f" ⏰ 通过后订阅间隔: {max(interval, 15)}分钟\\n\\n"
-            f"群友回复「同意」或「拒绝」即可，1小时无人回复自动订阅"
-        )
+    
 
     @filter.llm_tool(name="myrss_unsubscribe")
     async def tool_unsub(self, event: AstrMessageEvent, idx: int = 0, idxs: str = ""):
@@ -3056,131 +2837,9 @@ class MyRssPlugin(Star):
         self._group_cooldown.clear()
         yield event.plain_result(f"✅ 已重置 {count} 个全局源的推送记录和冷却\\n下次检查（~5分钟内）将重新推送")
 
-    @myrss.command("recommend")
-    async def cmd_recommend(self, event: AstrMessageEvent, group_id: str = "", route: str = ""):
-        """手动推荐上次预览的频道到指定群
-        用法：/myrss recommend 721058477
-        /myrss recommend 721058477 /twitter/user/hachi_08
-        """
-        if not group_id:
-            yield event.plain_result("用法: /myrss recommend <群号> [路由]\\n群号必填，路由不填则用上次预览的频道")
-            return
+    
 
-        if not route:
-            if self._last_preview:
-                route = self._last_preview["route"]
-            else:
-                yield event.plain_result("没有上次预览的频道。请先预览一个频道或提供路由。")
-                return
-
-        eps = self.dh.data.get("rsshub_endpoints", [])
-        if not eps:
-            yield event.plain_result("未配置RSSHub端点。")
-            return
-
-
-        full_url = eps[0].rstrip("/") + route
-        pn = event.unified_msg_origin.split(":")[0]
-        gids = [g.strip() for g in re.split(r'[,，\\s]+', group_id) if g.strip()]
-        target_groups = [f"{pn}:GroupMessage:{gid}" for gid in gids]
-
-        yield event.plain_result(f"📡 正在准备推荐卡片 {route} → {gids}...")
-
-        text = await self._fetch(full_url)
-        title, desc, avatar_url = "未知", "", ""
-        if text:
-            try:
-                title, desc, avatar_url = self.dh.parse_channel_info(text)
-            except Exception:
-                pass
-
-        if self._last_preview and self._last_preview.get("route") == route:
-            title = self._last_preview.get("title", title)
-            desc = self._last_preview.get("description", desc)
-            avatar_url = self._last_preview.get("avatar_url", avatar_url)
-
-        items = await self._poll(full_url, num=3)
-        previews = [{"title": it.title, "time": self.card._format_time(it.pubDate) if it.pubDate else ""} for it in items]
-
-        avt_data = None
-        if avatar_url:
-            try:
-                conn = aiohttp.TCPConnector(ssl=False)
-                async with aiohttp.ClientSession(trust_env=True, connector=conn) as s:
-                    async with s.get(avatar_url, timeout=aiohttp.ClientTimeout(total=5)) as r:
-                        if r.status == 200:
-                            avt_data = await r.read()
-            except Exception:
-                pass
-
-        rec_id = f"R{int(time.time()) % 100000:05d}"
-        b64 = await self.card.make(
-            title=title, desc=desc, avatar=avt_data,
-            link=route,
-        )
-
-        if not b64:
-            yield event.plain_result("❌ 推荐卡片生成失败。")
-            return
-
-        groups_state = {}
-        for gid in target_groups:
-            groups_state[gid] = {"agrees": [], "rejects": [], "status": "pending"}
-
-        self._pending_recs[rec_id] = {
-            "route": route, "url": full_url, "title": title,
-            "description": desc, "avatar_url": avatar_url,
-            "recommender": event.unified_msg_origin,
-            "groups": groups_state,
-            "interval": 30,
-            "created_at": time.time(),
-        }
-        self._save_recs()
-
-        card_comps = [
-            Comp.Image.fromBase64(b64),
-            Comp.Plain(f"\\n📢 有人推荐订阅「{title}」\\n回复「同意」订阅 / 回复「拒绝」取消\\n（1人回复即生效，1小时无人回复自动订阅）"),
-        ]
-
-        sent_count = 0
-        for gid in target_groups:
-            try:
-                gpn = gid.split(":")[0]
-                if gpn == "aiocqhttp" and self.compose:
-                    node = Comp.Node(uin=0, name="频道推荐", content=card_comps)
-                    ret = await self.ctx.send_message(gid, MessageChain(chain=[node]))
-                else:
-                    ret = await self.ctx.send_message(gid, MessageChain(chain=card_comps))
-                if ret is not None and ret is not False:
-                    sent_count += 1
-                await asyncio.sleep(2)
-            except Exception as e:
-                self.logger.error("[MyRSS] recommend send failed: %s", e)
-
-        yield event.plain_result(f"✅ 推荐已发送到 {sent_count}/{len(target_groups)} 个群\\n编号: {rec_id}\\n群友回复「同意」或「拒绝」即可，1小时无人回复自动订阅")
-
-    async def _check_rec_timeout(self):
-        """检查超时的推荐，1小时无人拒绝自动通过"""
-        now = time.time()
-        for rec_id, rec in list(self._pending_recs.items()):
-            if now - rec.get("created_at", 0) < 3600:
-                continue
-            for gid, gs in rec.get("groups", {}).items():
-                if gs.get("status") != "pending":
-                    continue
-                gs["status"] = "approved"
-                self._save_recs()
-                try:
-                    ok = await self._auto_subscribe(
-                        rec["url"], gid, rec.get("interval", 30)
-                    )
-                    title = rec.get("title", "未知")
-                    if ok:
-                        await self.ctx.send_message(gid, MessageChain(chain=[
-                            Comp.Plain(f"✅ 推荐「{title}」1小时无人拒绝，已自动订阅！\\n⏰ 每{rec.get('interval', 30)}分钟检查更新")
-                        ]))
-                except Exception as e:
-                    self.logger.error("[MyRSS] auto-approve failed for %s: %s", gid, e)
+    
 
     async def _is_group_admin(self, group_id: str, user_id: str) -> bool:
         """判断用户是否为群主或管理员"""
@@ -3253,74 +2912,9 @@ class MyRssPlugin(Star):
             bl.remove(uid)
             self.dh.save()
 
-    @myrss.command("recs")
-    async def cmd_recs(self, event: AstrMessageEvent):
-        """查看所有待处理的推荐"""
-        if not self._pending_recs:
-            yield event.plain_result("当前没有待处理的推荐。")
-            return
-        lines = ["📋 推荐列表："]
-        now = time.time()
-        for rec_id, rec in sorted(self._pending_recs.items(), key=lambda x: x[1].get("created_at", 0), reverse=True):
-            title = rec.get("title", "未知")
-            route = rec.get("route", "")
-            elapsed = int((now - rec.get("created_at", 0)) / 60)
-            remaining = max(0, 60 - elapsed)
-            groups_info = []
-            for gid, gs in rec.get("groups", {}).items():
-                status = gs.get("status", "pending")
-                gid_short = gid.split(":")[-1]
-                if status == "pending":
-                    groups_info.append(f" {gid_short} ⏳待定")
-                elif status == "approved":
-                    groups_info.append(f" {gid_short} ✅已订阅")
-                elif status == "rejected":
-                    groups_info.append(f" {gid_short} ❌已拒绝")
-                elif status == "cancelled":
-                    groups_info.append(f" {gid_short} 🚫已撤回")
-            lines.append(f"\\n🆔 {rec_id} | {title}")
-            lines.append(f" 路由: {route}")
-            lines.append(f" 已过{elapsed}分钟 | {'已超时' if remaining == 0 else f'剩{remaining}分钟自动通过'}")
-            lines.extend(groups_info)
-        yield event.plain_result("\\n".join(lines))
+    
 
-    @myrss.command("cancelrec")
-    async def cmd_cancelrec(self, event: AstrMessageEvent, rec_id: str = ""):
-        """撤回推荐（取消所有待定群的订阅）
-        用法：/myrss cancelrec R78813
-        /myrss cancelrec all
-        """
-        if not rec_id:
-            yield event.plain_result("用法: /myrss cancelrec <编号或all>\\n先用 /myrss recs 查看编号")
-            return
-
-        if rec_id.lower() == "all":
-            count = 0
-            for rid, rec in self._pending_recs.items():
-                for gid, gs in rec.get("groups", {}).items():
-                    if gs.get("status") == "pending":
-                        gs["status"] = "cancelled"
-                        count += 1
-            self._save_recs()
-            yield event.plain_result(f"✅ 已撤回所有待定推荐（{count}个群）")
-            return
-
-        if rec_id not in self._pending_recs:
-            yield event.plain_result(f"找不到编号 {rec_id}，用 /myrss recs 查看")
-            return
-
-        rec = self._pending_recs[rec_id]
-        cancelled = []
-        for gid, gs in rec.get("groups", {}).items():
-            if gs.get("status") == "pending":
-                gs["status"] = "cancelled"
-                cancelled.append(gid.split(":")[-1])
-        self._save_recs()
-
-        if cancelled:
-            yield event.plain_result(f"✅ 已撤回推荐 {rec_id}「{rec.get('title', '')}」\\n取消了 {len(cancelled)} 个群: {', '.join(cancelled)}")
-        else:
-            yield event.plain_result(f"推荐 {rec_id} 没有待定的群（可能已全部通过/拒绝）")
+    
 
     @myrss.command("subs")
     async def cmd_subs(self, event: AstrMessageEvent):
@@ -3564,7 +3158,10 @@ class MyRssPlugin(Star):
                 f"📊 统计：{total_sources} 个订阅源，{total_subs} 个订阅记录\n"
                 f"📦 文件大小：{size} bytes\n"
                 f"🕒 最后修改：{mtime}\n\n"
-                "提示：如果这个路径和你手动查看的不一样，说明是容器挂载导致的，请优先使用这个路径。"
+                "⚠️ 重要提示：\n"
+                "1. 看到这个路径说明数据实际写在这里。\n"
+                "2. 重装/更新插件时，如果这个目录被删除，seen_links 会丢失 → 可能重复推送！\n"
+                "3. 强烈建议在插件配置中设置 custom_data_dir（填绝对路径）来固定数据位置。"
             )
             yield event.plain_result(msg)
         except Exception as e:
