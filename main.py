@@ -46,17 +46,18 @@ class DataHandler:
     解决 Docker/容器 vs 主机路径混乱问题。
 
     路径优先级（从高到低）：
-    1. 插件配置里的 custom_data_dir （推荐 Docker 用户直接填绝对路径）
+    1. 插件配置里的 custom_data_dir
     2. 环境变量 MYRSS_DATA_DIR
-    3. 插件源码所在目录下的 _data/ （默认，git pull 安全）
-    4. 旧的 data/astrbot_plugin_myrss 兜底
+    3. AstrBot 官方持久化目录 data/plugin_data/astrbot_plugin_myrss/
 
+    插件源码目录下的 _data 仅作为旧数据迁移来源，绝不再作为默认写入位置。
     每次启动都会在日志里明确打印实际使用的完整路径。
     """
 
     def __init__(self, plugin_dir=None, seen_links_max_days=365, custom_data_dir=None):
         self.logger = logging.getLogger("astrbot")
         self.seen_links_max_days = seen_links_max_days
+        self.plugin_dir = os.path.abspath(plugin_dir) if plugin_dir else None
 
         self.data_dir = self._resolve_data_dir(plugin_dir, custom_data_dir)
         self.config_path = os.path.join(self.data_dir, "_data.json")
@@ -69,9 +70,8 @@ class DataHandler:
 
         self.data = self._load()
 
-        # 强提示：推荐用户配置 custom_data_dir 防止重装丢数据
         if not custom_data_dir:
-            self.logger.warning("[MyRSS] ⚠️ 强烈建议在插件配置中设置 custom_data_dir（绝对路径），否则重装/更新插件可能导致 seen_links 丢失，引发重复推送！")
+            self.logger.info("[MyRSS] 未设置 custom_data_dir，已使用 AstrBot 官方 plugin_data 持久化目录")
 
     def _is_running_in_container(self) -> bool:
         """自动检测是否在容器（Docker / AstrBot 常见容器）内运行。
@@ -100,9 +100,17 @@ class DataHandler:
         # 1. 最高优先级：用户在 AstrBot 配置界面填的 custom_data_dir
         if custom_data_dir and str(custom_data_dir).strip():
             d = os.path.abspath(str(custom_data_dir).strip())
-            os.makedirs(d, exist_ok=True)
-            self.logger.info("[MyRSS] 使用用户自定义数据目录 (custom_data_dir)")
-            return d
+            plugin_root = os.path.abspath(plugin_dir) if plugin_dir else ""
+            try:
+                inside_plugin = bool(plugin_root and os.path.commonpath([d, plugin_root]) == plugin_root)
+            except ValueError:
+                inside_plugin = False
+            if inside_plugin:
+                self.logger.error("[MyRSS] custom_data_dir 指向插件源码目录，重装会丢数据；已拒绝并改用官方 plugin_data 目录: %s", d)
+            else:
+                os.makedirs(d, exist_ok=True)
+                self.logger.info("[MyRSS] 使用用户自定义数据目录 (custom_data_dir)")
+                return d
 
         # 2. 环境变量（方便 Docker compose 覆盖）
         env_dir = os.environ.get("MYRSS_DATA_DIR", "").strip()
@@ -112,18 +120,17 @@ class DataHandler:
             self.logger.info("[MyRSS] 使用环境变量 MYRSS_DATA_DIR")
             return d
 
-        # 3. 插件目录 _data （最推荐的默认方式）
-        if plugin_dir:
-            d = os.path.join(os.path.abspath(plugin_dir), "_data")
-            os.makedirs(d, exist_ok=True)
-            if self._is_running_in_container():
-                self.logger.info("[MyRSS] 检测到容器环境，使用插件目录下的 _data")
-            return d
-
-        # 4. 最后兜底（旧行为）
-        d = os.path.abspath("data/astrbot_plugin_myrss")
+        # 3. AstrBot 官方插件持久化目录。
+        # v4.9.2+ 使用官方路径 API；旧版本回退到 AstrBot 工作目录下的 data。
+        try:
+            from astrbot.core.utils.astrbot_path import get_astrbot_data_path
+            data_root = os.path.abspath(str(get_astrbot_data_path()))
+        except (ImportError, AttributeError, TypeError):
+            data_root = os.path.abspath("data")
+            self.logger.warning("[MyRSS] AstrBot 路径 API 不可用，回退到 data/plugin_data")
+        d = os.path.join(data_root, "plugin_data", "astrbot_plugin_myrss")
         os.makedirs(d, exist_ok=True)
-        self.logger.warning("[MyRSS] 使用兜底数据目录 data/astrbot_plugin_myrss")
+        self.logger.info("[MyRSS] 使用 AstrBot 官方插件数据目录 data/plugin_data/astrbot_plugin_myrss")
         return d
 
     def get_data_path(self) -> str:
@@ -142,19 +149,40 @@ class DataHandler:
                     self._backup_data(d)
                 return d
 
-        # 迁移旧路径
-        old_path = "data/astrbot_plugin_myrss/_data.json"
-        if os.path.exists(old_path):
+        # 仅当新目录尚无数据时迁移旧路径。优先迁移插件内部 _data，
+        # 其次兼容早期 data/astrbot_plugin_myrss。旧文件只读并保留备份，不删除。
+        legacy_paths = []
+        if self.plugin_dir:
+            legacy_paths.append(os.path.join(self.plugin_dir, "_data", "_data.json"))
+        legacy_paths.append(os.path.abspath("data/astrbot_plugin_myrss/_data.json"))
+        for old_path in legacy_paths:
+            if os.path.abspath(old_path) == os.path.abspath(self.config_path):
+                continue
+            if not os.path.exists(old_path):
+                continue
             old_data = self._read_json(old_path)
-            if old_data is not None:
-                os.makedirs(self.data_dir, exist_ok=True)
-                with open(self.config_path, "w", encoding="utf-8") as f:
+            if old_data is None:
+                self.logger.error("[MyRSS] 发现旧数据但 JSON 无法读取，拒绝覆盖: %s", old_path)
+                continue
+            os.makedirs(self.data_dir, exist_ok=True)
+            tmp_path = self.config_path + ".migrate_tmp"
+            try:
+                with open(tmp_path, "w", encoding="utf-8") as f:
                     json.dump(old_data, f, indent=2, ensure_ascii=False)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp_path, self.config_path)
                 try:
                     shutil.copy2(old_path, old_path + ".migrated_bak")
-                except Exception:
-                    pass
+                except Exception as backup_error:
+                    self.logger.warning("[MyRSS] 旧数据备份失败但迁移已完成: %s", backup_error)
+                self.logger.warning("[MyRSS] 已迁移持久化数据: %s -> %s", old_path, self.config_path)
                 return old_data
+            except Exception as migrate_error:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+                self.logger.error("[MyRSS] 旧数据迁移失败，拒绝初始化空库: %s", migrate_error)
+                raise
 
         # 初始化
         d = {"rsshub_endpoints": []}
@@ -606,8 +634,7 @@ class MyRssPlugin(Star):
         self.ctx = context
         self.cfg = config
         
-        # 插件目录（用于存储数据文件，避免 git pull 时丢失）
-        # main.py 在 astrbot_plugin_myrss/main.py，数据目录在 astrbot_plugin_myrss/_data/
+        # 插件目录仅用于发现并迁移旧版 _data；新数据写入 AstrBot data/plugin_data。
         _plugin_dir = os.path.dirname(os.path.abspath(__file__))
         
         # 初始化 DataHandler（插件目录 + 迁移 + 清理）
@@ -2527,8 +2554,8 @@ class MyRssPlugin(Star):
                 f"🕒 最后修改：{mtime}\n\n"
                 "⚠️ 重要提示：\n"
                 "1. 看到这个路径说明数据实际写在这里。\n"
-                "2. 重装/更新插件时，如果这个目录被删除，seen_links 会丢失 → 可能重复推送！\n"
-                "3. 强烈建议在插件配置中设置 custom_data_dir（填绝对路径）来固定数据位置。"
+                "2. 默认路径应位于 AstrBot data/plugin_data/astrbot_plugin_myrss，不应位于插件源码目录。\n"
+                "3. Docker 用户必须持久化挂载整个 AstrBot data 目录，否则容器重建后仍会丢失订阅和 seen_links。"
             )
             yield event.plain_result(msg)
         except Exception as e:
