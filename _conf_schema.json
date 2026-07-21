@@ -109,7 +109,7 @@
     "default": 365
   },
   "custom_data_dir": {
-    "description": "自定义数据目录（强烈推荐 Docker 用户填写绝对路径，例如 /data/myrss 或 /mnt/hdd/bot/astrbot/data/plugins/astrbot_plugin_myrss/_data）。留空则自动检测。",
+    "description": "可选自定义持久化目录。留空时使用 AstrBot 官方 data/plugin_data/astrbot_plugin_myrss；不要填写插件源码目录。Docker 用户须确保 AstrBot data 目录已挂载到宿主机。",
     "type": "string",
     "default": ""
   },
