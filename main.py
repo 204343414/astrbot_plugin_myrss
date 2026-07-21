@@ -16,7 +16,7 @@ from typing import List
 
 from lxml import etree
 from bs4 import BeautifulSoup
-from PIL import Image
+from PIL import Image, ImageOps, ImageDraw
 from jinja2 import Environment, BaseLoader
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -638,6 +638,9 @@ class MyRssPlugin(Star):
         self.content_filter = True
         self._comment_cache = {} # key=item_link, value=comment_text
         self._safe_cache = {} # key=item_link, value=bool(safe)
+        self._vision_cache = {} # key=item_link, value=融合图单次识别结果（失败也缓存）
+        self.image_caption_provider_id = config.get("image_caption_provider_id", "")
+        self.max_vision_images = 9
         self._preview_states = {}  # key=(origin, preview_id), value=一次性安全预览状态
         self._preview_ttl_seconds = 600
         
@@ -1021,6 +1024,9 @@ class MyRssPlugin(Star):
         if item.description:
             desc_short = item.description[:200]
             content_summary += "\\n" + desc_short
+        vision = await self._analyze_item_images(item)
+        if vision.get("status") == "SAFE" and vision.get("description"):
+            content_summary += "\\n图片内容：" + vision["description"][:600]
 
         # 获取人格设定（v4 正统：PersonaManager）
         system_prompt = None
@@ -1071,6 +1077,127 @@ class MyRssPlugin(Star):
             self.logger.error("[MyRSS] comment generation failed: %s", e)
             return ""
 
+    def _item_cache_key(self, item: RSSItem) -> str:
+        return (item.link.split("#", 1)[0].split("?", 1)[0] if item.link else "") or f"{item.title}|{item.pubDate_timestamp}"
+
+    def _build_contact_sheet(self, images: list[bytes]) -> bytes:
+        """把同一动态的图片本地融合为一张带编号联系表，不调用外部服务。"""
+        count = len(images)
+        if count <= 0:
+            return b""
+        if count == 1:
+            cols, rows = 1, 1
+        elif count == 2:
+            cols, rows = 2, 1
+        elif count <= 4:
+            cols, rows = 2, 2
+        elif count <= 6:
+            cols, rows = 3, 2
+        else:
+            cols, rows = 3, 3
+        cell = 512
+        canvas = Image.new("RGB", (cols * cell, rows * cell), (245, 245, 245))
+        draw = ImageDraw.Draw(canvas)
+        for index, raw in enumerate(images):
+            with Image.open(BytesIO(raw)) as source:
+                image = ImageOps.exif_transpose(source).convert("RGB")
+                image.thumbnail((cell - 16, cell - 16), Image.LANCZOS)
+                x0 = (index % cols) * cell
+                y0 = (index // cols) * cell
+                x = x0 + (cell - image.width) // 2
+                y = y0 + (cell - image.height) // 2
+                canvas.paste(image, (x, y))
+                draw.rectangle((x0, y0, x0 + cell - 1, y0 + cell - 1), outline=(190, 190, 190), width=2)
+                draw.rectangle((x0 + 8, y0 + 8, x0 + 70, y0 + 42), fill=(0, 0, 0))
+                draw.text((x0 + 16, y0 + 13), f"IMG {index + 1}", fill=(255, 255, 255))
+        out = BytesIO()
+        canvas.save(out, format="JPEG", quality=85, optimize=True)
+        return out.getvalue()
+
+    async def _analyze_item_images(self, item: RSSItem) -> dict:
+        """全部图片融合后只调用一次多模态 LLM；任何失败状态也缓存，禁止反复调用。"""
+        key = self._item_cache_key(item)
+        if key in self._vision_cache:
+            return self._vision_cache[key]
+        if not item.pic_urls:
+            result = {"status": "NO_IMAGE", "description": "", "image_count": 0}
+            self._vision_cache[key] = result
+            return result
+        if len(item.pic_urls) > self.max_vision_images:
+            result = {"status": "REJECT", "description": "图片数量超过安全审核上限", "image_count": len(item.pic_urls)}
+            self._vision_cache[key] = result
+            return result
+
+        downloaded = []
+        try:
+            async with aiohttp.ClientSession(trust_env=True, connector=aiohttp.TCPConnector(ssl=False)) as session:
+                for image_url in item.pic_urls:
+                    try:
+                        async with session.get(image_url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                            raw = await resp.read() if resp.status == 200 else b""
+                        if len(raw) <= 100:
+                            raise ValueError(f"empty image HTTP {resp.status}")
+                        # 在融合前解码一次，拒绝伪图片或损坏文件。
+                        with Image.open(BytesIO(raw)) as check:
+                            check.verify()
+                        downloaded.append(raw)
+                    except Exception as exc:
+                        # RSS 常同时给出候选封面（例如 YouTube maxres 404 + hq 可用），
+                        # 单个候选失败只跳过；最终一张都拿不到时才 fail closed。
+                        self.logger.warning("[MyRSS] image candidate download/decode failed, skip: %s", exc)
+                        continue
+            if not downloaded:
+                result = {"status": "REJECT", "description": "所有图片候选均无法下载或解码", "image_count": 0}
+                self._vision_cache[key] = result
+                return result
+            contact_sheet = self._build_contact_sheet(downloaded)
+        except Exception as exc:
+            self.logger.error("[MyRSS] contact sheet failed: %s", exc)
+            result = {"status": "REJECT", "description": "图片融合失败", "image_count": len(item.pic_urls)}
+            self._vision_cache[key] = result
+            return result
+
+        provider_id = self.image_caption_provider_id or self.filter_provider_id or await self._get_provider_id()
+        if not provider_id:
+            result = {"status": "REJECT", "description": "没有可用的多模态审核模型", "image_count": len(downloaded)}
+            self._vision_cache[key] = result
+            return result
+        data_uri = "data:image/jpeg;base64," + base64.b64encode(contact_sheet).decode()
+        prompt = (
+            f"你正在审核一张由同一条动态的 {len(downloaded)} 张原图按编号融合而成的联系表。"
+            "请查看所有编号区域，概括人物、场景、可读文字及图片之间的关系。"
+            "若任何区域含政治敏感、色情、暴力、血腥、仇恨、违法内容，或小到无法可靠判断，必须拒绝。"
+            "只返回严格 JSON，不要代码块："
+            '{"status":"SAFE|REJECT|MALICIOUS|UNCERTAIN","description":"完整中文描述","uncertain":false}'
+        )
+        try:
+            # 唯一的视觉 LLM 调用点；不在本函数内重试。
+            response = await self.ctx.llm_generate(
+                chat_provider_id=provider_id,
+                prompt=prompt,
+                image_urls=[data_uri],
+                request_max_retries=1,
+            )
+            text = (response.completion_text or "").strip()
+            text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.I | re.S)
+            parsed = json.loads(text)
+            status = str(parsed.get("status", "UNCERTAIN")).upper()
+            description = str(parsed.get("description", "")).strip()
+            uncertain = bool(parsed.get("uncertain", False))
+            if status not in {"SAFE", "REJECT", "MALICIOUS", "UNCERTAIN"} or not description:
+                raise ValueError("invalid vision JSON fields")
+            if uncertain or status == "UNCERTAIN":
+                status = "REJECT"
+            result = {"status": status, "description": description, "image_count": len(downloaded)}
+        except Exception as exc:
+            self.logger.error("[MyRSS] single vision call failed; reject and cache: %s", exc)
+            result = {"status": "REJECT", "description": "多模态识图失败", "image_count": len(downloaded)}
+        self._vision_cache[key] = result
+        if len(self._vision_cache) > 500:
+            for old_key in list(self._vision_cache)[:200]:
+                del self._vision_cache[old_key]
+        return result
+
     async def _check_content_safe(self, item: RSSItem) -> str:
         """
         增强版内容审核（三种状态）：
@@ -1101,13 +1228,21 @@ class MyRssPlugin(Star):
                 self._safe_cache[cache_key] = "MALICIOUS"
                 return "MALICIOUS"
 
+        vision = await self._analyze_item_images(item)
+        if vision.get("status") in {"REJECT", "MALICIOUS"}:
+            status = vision["status"]
+            self.logger.warning("[MyRSS] image review %s: %s", status, vision.get("description", "")[:80])
+            self._safe_cache[cache_key] = status
+            return status
+
         provider_id = self.filter_provider_id if self.filter_provider_id else await self._get_provider_id()
         if not provider_id:
             self.logger.error("[MyRSS] no provider for mandatory content review; reject by default")
             self._safe_cache[cache_key] = "REJECT"
             return "REJECT"
 
-        content = (item.title + " " + (item.description or ""))[:400]
+        image_description = vision.get("description", "")
+        content = (item.title + " " + (item.description or "") + "\n图片内容：" + image_description)[:1200]
 
         # 增强提示词：三种状态
         prompt = (
@@ -1910,9 +2045,15 @@ class MyRssPlugin(Star):
         """清空过滤缓存和锐评缓存"""
         safe_count = len(self._safe_cache)
         comment_count = len(self._comment_cache)
+        vision_count = len(self._vision_cache)
         self._safe_cache.clear()
         self._comment_cache.clear()
-        yield event.plain_result(f"✅ 缓存已清空\\n 过滤缓存: {safe_count} 条已清除\\n 锐评缓存: {comment_count} 条已清除")
+        self._vision_cache.clear()
+        yield event.plain_result(
+            f"✅ 缓存已清空\\n 过滤缓存: {safe_count} 条已清除"
+            f"\\n 锐评缓存: {comment_count} 条已清除"
+            f"\\n 识图缓存: {vision_count} 条已清除"
+        )
 
     @myrss.command("clear")
     async def cmd_clear(self, event: AstrMessageEvent, target: str = "all"):
@@ -2107,6 +2248,7 @@ class MyRssPlugin(Star):
         yield event.plain_result(
             "✅ 测试完成！\\n"
             f" 过滤缓存大小: {len(self._safe_cache)}\\n"
+            f" 识图缓存大小: {len(self._vision_cache)}\\n"
             f" 锐评缓存大小: {len(self._comment_cache)}\\n"
             "再次执行同样的命令可验证缓存是否命中（应显示 True）"
         )
@@ -2293,6 +2435,7 @@ class MyRssPlugin(Star):
         # 1. 清空内存缓存
         self._safe_cache.clear()
         self._comment_cache.clear()
+        self._vision_cache.clear()
         self.logger.info("[MyRSS] 内存缓存已清空")
         
         count = 0
