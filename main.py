@@ -2399,7 +2399,7 @@ class MyRssPlugin(Star):
         rec_id = f"R{int(time.time()) % 100000:05d}"
         b64 = await self.card.make(
             title=title, desc=desc, avatar=avt_data,
-            route=route, previews=previews, rec_id=rec_id,
+            link=route,
         )
 
         if b64:
@@ -2505,7 +2505,7 @@ class MyRssPlugin(Star):
 
         b64 = await self.card.make(
             title=title, desc=desc, avatar=avt_data,
-            route=route, previews=previews, rec_id=rec_id,
+            link=route,
         )
 
         if not b64:
@@ -3116,7 +3116,7 @@ class MyRssPlugin(Star):
         rec_id = f"R{int(time.time()) % 100000:05d}"
         b64 = await self.card.make(
             title=title, desc=desc, avatar=avt_data,
-            route=route, previews=previews, rec_id=rec_id,
+            link=route,
         )
 
         if not b64:
