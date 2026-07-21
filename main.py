@@ -1575,10 +1575,24 @@ class MyRssPlugin(Star):
                 "title": title, "consumed": False,
             }
             card = await self._make_safe_preview_card(item)
+            card_sent = False
             if card:
-                yield event.chain_result([Comp.Image.fromBase64(card)])
-            else:
-                yield event.plain_result(f"📡 {title}\n📝 {item.title}\n{item.description}")
+                # LLM 工具的普通 chain_result 可能只作为工具结果交回模型，
+                # 不一定直接显示给用户。这里按 AstrBot 事件 API 主动发送一次图片，
+                # 随后的 plain_result 只负责把确认信息交给模型，避免重复发卡片。
+                try:
+                    await event.send(MessageChain(chain=[Comp.Image.fromBase64(card)]))
+                    card_sent = True
+                except Exception as exc:
+                    self.logger.error("[MyRSS] safe preview card send failed: route=%s error=%s", route, exc)
+            if not card_sent:
+                if not card:
+                    self.logger.error("[MyRSS] safe preview card render failed: route=%s", route)
+                yield event.plain_result(
+                    f"⚠️ 安全审核已通过，但图片预览卡片生成或发送失败。\n"
+                    f"频道：{title}\n最新动态：{item.title}\n"
+                    "本次仍保留预览编号，但没有发送图片卡片。"
+                )
             yield event.plain_result(
                 f"预览编号：{preview_id}\n"
                 "这只是预览，尚未订阅。若确认，请明确说：确认订阅到当前群；"
