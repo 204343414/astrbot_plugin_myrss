@@ -2397,7 +2397,7 @@ class MyRssPlugin(Star):
                 pass
 
         rec_id = f"R{int(time.time()) % 100000:05d}"
-        b64 = await self.card.make_rec_card(
+        b64 = await self.card.make(
             title=title, description=desc, avatar=avt_data,
             route=route, previews=previews, rec_id=rec_id,
         )
@@ -2503,7 +2503,7 @@ class MyRssPlugin(Star):
 
         rec_id = f"R{int(time.time()) % 100000:05d}"
 
-        b64 = await self.card.make_rec_card(
+        b64 = await self.card.make(
             title=title, description=desc, avatar=avt_data,
             route=route, previews=previews, rec_id=rec_id,
         )
@@ -3114,7 +3114,7 @@ class MyRssPlugin(Star):
                 pass
 
         rec_id = f"R{int(time.time()) % 100000:05d}"
-        b64 = await self.card.make_rec_card(
+        b64 = await self.card.make(
             title=title, description=desc, avatar=avt_data,
             route=route, previews=previews, rec_id=rec_id,
         )
