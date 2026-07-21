@@ -1512,8 +1512,62 @@ class MyRssPlugin(Star):
             bot_avatar=None, bot_provider_name="",
         )
 
+    def _explicit_subscribe_confirmation(self, event: AstrMessageEvent) -> bool:
+        """以用户原始消息为准，不信任 LLM 自行填写的 confirm 参数。"""
+        text = re.sub(r"[\s，,。.!！?？:：]", "", getattr(event, "message_str", "") or "")
+        return any(word in text for word in ("确认订阅", "确认关注", "确认添加订阅", "认订阅"))
+
+    def _target_group_from_request(self, event: AstrMessageEvent, target_group: str = "") -> str:
+        """优先使用工具参数；缺失时从用户原始消息提取明确群号。"""
+        if str(target_group or "").strip().isdigit():
+            return str(target_group).strip()
+        text = getattr(event, "message_str", "") or ""
+        match = re.search(r"(?:群号|群)\s*[:：]?\s*(\d{5,})", text)
+        return match.group(1) if match else ""
+
+    def _latest_preview_state(self, origin: str, preview_id: str = ""):
+        """按当前会话取预览；LLM 抄错/漏填编号时回退到该会话最新状态。"""
+        exact = self._preview_states.get((origin, preview_id)) if preview_id else None
+        if exact:
+            return exact
+        candidates = [v for (state_origin, _), v in self._preview_states.items() if state_origin == origin]
+        return max(candidates, key=lambda x: x.get("created_at", 0)) if candidates else None
+
+    def _subscription_target(self, event: AstrMessageEvent, target_group: str):
+        """返回 (target_origin, error)。跨群只能由 AstrBot 管理员操作。"""
+        origin = event.unified_msg_origin
+        if not target_group:
+            return origin, ""
+        current_gid = origin.split(":")[-1] if "GroupMessage" in origin else ""
+        if target_group != current_gid and not self._is_astrbot_admin(event):
+            return "", "⚠️ 指定其他群仅 AstrBot 管理员可用。"
+        return f"{origin.split(':')[0]}:GroupMessage:{target_group}", ""
+
+    async def _confirm_preview_subscription(self, event: AstrMessageEvent, state: dict, target_group: str):
+        """幂等确认订阅；绝不对已有订阅再次调用 _add，避免重置 seen_links。"""
+        target_origin, error = self._subscription_target(event, target_group)
+        if error:
+            return error
+        if time.time() - state.get("created_at", 0) > self._preview_ttl_seconds:
+            return "❌ 最近一次预览已过期，请重新预览。"
+        feed_url = state["url"]
+        if target_origin in self.dh.data.get(feed_url, {}).get("subscribers", {}):
+            state["consumed"] = True
+            state["target_origin"] = target_origin
+            return f"ℹ️「{state.get('title', feed_url)}」已经订阅到 {target_origin}，未重复写入。"
+        if state.get("consumed"):
+            return f"❌ 最近一次预览已经用于 {state.get('target_origin', '其他目标')}，如需换群请重新预览。"
+        ret = await self._add(feed_url, "*/15 * * * *", event, target_user=target_origin)
+        if isinstance(ret, MessageEventResult):
+            return ret
+        state["consumed"] = True
+        state["target_origin"] = target_origin
+        self._reload_jobs()
+        return f"✅ 已订阅「{ret['title']}」\n目标：{target_origin}\n预览编号已消费。"
+
     @filter.llm_tool(name="myrss_preview")
-    async def tool_preview(self, event: AstrMessageEvent, url: str = ""):
+    async def tool_preview(self, event: AstrMessageEvent, url: str = "",
+                           target_group: str = "", confirm: bool = False):
         """生成“可订阅动态源”的安全预览卡片，并为后续确认订阅创建 preview_id。
 
         这是 RSS 订阅工作流工具，不是通用联网搜索、新闻搜索或事实查询工具。
@@ -1531,11 +1585,15 @@ class MyRssPlugin(Star):
         - 用户要求普通网页搜索、资料检索、事实核查或总结实时事件；
         - 用户没有订阅、关注、取关、推荐动态源或生成订阅卡片的意图。
 
-        本工具只生成预览，不会建立订阅、不会向目标群发送动态，也不会修改 seen_links。
-        审核通过后会返回一次性 preview_id；必须等待用户明确确认，再调用 myrss_manage。
+        默认只生成预览，不会建立订阅或向目标群发送历史动态。
+        但 AstrBot 管理员若在同一句原始消息中明确说“预览……并确认订阅到群号”，
+        本工具会在安全预览通过后直接完成订阅，不要求模型复制 preview_id。
+        是否明确确认以用户原始消息为准，不信任模型自行填写的 confirm 参数。
 
         Args:
             url(string): 用户准备订阅的账号/UP主/频道链接，或 / 开头的 RSSHub 路由。不是搜索关键词。
+            target_group(string): 仅在用户同一句话明确要求确认订阅时填写目标群号。
+            confirm(bool): 用户同一句话明确说确认订阅时为 true；插件仍会复核原始消息。
         """
         full_url, route, error = self._resolve_feed_url(url)
         if not full_url:
@@ -1593,13 +1651,21 @@ class MyRssPlugin(Star):
                     f"频道：{title}\n最新动态：{item.title}\n"
                     "本次仍保留预览编号，但没有发送图片卡片。"
                 )
-            yield event.plain_result(
-                f"预览编号：{preview_id}\n"
-                "这只是预览，尚未订阅。若确认，请明确说：确认订阅到当前群；"
-                "跨群请由 AstrBot 管理员说：确认订阅到群号。编号 10 分钟内有效。"
-            )
+            requested_group = self._target_group_from_request(event, target_group)
+            if self._explicit_subscribe_confirmation(event):
+                result = await self._confirm_preview_subscription(event, self._preview_states[(origin, preview_id)], requested_group)
+                if isinstance(result, MessageEventResult):
+                    yield result
+                else:
+                    yield event.plain_result(result)
+            else:
+                yield event.plain_result(
+                    f"预览编号：{preview_id}\n"
+                    "这只是预览，尚未订阅。直接明确说“确认订阅到当前群”或“确认订阅到群号”即可；"
+                    "插件会自动使用本会话最近一次预览，不需要引用或复制编号。编号 10 分钟内有效。"
+                )
         finally:
-            if old_entry is None:
+            if old_entry is None and not self.dh.data.get(full_url, {}).get("subscribers"):
                 self.dh.data.pop(full_url, None)
 
     @filter.llm_tool(name="myrss_manage")
@@ -1615,7 +1681,8 @@ class MyRssPlugin(Star):
         action 使用规则：
         - list：用户询问“我订阅了什么”“当前关注列表”时使用；不需要 preview_id。
         - subscribe：只能在 myrss_preview 已成功生成安全卡片后使用。用户必须明确说
-          “确认订阅/确认关注”，并提供同一会话内有效的 preview_id。仅发送群号不算确认。
+          “确认订阅/确认关注”。插件自动读取当前会话最近一次有效预览；preview_id 可省略，
+          即使模型漏填或抄错也不会串到其他会话。仅发送群号不算确认。
         - unsubscribe：用户明确要求取消关注、退订、取关某个现有动态源时使用；
           使用订阅列表编号或能唯一匹配的标题/URL关键词。
 
@@ -1627,10 +1694,10 @@ class MyRssPlugin(Star):
 
         Args:
             action(string): 必须是 list、subscribe 或 unsubscribe。
-            preview_id(string): subscribe 必填，必须来自当前会话最近一次 myrss_preview。
-            target_group(string): 订阅/取关的可选目标群号；跨群仅 AstrBot 管理员可操作。
+            preview_id(string): subscribe 可选；插件会回退到当前会话最近一次预览，禁止跨会话匹配。
+            target_group(string): 订阅/取关的可选目标群号；遗漏时插件可从原始消息提取。
             keyword(string): unsubscribe 使用的唯一标题、URL关键词或订阅列表编号。
-            confirm(bool): 仅当用户明确表达“确认订阅/确认关注”时传 true；不得自行推断。
+            confirm(bool): 提示模型用；真正授权以用户原始消息中的明确确认措辞为准。
         """
         action = (action or "list").strip().lower()
         origin = event.unified_msg_origin
@@ -1647,29 +1714,19 @@ class MyRssPlugin(Star):
             yield event.plain_result("\n".join(lines))
             return
         if action == "subscribe":
-            if not confirm:
-                yield event.plain_result("尚未执行：请明确说“确认订阅”，不能仅发送群号。")
+            if not self._explicit_subscribe_confirmation(event):
+                yield event.plain_result("尚未执行：原始消息中必须明确包含“确认订阅/确认关注”，不能仅发送群号。")
                 return
-            state = self._preview_states.get((origin, preview_id))
-            if not state or state.get("consumed") or time.time() - state.get("created_at", 0) > self._preview_ttl_seconds:
-                yield event.plain_result("❌ 预览编号无效、已使用或已过期，请重新预览。")
+            state = self._latest_preview_state(origin, preview_id)
+            if not state:
+                yield event.plain_result("❌ 当前会话没有可用预览，请先生成订阅预览卡片。")
                 return
-            target_origin = origin
-            if target_group:
-                current_gid = origin.split(":")[-1] if "GroupMessage" in origin else ""
-                if str(target_group) != current_gid:
-                    if not self._is_astrbot_admin(event):
-                        yield event.plain_result("⚠️ 指定其他群仅 AstrBot 管理员可用。")
-                        return
-                    platform = origin.split(":")[0]
-                    target_origin = f"{platform}:GroupMessage:{target_group}"
-            ret = await self._add(state["url"], "*/15 * * * *", event, target_user=target_origin)
-            if isinstance(ret, MessageEventResult):
-                yield ret
-                return
-            state["consumed"] = True
-            self._reload_jobs()
-            yield event.plain_result(f"✅ 已订阅「{ret['title']}」\n目标：{target_origin}\n预览编号已消费。")
+            requested_group = self._target_group_from_request(event, target_group)
+            result = await self._confirm_preview_subscription(event, state, requested_group)
+            if isinstance(result, MessageEventResult):
+                yield result
+            else:
+                yield event.plain_result(result)
             return
         if action == "unsubscribe":
             target_origin = origin
