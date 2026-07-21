@@ -82,6 +82,12 @@
     "default": "",
     "_special": "select_provider"
   },
+  "image_caption_provider_id": {
+    "description": "融合图片识别用的多模态LLM（留空则依次使用审核模型、锐评/默认模型）",
+    "type": "string",
+    "default": "",
+    "_special": "select_provider"
+  },
   "push_delay_min": {
     "description": "推送间隔最小秒数（防风控）",
     "type": "float",
