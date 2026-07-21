@@ -634,9 +634,12 @@ class MyRssPlugin(Star):
         self.comment_max_length = config.get("comment_max_length", 80)
         self.bot_qq = config.get("bot_qq", "")
         self.bot_provider_name = config.get("bot_provider_name", "")
-        self.content_filter = config.get("content_filter", True)
+        # 安全审核为强制生产不变量：不能通过配置绕过。
+        self.content_filter = True
         self._comment_cache = {} # key=item_link, value=comment_text
         self._safe_cache = {} # key=item_link, value=bool(safe)
+        self._preview_states = {}  # key=(origin, preview_id), value=一次性安全预览状态
+        self._preview_ttl_seconds = 600
         
         self._last_fetch_error = None  # 拉取错误追踪（新版本 _fetch 使用）
         self.push_delay_min = config.get("push_delay_min", 5.0)
@@ -1076,16 +1079,7 @@ class MyRssPlugin(Star):
           - "REJECT"     驳回（不严重但可能导致 bot 封号的内容）
           - "MALICIOUS"  违规（故意抹黑、恶俗政治、色情暴力等）
         """
-        if not self.content_filter:
-            return "SAFE"
-
-        # 智能免审
-        link_lower = (item.link or "").lower()
-        domestic_keywords = ["bilibili.com", "weibo.com", "weibo.cn", "zhihu.com", "xiaohongshu.com", "douyin.com", "sspai.com"]
-        if any(dk in link_lower for dk in domestic_keywords):
-            self.logger.info(f"[MyRSS] 智能免审：检测到国内安全平台 {item.chan_title}，直接放行。")
-            return "SAFE"
-
+        # 安全审核不可通过配置绕过，也不按平台免审。
         norm_link = item.link.split("#", 1)[0].split("?", 1)[0] if item.link else ""
         cache_key = norm_link or (item.title + "|" + str(item.pubDate_timestamp))
         if cache_key in self._safe_cache:
@@ -1109,8 +1103,9 @@ class MyRssPlugin(Star):
 
         provider_id = self.filter_provider_id if self.filter_provider_id else await self._get_provider_id()
         if not provider_id:
-            self._safe_cache[cache_key] = "SAFE"
-            return "SAFE"
+            self.logger.error("[MyRSS] no provider for mandatory content review; reject by default")
+            self._safe_cache[cache_key] = "REJECT"
+            return "REJECT"
 
         content = (item.title + " " + (item.description or ""))[:400]
 
@@ -1465,288 +1460,197 @@ class MyRssPlugin(Star):
         # ============================================================
         # LLM 工具
         # ============================================================
-
-    @filter.llm_tool(name="myrss_subscribe")
-    async def tool_sub(self, event: AstrMessageEvent, url: str = "https://example.com", interval: int = 15, target_group: str = ""):
-        """用户想订阅某个网站/博主更新时调用。
-
-        Args:
-            url(string): 链接或路由路径
-            interval(int): 间隔分钟数，默认15
-            target_group(string): 指定推送到的群号(可选，不填则推到当前会话)
-        """
-        if not url or url == "https://example.com":
-            yield event.plain_result(
-                "需要用户提供链接或路由。支持平台：B站、YouTube、Twitter/X、微博、知乎等。\\n"
-                "路由示例：/youtube/community/@用户名、/twitter/user/用户名、/bilibili/user/dynamic/UID\\n"
-                "可选参数：interval(分钟)、target_group(指定群号)\\n"
-                "详见 https://docs.rsshub.app"
-            )
-            return
-
-        # 黑名单早检查（节省资源）
-        if self._is_blacklisted(event.unified_msg_origin):
-            yield event.plain_result("❌ 您已被加入全局黑名单，无法使用订阅功能。")
-            return
-
-        eps = self.dh.data.get("rsshub_endpoints", [])
-        if not eps:
-            yield event.plain_result(
-                "尚未配置RSSHub端点，请告诉用户执行以下命令之一：\\n"
-                "/myrss rsshub add https://rsshub.rssforever.com\\n"
-                "/myrss rsshub add https://rsshub.app\\n"
-                "配置后即可订阅。"
-            )
-            return
-        if url.startswith("/"):
-            furl = eps[0] + url
-        elif url.startswith("http"):
-            r = URLMapper.match(url)
-            if r:
-                route, pn = r
-                furl = eps[0] + route
-            else:
-                yield event.plain_result("无法自动识别该链接。\\n\\n" + URLMapper.suggest(url) + "\\n\\n请选择路由后用/开头再次调用。")
-                return
-        else:
-            yield event.plain_result("请提供http开头的链接或/开头的路由。")
-            return
-        if interval < 15:
-            interval = 15
-
-        # 如果已有订阅者，间隔只能取更大值（保护公共源）
-        if furl in self.dh.data:
-            existing_subs = self.dh.data[furl].get("subscribers", {})
-            if existing_subs:
-                def cron_to_minutes(expr: str) -> int:
-                    try:
-                        f = expr.split(" ")
-                        # */15 * * * *
-                        if f[0].startswith("*/"):
-                            return int(f[0][2:])
-                        # 0 */1 * * *
-                        if f[1].startswith("*/"):
-                            return int(f[1][2:]) * 60
-                        return 60
-                    except Exception:
-                        return 60
-
-                max_existing = max(cron_to_minutes(si["cron_expr"]) for si in existing_subs.values())
-                if interval < max_existing:
-                    interval = max_existing
-                    yield event.plain_result(f"⚠️ 已有订阅者使用{max_existing}分钟间隔，为保护公共源已自动调整为{max_existing}分钟。")
-
-        # 分钟制cron
-        if interval < 60:
-            cron_expr = f"*/{interval} * * * *"
-        else:
-            cron_expr = f"0 */{interval // 60} * * *"
-        unit = "分钟" if interval < 60 else "小时"
-        show_interval = interval if interval < 60 else interval // 60
-        # 如果指定了目标群
-        if target_group:
-            # 构造目标群的unified_msg_origin
-            pn = event.unified_msg_origin.split(":")[0]
-            target_umo = f"{pn}:GroupMessage:{target_group}"
-            # 临时替换event的origin
-            original_umo = event.unified_msg_origin
-            event._unified_msg_origin = target_umo
-            ret = await self._add(furl, cron_expr, event)
-            event._unified_msg_origin = original_umo
-            if isinstance(ret, MessageEventResult):
-                yield ret
-                return
-        self._reload_jobs()
-        yield event.plain_result(
-            "✅ 订阅成功！\\n📡 " + ret["title"] +
-            "\\n⏰ 每" + str(show_interval) + unit +
-            "\\n📍 推送到群 " + target_group +
-            "\\n🔗 " + furl
-        )
-        return
-
-    @filter.llm_tool(name="myrss_list")
-    async def tool_list(self, event: AstrMessageEvent, query: str = "all"):
-        """用户问订阅了什么时调用。
-
-        Args:
-            query(string): 固定传all
-        """
-        user = event.unified_msg_origin
-        urls = self.dh.get_subs(user)
-        if not urls:
-            yield event.plain_result("当前没有任何订阅。")
-            return
-        txt = "📋 订阅列表：\\n"
-        for i, u in enumerate(urls):
-            info = self.dh.data[u]["info"]
-            cr = self.dh.data[u]["subscribers"][user]["cron_expr"]
-            txt += " " + str(i) + ". " + info["title"] + " [" + cr + "]\\n"
-        yield event.plain_result(txt)
-
-    @filter.llm_tool(name="myrss_preview")
-    async def tool_preview(self, event: AstrMessageEvent, url: str = ""):
-        """用户想查看/搜索某个频道的信息时调用。生成频道预览卡片。
-
-        常用路由格式（直接填到url参数里）：
-        - 推特/X: /twitter/user/用户名 （如 /twitter/user/Google）
-        - B站: /bilibili/user/dynamic/UID
-        - YouTube: /youtube/user/@用户名
-        - 也可以传完整链接如 https://x.com/Google
-
-        Args:
-            url(string): 频道链接或RSSHub路由，如 /twitter/user/Google 或 https://x.com/Google
-        """
-        if not url:
-            yield event.plain_result(
-                "请提供频道链接或路由。例如：\\n"
-                " 推特: https://x.com/用户名\\n"
-                " B站: https://space.bilibili.com/UID\\n"
-                " YouTube: https://youtube.com/@用户名\\n"
-                " 或直接用路由: /twitter/user/用户名"
-            )
-            return
-
-        eps = self.dh.data.get("rsshub_endpoints", [])
-        if not eps:
-            yield event.plain_result("未配置RSSHub端点，请先 /myrss rsshub add ")
-            return
-
-        if url.startswith("http"):
-            matched = URLMapper.match(url)
-            if matched:
-                route, platform = matched
-                yield event.plain_result(f"🔄 识别为 {platform}，路由: {route}")
-            else:
-                yield event.plain_result("无法识别该链接。\\n\\n" + URLMapper.suggest(url))
-                return
-        elif url.startswith("/"):
-            route = url
-        else:
-            route = "/" + url
-
-        full_url = eps[0].rstrip("/") + route
-        yield event.plain_result(f"📡 正在获取频道信息...")
-
-        text = None
-        for _attempt in range(3):
-            raw = await self._fetch(full_url)
-            if raw and b'' in raw[:10000]:
-                text = raw
-                break
-            await asyncio.sleep(3)
-        if not text:
-            yield event.plain_result("❌ 无法访问该源（已重试3次），请稍后再试。")
-            return
-
-        try:
-            title, desc, avatar_url = self.dh.parse_channel_info(text)
-        except Exception as e:
-            yield event.plain_result(f"❌ 解析失败: {e}")
-            return
-
-        items = await self._poll(full_url, num=3)
-        previews = []
-        for it in items:
-            previews.append({
-                "title": it.title,
-                "time": self.card._format_time(it.pubDate) if it.pubDate else "",
-            })
-
-        avt_data = None
-        if avatar_url:
-            try:
-                conn = aiohttp.TCPConnector(ssl=False)
-                async with aiohttp.ClientSession(trust_env=True, connector=conn) as s:
-                    async with s.get(avatar_url, timeout=aiohttp.ClientTimeout(total=5)) as r:
-                        if r.status == 200:
-                            avt_data = await r.read()
-            except Exception:
-                pass
-
-        rec_id = f"R{int(time.time()) % 100000:05d}"
-        b64 = await self.card.make(
-            title=title, desc=desc, avatar=avt_data,
-            link=route,
-        )
-
-        if b64:
-            self._last_preview = {
-                "route": route, "url": full_url, "title": title,
-                "description": desc, "avatar_url": avatar_url, "rec_id": rec_id,
-            }
-            comps = [Comp.Image.fromBase64(b64)]
-            pn = event.unified_msg_origin.split(":")[0]
-            if pn == "aiocqhttp" and self.compose:
-                yield event.chain_result([Comp.Node(uin=0, name="频道预览", content=comps)])
-            else:
-                yield event.chain_result(comps)
-            yield event.plain_result(
-                f"📡 {title}\\n📝 {desc[:100]}\\n🔗 {route}\\n\\n"
-                f"如需推荐到群，请说「推荐到群XXX」（群号用逗号分隔）"
-            )
-        else:
-            yield event.plain_result(f"📡 {title}\\n📝 {desc[:100]}\\n🔗 {route}\\n\\n（卡片生成失败，但信息已获取）")
-
-    
-
-    @filter.llm_tool(name="myrss_unsubscribe")
-    async def tool_unsub(self, event: AstrMessageEvent, idx: int = 0, idxs: str = ""):
-        """取消订阅（支持多选/清空）。
-
-        Args:
-            idx(int): 单个编号（兼容旧用法）
-            idxs(string): 多个编号，如 "0、2、4" / "0,2,4" / "0 2 4"
-            或 "all"/"清空"/"全部"
-        """
-        user = event.unified_msg_origin
-        urls = self.dh.get_subs(user)
-        if not urls:
-            yield event.plain_result("当前没有任何订阅。")
-            return
-
-        # 解析要删除的编号列表
-        to_remove = []
-
-        if idxs and str(idxs).strip():
-            s = str(idxs).strip().lower()
-            if s in ("all", "清空", "全部"):
-                to_remove = list(range(len(urls)))
-            else:
-                nums = [int(x) for x in re.findall(r"\\d+", s)]
-                to_remove = sorted(set(n for n in nums if 0 <= n < len(urls)))
-            if not to_remove:
-                yield event.plain_result("没解析到有效编号。示例：0、2、4 或 all/清空/全部")
-                return
-        else:
-            # 兼容旧逻辑：只删一个 idx
-            if idx < 0 or idx >= len(urls):
-                yield event.plain_result("编号" + str(idx) + "不存在，有效范围0~" + str(len(urls) - 1))
-                return
-            to_remove = [idx]
-
-        removed_titles = []
-        # 注意：这里不要边删边重新取urls；我们用同一份 urls 快照一次性删完
-        for n in to_remove:
-            u = urls[n]
-            t = self.dh.data.get(u, {}).get("info", {}).get("title", u)
-            try:
-                self.dh.data[u]["subscribers"].pop(user, None)
-                removed_titles.append(t)
-            except Exception:
-                pass
-
-        self.dh.save()
-        self._reload_jobs()
-
-        if removed_titles:
-            msg = "✅ 已取消以下订阅：\\n" + "\\n".join(f" - {x}" for x in removed_titles)
-            yield event.plain_result(msg)
-        else:
-            yield event.plain_result("没有取消任何订阅（可能已经被删过）。")
     # ============================================================
     # 手动命令
     # ============================================================
+
+    def _resolve_feed_url(self, value: str):
+        """把路由或已知平台链接解析为 (full_url, route, platform)。"""
+        eps = self.dh.data.get("rsshub_endpoints", [])
+        if not eps:
+            return None, None, "未配置 RSSHub 端点"
+        value = (value or "").strip()
+        if value.startswith("/"):
+            route, platform = value, "RSSHub"
+        elif value.startswith("http"):
+            matched = URLMapper.match(value)
+            if not matched:
+                return None, None, URLMapper.suggest(value)
+            route, platform = matched
+        else:
+            return None, None, "请提供 http 开头的链接或 / 开头的 RSSHub 路由"
+        return eps[0].rstrip("/") + route, route, platform
+
+    async def _make_safe_preview_card(self, item: RSSItem) -> str:
+        """预览专用卡片：不调用锐评 LLM，只下载头像和首张图片。"""
+        avatar_data = None
+        avatar_url = self._get_avatar_url(item)
+        if avatar_url:
+            try:
+                async with aiohttp.ClientSession(trust_env=True, connector=aiohttp.TCPConnector(ssl=False)) as session:
+                    async with session.get(avatar_url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                        if resp.status == 200:
+                            avatar_data = await resp.read()
+            except Exception:
+                pass
+        thumb_data = None
+        if self.read_pic:
+            for image_url in item.pic_urls[:3]:
+                try:
+                    async with aiohttp.ClientSession(trust_env=True, connector=aiohttp.TCPConnector(ssl=False)) as session:
+                        async with session.get(image_url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                            data = await resp.read() if resp.status == 200 else b""
+                            if len(data) > 100:
+                                thumb_data = data
+                                break
+                except Exception:
+                    continue
+        return await self.card.make(
+            channel=item.chan_title, title=item.title, desc=item.description,
+            link="" if self.hide_url else item.link, ts=item.pubDate or "",
+            thumb=thumb_data, avatar=avatar_data, comment="",
+            bot_avatar=None, bot_provider_name="",
+        )
+
+    @filter.llm_tool(name="myrss_preview")
+    async def tool_preview(self, event: AstrMessageEvent, url: str = ""):
+        """安全预览一个动态源。只预览，不订阅；成功后返回一次性 preview_id。
+
+        Args:
+            url(string): 网站链接或 / 开头的 RSSHub 路由
+        """
+        full_url, route, error = self._resolve_feed_url(url)
+        if not full_url:
+            yield event.plain_result("❌ " + error)
+            return
+        raw = await self._fetch(full_url)
+        if not raw:
+            yield event.plain_result("❌ 无法访问该源，本次不生成确认状态。")
+            return
+        try:
+            title, desc, avatar = self.dh.parse_channel_info(raw)
+        except Exception as exc:
+            yield event.plain_result(f"❌ 频道解析失败：{exc}")
+            return
+        # 临时注入资料供 _poll / 头像查找使用，不新增订阅者，不保存到磁盘。
+        old_entry = self.dh.data.get(full_url)
+        if old_entry is None:
+            self.dh.data[full_url] = {"subscribers": {}, "info": {"title": title, "description": desc, "avatar": avatar}}
+        try:
+            items = await self._poll(full_url, num=1)
+            if not items:
+                yield event.plain_result("❌ 该源没有可预览的最新动态。")
+                return
+            item = items[0]
+            status = await self._check_content_safe(item)
+            if status != "SAFE":
+                self.logger.warning("[MyRSS] preview blocked: status=%s route=%s", status, route)
+                yield event.plain_result("🚫 最新动态未通过安全审核，本次不展示内容，也不能确认订阅。")
+                return
+            preview_id = f"P{int(time.time() * 1000):x}{random.randint(0, 0xffff):04x}"
+            origin = event.unified_msg_origin
+            # 每个会话只保留最近一次预览，防止状态堆积或误确认旧目标。
+            for key in [k for k in self._preview_states if k[0] == origin]:
+                del self._preview_states[key]
+            self._preview_states[(origin, preview_id)] = {
+                "created_at": time.time(), "url": full_url, "route": route,
+                "title": title, "consumed": False,
+            }
+            card = await self._make_safe_preview_card(item)
+            if card:
+                yield event.chain_result([Comp.Image.fromBase64(card)])
+            else:
+                yield event.plain_result(f"📡 {title}\n📝 {item.title}\n{item.description}")
+            yield event.plain_result(
+                f"预览编号：{preview_id}\n"
+                "这只是预览，尚未订阅。若确认，请明确说：确认订阅到当前群；"
+                "跨群请由 AstrBot 管理员说：确认订阅到群号。编号 10 分钟内有效。"
+            )
+        finally:
+            if old_entry is None:
+                self.dh.data.pop(full_url, None)
+
+    @filter.llm_tool(name="myrss_manage")
+    async def tool_manage(self, event: AstrMessageEvent, action: str = "list",
+                          preview_id: str = "", target_group: str = "",
+                          keyword: str = "", confirm: bool = False):
+        """管理订阅。订阅必须先安全预览并由用户明确确认；也可列出或取关。
+
+        Args:
+            action(string): list、subscribe 或 unsubscribe
+            preview_id(string): subscribe 时使用预览返回的编号
+            target_group(string): 可选目标群号；跨群仅 AstrBot 管理员
+            keyword(string): unsubscribe 时使用标题、URL关键词或列表编号
+            confirm(bool): 只有用户明确说“确认订阅”时才传 true
+        """
+        action = (action or "list").strip().lower()
+        origin = event.unified_msg_origin
+        if action == "list":
+            urls = self.dh.get_subs(origin)
+            if not urls:
+                yield event.plain_result("当前没有任何订阅。")
+                return
+            lines = ["📋 当前订阅："]
+            for i, feed_url in enumerate(urls):
+                info = self.dh.data[feed_url].get("info", {})
+                cron = self.dh.data[feed_url]["subscribers"][origin].get("cron_expr", "?")
+                lines.append(f" {i}. {info.get('title', feed_url)} [{cron}]")
+            yield event.plain_result("\n".join(lines))
+            return
+        if action == "subscribe":
+            if not confirm:
+                yield event.plain_result("尚未执行：请明确说“确认订阅”，不能仅发送群号。")
+                return
+            state = self._preview_states.get((origin, preview_id))
+            if not state or state.get("consumed") or time.time() - state.get("created_at", 0) > self._preview_ttl_seconds:
+                yield event.plain_result("❌ 预览编号无效、已使用或已过期，请重新预览。")
+                return
+            target_origin = origin
+            if target_group:
+                current_gid = origin.split(":")[-1] if "GroupMessage" in origin else ""
+                if str(target_group) != current_gid:
+                    if not self._is_astrbot_admin(event):
+                        yield event.plain_result("⚠️ 指定其他群仅 AstrBot 管理员可用。")
+                        return
+                    platform = origin.split(":")[0]
+                    target_origin = f"{platform}:GroupMessage:{target_group}"
+            ret = await self._add(state["url"], "*/15 * * * *", event, target_user=target_origin)
+            if isinstance(ret, MessageEventResult):
+                yield ret
+                return
+            state["consumed"] = True
+            self._reload_jobs()
+            yield event.plain_result(f"✅ 已订阅「{ret['title']}」\n目标：{target_origin}\n预览编号已消费。")
+            return
+        if action == "unsubscribe":
+            target_origin = origin
+            if target_group:
+                current_gid = origin.split(":")[-1] if "GroupMessage" in origin else ""
+                if str(target_group) != current_gid and not self._is_astrbot_admin(event):
+                    yield event.plain_result("⚠️ 指定其他群仅 AstrBot 管理员可用。")
+                    return
+                target_origin = f"{origin.split(':')[0]}:GroupMessage:{target_group}"
+            urls = self.dh.get_subs(target_origin)
+            if not urls:
+                yield event.plain_result("目标会话当前没有订阅。")
+                return
+            matches = []
+            if str(keyword).isdigit() and int(keyword) < len(urls):
+                matches = [urls[int(keyword)]]
+            elif keyword:
+                low = keyword.lower()
+                matches = [u for u in urls if low in u.lower() or low in self.dh.data[u].get("info", {}).get("title", "").lower()]
+            if len(matches) != 1:
+                yield event.plain_result("请提供唯一匹配的订阅编号或关键词；可先执行订阅列表。")
+                return
+            feed_url = matches[0]
+            title = self.dh.data[feed_url].get("info", {}).get("title", feed_url)
+            self.dh.data[feed_url].get("subscribers", {}).pop(target_origin, None)
+            self.dh.save()
+            self._reload_jobs()
+            yield event.plain_result(f"✅ 已取关：{title}")
+            return
+        yield event.plain_result("action 只支持 list、subscribe、unsubscribe。")
 
     @filter.command_group("myrss")
     def myrss(self):
@@ -2059,7 +1963,7 @@ class MyRssPlugin(Star):
         cache_key = norm_link or (item.title + "|" + str(item.pubDate_timestamp))
         was_cached = cache_key in self._safe_cache
         safe = await self._check_content_safe(item)
-        if not safe:
+        if safe != "SAFE":
             yield event.plain_result(
                 f"🚫 内容被过滤（判定不安全），不会推送。\\n"
                 f" 缓存命中: {was_cached}\\n"
@@ -2424,9 +2328,9 @@ class MyRssPlugin(Star):
             for gid in gids:
                 # 模糊匹配：群号可能只传了数字
                 to_del = [k for k in subs if gid in k]
-                for k in to_del:
-                    del subs[k]
-                removed.append(k.split(":")[-1])
+                for key in to_del:
+                    del subs[key]
+                    removed.append(key.split(":")[-1])
 
         if removed:
             self.dh.save()
@@ -2437,58 +2341,3 @@ class MyRssPlugin(Star):
             )
         else:
             yield event.plain_result("没有匹配的群号，请检查输入。")
-
-    @filter.llm_tool(name="myrss_batch_unsub")
-    async def tool_batch_unsub(self, event: AstrMessageEvent, keyword: str = "", group_ids: str = "all"):
-        """用户想从某个源批量退订群时调用。如"取消道爷张志顺在所有群的订阅""退订B站xxx的123群和456群"。
-
-        Args:
-            keyword(string): 源名称关键词，如"道爷""张至顺""AnthropicAI"
-            group_ids(string): 群号逗号分隔，或"all"退订所有群
-        """
-        if not keyword:
-            yield event.plain_result("请告诉我要退订哪个源。")
-            return
-
-        # 模糊匹配源
-        target_url = None
-        target_title = None
-        for url, info in self.dh.data.items():
-            if url in ("rsshub_endpoints", "settings"):
-                continue
-            title = info.get("info", {}).get("title", "")
-            if keyword.lower() in title.lower() or keyword.lower() in url.lower():
-                target_url = url
-                target_title = title
-                break
-
-        if not target_url:
-            yield event.plain_result(f"找不到包含「{keyword}」的订阅源。\\n用 /myrss subs 查看所有源。")
-            return
-
-        subs = self.dh.data[target_url].get("subscribers", {})
-        if not subs:
-            yield event.plain_result(f"「{target_title}」没有订阅者。")
-            return
-
-        if group_ids.strip().lower() == "all":
-            removed = [k.split(":")[-1] for k in subs]
-            subs.clear()
-        else:
-            gids = [g.strip() for g in re.split(r'[,，\\s]+', group_ids) if g.strip()]
-            removed = []
-            for gid in gids:
-                to_del = [k for k in subs if gid in k]
-                for k in to_del:
-                    del subs[k]
-                removed.append(k.split(":")[-1])
-
-        if removed:
-            self.dh.save()
-            self._reload_jobs()
-            yield event.plain_result(
-                f"✅ 已从「{target_title}」退订 {len(removed)} 个群:\\n" +
-                "\\n".join(f" - {g}" for g in removed)
-            )
-        else:
-            yield event.plain_result("没有匹配的群号。")
