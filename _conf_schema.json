@@ -76,11 +76,6 @@
     "type": "string",
     "default": ""
   },
-  "content_filter": {
-    "description": "是否过滤不适合推送的内容（反动/暴力/涩情等）",
-    "type": "bool",
-    "default": true
-  },
   "filter_provider_id": {
     "description": "内容过滤用的LLM（建议选便宜快速的）",
     "type": "string",
