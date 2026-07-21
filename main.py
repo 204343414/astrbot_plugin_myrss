@@ -8,7 +8,6 @@ import base64
 import logging
 import asyncio
 import aiohttp
-import calendar
 from io import BytesIO
 from dataclasses import dataclass
 from urllib.parse import urlparse
@@ -610,7 +609,6 @@ class MyRssPlugin(Star):
         # 插件目录（用于存储数据文件，避免 git pull 时丢失）
         # main.py 在 astrbot_plugin_myrss/main.py，数据目录在 astrbot_plugin_myrss/_data/
         _plugin_dir = os.path.dirname(os.path.abspath(__file__))
-        _data_subdir = os.path.join(_plugin_dir, "_data")
         
         # 初始化 DataHandler（插件目录 + 迁移 + 清理）
         seen_links_max_days = max(config.get("seen_links_max_days", 365), 1)
@@ -620,10 +618,6 @@ class MyRssPlugin(Star):
             seen_links_max_days=seen_links_max_days,
             custom_data_dir=custom_data_dir
         )
-
-        # 活跃群数据文件（插件目录下）
-        self._group_data_file = os.path.join(_data_subdir, "_groups.json")
-        self._group_data = self._load_group_data()
 
         self.title_max = config.get("title_max_length", 60)
         self.desc_max = config.get("description_max_length", 200)
@@ -644,31 +638,10 @@ class MyRssPlugin(Star):
         self._comment_cache = {} # key=item_link, value=comment_text
         self._safe_cache = {} # key=item_link, value=bool(safe)
         
-        # 读取自定义审核提示词
-        self.filter_prompt = config.get("filter_prompt", "")
-
-        # 活跃群检测（学新闻插件）
-        self._active_groups = set() # 内存中记录有人说话的群
         self._last_fetch_error = None  # 拉取错误追踪（新版本 _fetch 使用）
-
-        # 全局订阅
-        self.global_feeds = [
-            line.strip() for line in config.get("global_feeds", "").split("\\n")
-            if line.strip() and line.strip().startswith("/")
-        ]
-        self.global_feed_interval = max(config.get("global_feed_interval", 15), 5)
-        self.global_feed_max_interval = max(config.get("global_feed_max_interval", 1440), self.global_feed_interval)
-        self._feed_miss_count = {} # key=url, value=连续无更新次数
-        self._feed_tick = {} # key=url, value=全局订阅触发次数（用于退避skip计数）
         self.push_delay_min = config.get("push_delay_min", 5.0)
         self.push_delay_max = config.get("push_delay_max", 8.0)
         self.filter_provider_id = config.get("filter_provider_id", "")
-        self.safe_mode = config.get("safe_mode", True)
-        self.safe_mode_groups = [g.strip() for g in config.get("safe_mode_groups", "").split(",") if g.strip()]
-        self.group_cooldown_seconds = max(config.get("group_cooldown_minutes", 60), 1) * 60
-        self._group_cooldown = {} # key=group_id, value=上次推送的时间戳
-        self.image_caption_provider_id = config.get("image_caption_provider_id", "")
-
         self.pic = PicHandler(self.adjust_pic)
         self.browserless_url = config.get("browserless_url", "http://browserless:3000")
         self.card = CardGen(browserless_url=self.browserless_url)
@@ -677,9 +650,6 @@ class MyRssPlugin(Star):
         self._locks: dict = {}
         self._data_lock = asyncio.Lock() # 保护 dh.data 读写
         # 推荐系统已移除
-        self._aiocqhttp_bot = None # 缓存 aiocqhttp 的 bot client，用于直连发送
-        self._bot_ready = False # 收到第一条消息后才开始全局推送
-        self._push_lock = asyncio.Lock() # 全局推送发送锁，防止多源同时推同一个群
         # [防冲突] 在创建新调度器前，先杀掉模块级残留的老调度器
         # 场景：插件热更新时框架直接创建新实例，老实例的destroy()可能未被调用
         # 如果不杀，老调度器继续运行老代码的job，和新调度器同时推送→双推
@@ -773,25 +743,10 @@ class MyRssPlugin(Star):
                 self.logger.info("RSS调度: %s 每%d分钟拉取，%d个订阅者", url, max_minutes, len(subs))
             else:
                 self.logger.info("RSS调度: %s 每%d小时拉取，%d个订阅者", url, max_minutes // 60, len(subs))
-        # 重建全局订阅 job（因为 remove_all_jobs 会一并清除）
-        if self.global_feeds:
-            self._setup_global_feeds()
 
     async def _fetch(self, url: str):
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
         to = aiohttp.ClientTimeout(total=30, connect=10)
-
-        def is_local_url(u: str) -> bool:
-            try:
-                parsed = urlparse(u)
-                host = parsed.hostname or ""
-                if host.lower() in ("localhost", "127.0.0.1", "rsshub", "browserless"):
-                    return True
-                if "." not in host:
-                    return True
-                return False
-            except Exception:
-                return False
 
         async def _try(u: str):
             try:
@@ -1029,502 +984,6 @@ class MyRssPlugin(Star):
         }
         self.dh.save()
         return self.dh.data[url]["info"]
-    # ============================================================
-    # 活跃群检测
-    # ============================================================
-
-    def _load_group_data(self) -> dict:
-        # 优先从新路径加载
-        if os.path.exists(self._group_data_file):
-            try:
-                with open(self._group_data_file, "r", encoding="utf-8") as f:
-                    return json.load(f)
-            except Exception:
-                pass
-        # 迁移：从旧路径迁移
-        old_path = "data/astrbot_plugin_myrss/_groups.json"
-        if os.path.exists(old_path):
-            try:
-                with open(old_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                os.makedirs(os.path.dirname(self._group_data_file), exist_ok=True)
-                with open(self._group_data_file, "w", encoding="utf-8") as f:
-                    json.dump(data, f, indent=2, ensure_ascii=False)
-                self.logger.info("[MyRSS] 迁移群数据: %s -> %s", old_path, self._group_data_file)
-                return data
-            except Exception:
-                pass
-        return {"groups": {}, "blocked_feeds": {}}
-    # blocked_feeds 结构: { "群unified_id": ["/twitter/user/elonmusk", ...] }
-
-    def _save_group_data(self):
-        try:
-            os.makedirs(os.path.dirname(self._group_data_file), exist_ok=True)
-            with open(self._group_data_file, "w", encoding="utf-8") as f:
-                json.dump(self._group_data, f, indent=2, ensure_ascii=False)
-        except Exception as e:
-            self.logger.error("[MyRSS] save group data failed: %s", e)
-
-    # ============================================================
-    # 无效群自动清理（保守模式：仅匹配明确“群不存在/被踢”错误字符串）
-    # ============================================================
-    _INVALID_GROUP_KEYWORDS = [
-        "group not found", "群不存在", "群号不存在", "not a member", "你已不在该群",
-        "kicked", "已被踢出", "not in group", "群被踢", "群已解散", "群不存在或已解散"
-    ]
-
-    def _is_invalid_group_error(self, err: Exception) -> bool:
-        """保守判断：只有错误消息中包含明确无效群关键词才触发清理"""
-        if not err:
-            return False
-        msg = str(err).lower()
-        return any(kw.lower() in msg for kw in self._INVALID_GROUP_KEYWORDS)
-
-    def _prune_invalid_group(self, group_id: str, reason: str = ""):
-        """检测到群无效（被踢/不存在）时，从所有订阅和全局数据中移除该群。
-        使用已有原子保存方法（dh.save + _save_group_data），绝不影响 seen_links 去重逻辑。
-        """
-        if not group_id:
-            return
-        target_unified = group_id if ":" in group_id else f"aiocqhttp:GroupMessage:{group_id}"
-
-        removed_count = 0
-        # 1. 从所有个人订阅源移除
-        for url, info in list(self.dh.data.items()):
-            if url in ("rsshub_endpoints", "settings"):
-                continue
-            subs = info.get("subscribers", {})
-            to_del = [k for k in subs if group_id in k or target_unified in k]
-            for k in to_del:
-                del subs[k]
-                removed_count += 1
-
-        # 2. 清理群活跃/禁用状态
-        if target_unified in self._group_data.get("groups", {}):
-            self._group_data["groups"][target_unified]["disabled"] = True
-            self._group_data["groups"][target_unified]["active"] = False
-            self._group_data["groups"][target_unified]["dormant"] = True
-
-        if target_unified in self._group_data.get("disabled_groups", []):
-            # already disabled ok
-            pass
-        else:
-            self._group_data.setdefault("disabled_groups", []).append(target_unified)
-
-        self._active_groups.discard(target_unified)
-        self._group_cooldown.pop(target_unified, None)
-
-        # 3. 原子保存（已有实现）
-        try:
-            self.dh.save()
-            self._save_group_data()
-            self._reload_jobs()
-            self.logger.info("[MyRSS] 已自动清理无效群 %s (原因: %s)，共移除 %d 条订阅", target_unified, reason or "推送失败", removed_count)
-        except Exception as e:
-            self.logger.error("[MyRSS] prune group failed: %s", e)
-
-    def _load_recs(self) -> dict:
-        # 优先从新路径加载
-        if os.path.exists(self._recs_file):
-            try:
-                with open(self._recs_file, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                now = time.time()
-                expired = [k for k, v in data.items() if now - v.get("created_at", 0) > 86400]
-                for k in expired:
-                    del data[k]
-                return data
-            except Exception:
-                pass
-        # 迁移：从旧路径迁移
-        old_path = "data/astrbot_plugin_myrss/_recs.json"
-        if os.path.exists(old_path):
-            try:
-                with open(old_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                os.makedirs(os.path.dirname(self._recs_file), exist_ok=True)
-                with open(self._recs_file, "w", encoding="utf-8") as f:
-                    json.dump(data, f, indent=2, ensure_ascii=False)
-                self.logger.info("[MyRSS] 迁移推荐数据: %s -> %s", old_path, self._recs_file)
-                return data
-            except Exception:
-                pass
-        return {}
-
-    def _save_recs(self):
-        try:
-            os.makedirs(os.path.dirname(self._recs_file), exist_ok=True)
-            with open(self._recs_file, "w", encoding="utf-8") as f:
-                json.dump(self._pending_recs, f, indent=2, ensure_ascii=False)
-        except Exception as e:
-            self.logger.error("[MyRSS] save recs failed: %s", e)
-
-    
-
-    def _mark_active(self, unified_id: str):
-        """标记某个群有人说话"""
-        if "GroupMessage" not in unified_id:
-            return
-        # 已禁用的群不记录活跃
-        if self._group_data["groups"].get(unified_id, {}).get("disabled", False):
-            return
-        # 双重检查：disabled_groups 列表
-        if unified_id in self._group_data.get("disabled_groups", []):
-            return
-        self._active_groups.add(unified_id)
-        if unified_id not in self._group_data["groups"]:
-            self._group_data["groups"][unified_id] = {
-                "active": True,
-                "dormant": False,
-                "last_activity": int(time.time()),
-            }
-        else:
-            self._group_data["groups"][unified_id]["active"] = True
-            self._group_data["groups"][unified_id]["dormant"] = False
-            self._group_data["groups"][unified_id]["last_activity"] = int(time.time())
-
-    def _get_active_groups(self) -> list:
-        """获取所有活跃群的unified_id列表"""
-        disabled = set(self._group_data.get("disabled_groups", []))
-        result = []
-        for uid, info in self._group_data["groups"].items():
-            if uid in disabled:
-                continue
-            if info.get("active") and not info.get("dormant") and not info.get("disabled", False):
-                result.append(uid)
-        return result
-
-    def _reset_activity(self):
-        """推送后重置活跃状态，等下次有人说话"""
-        for uid in self._group_data["groups"]:
-            self._group_data["groups"][uid]["active"] = uid in self._active_groups
-        self._active_groups.clear()
-        self._save_group_data()
-
-    @filter.regex(r"[\\s\\S]*")
-    async def _catch_activity(self, event: AstrMessageEvent):
-        """捕获所有消息：活跃度 + bot缓存 + 投票检测"""
-        if hasattr(event, "unified_msg_origin"):
-            self._mark_active(event.unified_msg_origin)
-        if self._aiocqhttp_bot is None:
-            try:
-                if hasattr(event, 'bot') and event.bot is not None:
-                    self._aiocqhttp_bot = event.bot
-                    self.logger.info("[MyRSS] cached aiocqhttp bot client")
-                    self._bot_ready = True
-            except Exception:
-                pass
-        if not self._bot_ready:
-            self._bot_ready = True
-        # 投票检测
-        # 推荐投票已移除
-    # ============================================================
-    # 全局订阅
-    # ============================================================
-
-    def _setup_global_feeds(self):
-        """为全局订阅源注册定时任务（用最短间隔，在job内部动态跳过）"""
-        eps = self.dh.data.get("rsshub_endpoints", [])
-        if not eps:
-            self.logger.warning("[MyRSS] no endpoints for global feeds")
-            return
-
-        for route in self.global_feeds:
-            url = eps[0].rstrip("/") + route
-
-            if url not in self.dh.data:
-                self.dh.data[url] = {
-                    "subscribers": {},
-                    "info": {"title": route, "description": "全局订阅"},
-                    "global": True,
-                }
-            self.dh.data[url]["global"] = True
-            self._feed_miss_count[url] = 0
-            self._feed_tick[url] = 0
-
-            # 用基础间隔注册，退避在job内部通过跳过实现
-            base = self.global_feed_interval
-            if base < 60:
-                cron = f"*/{base} * * * *"
-            else:
-                cron = f"0 */{base // 60} * * *"
-
-            job_id = f"myrss_global_{url}"
-            self.sched.add_job(
-                self._global_feed_job, "cron",
-                **self._cron(cron),
-                args=[url],
-                id=job_id,
-                replace_existing=True,
-                misfire_grace_time=120,
-            )
-            self.logger.info("[MyRSS] global feed: %s base=%dmin", route, base)
-
-        self.dh.save()
-
-    def _get_current_interval(self, url: str) -> int:
-        """根据连续miss次数计算当前间隔（分钟）"""
-        miss = self._feed_miss_count.get(url, 0)
-        base = self.global_feed_interval
-
-        # 每3次miss翻倍: 0-2次=base, 3-5次=2x, 6-8次=4x, 9-11次=8x...
-        multiplier = 2 ** (miss // 3)
-        current = base * multiplier
-
-        return min(current, self.global_feed_max_interval)
-
-    def _should_skip_this_tick(self, url: str) -> bool:
-        """判断本次tick是否应该跳过（实现退避）
-        修复点：不能用 miss 做取模（skip 时 miss 不变，会导致永远 skip）
-        改为用 tick（每次触发都会增长）来决定"每N次触发执行一次"
-        """
-        miss = self._feed_miss_count.get(url, 0)
-        if miss < 3:
-            return False # 前3次不跳
-
-        current_interval = self._get_current_interval(url)
-        base = self.global_feed_interval
-        if base <= 0:
-            return False
-
-        # 需要每多少次基础tick执行一次
-        skip_ratio = max(1, current_interval // base)
-
-        tick = self._feed_tick.get(url, 0)
-        # 每 skip_ratio 次触发执行 1 次，其它时候跳过
-        return (tick % skip_ratio) != 0
-    
-    async def _global_feed_job(self, url: str):
-        """全局订阅的定时推送（带指数退避）"""
-        await self._global_feed_job_inner(url)
-
-    async def _global_feed_job_inner(self, url: str):
-        """全局推送实际逻辑（被 _data_lock 保护）"""
-        # tick自增：每次触发都+1，用于退避skip计数
-        self._feed_tick[url] = self._feed_tick.get(url, 0) + 1
-
-        # 退避检查：是否跳过本次
-        if self._should_skip_this_tick(url):
-            return
-        # 等 bot 就绪（收到过至少一条消息）
-        if not self._bot_ready:
-            self.logger.info("[MyRSS] bot not ready yet (no message received since startup), skip")
-            return
-        current_interval = self._get_current_interval(url)
-        miss = self._feed_miss_count.get(url, 0)
-        self.logger.info("[MyRSS] global feed job: %s (miss=%d, interval=%dmin)", url, miss, current_interval)
-
-        async with self._data_lock:
-            self.dh.data = self.dh._load()
-
-        # 获取全局seen_links
-        if url not in self.dh.data:
-            return
-        feed_data = self.dh.data[url]
-        seen = set(feed_data.get("global_seen_links", []))
-
-        items = await self._poll(url, num=self.max_poll, after_ts=feed_data.get("global_last_update", 0))
-        if not items:
-            self._feed_miss_count[url] = self._feed_miss_count.get(url, 0) + 1
-            new_interval = self._get_current_interval(url)
-            self.logger.info("[MyRSS] no new items, miss=%d, next check ~%dmin",
-                             self._feed_miss_count[url], new_interval)
-            return
-
-        def item_key(it):
-            if it.link:
-                # 归一化：去掉 query / fragment，避免同一条推文因为参数不同被当成新内容
-                return it.link.split("#", 1)[0].split("?", 1)[0]
-            return f"{it.title}|{it.pubDate_timestamp}"
-
-        new_items = [it for it in items if item_key(it) not in seen]
-        if not new_items:
-            self._feed_miss_count[url] = self._feed_miss_count.get(url, 0) + 1
-            return
-
-        # 内容过滤（增强版）
-        safe_items = []
-        for it in new_items:
-            if self.content_filter:
-                status = await self._check_content_safe(it)
-                if status == "SAFE":
-                    safe_items.append(it)
-                elif status == "MALICIOUS":
-                    self.logger.warning("[MyRSS] MALICIOUS global feed filtered: %s", it.title[:30])
-                    # 可在此处触发自动取关逻辑（可选）
-                else:
-                    self.logger.info("[MyRSS] REJECT global feed filtered: %s", it.title[:30])
-            else:
-                safe_items.append(it)
-
-        if not safe_items:
-            # 更新seen即使被过滤
-            new_keys = [item_key(it) for it in new_items]
-            feed_data["global_seen_links"] = (new_keys + feed_data.get("global_seen_links", []))[:200]
-            ts_list = [it.pubDate_timestamp for it in new_items if it.pubDate_timestamp > 0]
-            if ts_list:
-                feed_data["global_last_update"] = max(ts_list)
-            self.dh.save()
-            return
-
-        # 更新seen_links（推送前，防重复）
-        new_keys = [item_key(it) for it in safe_items]
-        feed_data["global_seen_links"] = (new_keys + feed_data.get("global_seen_links", []))[:200]
-        ts_list = [it.pubDate_timestamp for it in safe_items if it.pubDate_timestamp > 0]
-        if ts_list:
-            feed_data["global_last_update"] = max(ts_list)
-        self.dh.save()
-
-        # 生成卡片（只生成一次，推给所有群）
-        batch = safe_items[:5]
-        if len(batch) > 1:
-            cards = [await self._make_card_b64(it) for it in batch]
-            cards = [c for c in cards if c]
-            if cards:
-                merged = self._merge_cards_b64(cards)
-                comps = [Comp.Image.fromBase64(merged)] if merged else None
-            else:
-                comps = None
-        elif batch:
-            comps = await self._make_comps(batch[0])
-        else:
-            return
-
-        if not comps:
-            return
-
-        # 推送给所有活跃群（排除屏蔽了该源的群）
-        # [安全模式] 如果开启，只推送到指定的测试群
-        if self.safe_mode:
-            if not self.safe_mode_groups:
-                self.logger.warning("[MyRSS] safe_mode ON but no test groups configured, skip push")
-                return
-            # [修复] 过滤掉被 unbind 禁用的群
-            disabled = set(self._group_data.get("disabled_groups", []))
-            active_groups = []
-            for gid in self.safe_mode_groups:
-                unified = f"aiocqhttp:GroupMessage:{gid}"
-                if unified not in disabled:
-                    active_groups.append(unified)
-                else:
-                    self.logger.info("[MyRSS] safe_mode: 跳过已禁用的群 %s", gid)
-            if not active_groups:
-                self.logger.info("[MyRSS] safe_mode: 所有测试群都被禁用，跳过本次推送")
-                return
-            self.logger.info("[MyRSS] safe_mode ON, pushing to test groups: %s", active_groups)
-        else:
-            active_groups = self._get_active_groups()
-        # 从URL提取路由部分用于匹配屏蔽列表
-        eps = self.dh.data.get("rsshub_endpoints", [])
-        feed_route = url
-        for ep in eps:
-            ep = ep.rstrip("/")
-            if url.startswith(ep):
-                feed_route = url[len(ep):]
-                break
-
-        blocked = self._group_data.get("blocked_feeds", {})
-        disabled = set(self._group_data.get("disabled_groups", []))
-        push_groups = [g for g in active_groups if feed_route not in blocked.get(g, []) and g not in disabled]
-        # 如果某群已经"自己订阅"了同一个源，就不再给它推全局，避免重复
-        personal_subs = set(self.dh.data.get(url, {}).get("subscribers", {}).keys())
-        push_groups = [g for g in push_groups if g not in personal_subs]
-        # 冷却期检查：跳过最近已经推送过的群
-        now = time.time()
-        cooled_groups = []
-        skipped_cooldown = 0
-        for g in push_groups:
-            last_push = self._group_cooldown.get(g, 0)
-            if now - last_push >= self.group_cooldown_seconds:
-                cooled_groups.append(g)
-            else:
-                skipped_cooldown += 1
-                remaining = int((self.group_cooldown_seconds - (now - last_push)) / 60)
-                self.logger.info("[MyRSS] group %s in cooldown, skip (%d min remaining)", g, remaining)
-        push_groups = cooled_groups
-
-        self.logger.info("[MyRSS] global push %d items to %d groups (skipped %d blocked, %d cooldown)",
-                         len(batch), len(push_groups),
-                         len(active_groups) - len(push_groups) - skipped_cooldown, skipped_cooldown)
-
-        # 给推送内容加上退订提示
-        push_comps = list(comps) # 复制一份，不污染原始 comps
-        push_comps.append(Comp.Plain("\\n💡 如需退订本群推送，请@我说「屏蔽xxx」"))
-
-        async with self._push_lock:
-            for group_id in push_groups:
-                # 再次检查冷却（可能被另一个源刚设上）
-                if time.time() - self._group_cooldown.get(group_id, 0) < self.group_cooldown_seconds:
-                    self.logger.info("[MyRSS] group %s cooldown set by another source, skip", group_id)
-                    continue
-                try:
-                    pn = group_id.split(":")[0]
-                    ret = None
-
-                    send_ok = False
-                    try:
-                        if pn == "aiocqhttp" and self.compose:
-                            node = Comp.Node(uin=0, name="Astrbot", content=push_comps)
-                            ret = await self.ctx.send_message(group_id, MessageChain(chain=[node], use_t2i_=self.t2i))
-                        else:
-                            ret = await self.ctx.send_message(group_id, MessageChain(chain=push_comps, use_t2i_=self.t2i))
-                        send_ok = True  # 没抛异常 = 发送成功
-                    except Exception:
-                        ret = False
-
-                    # ctx.send_message 失败 → 用 aiocqhttp 底层 API 直连
-                    if send_ok:
-                        ret = True  # 明确标记成功，确保冷却时间被记录
-                    if (ret is None or ret is False) and pn == "aiocqhttp" and self._aiocqhttp_bot:
-                        try:
-                            gid_num = int(group_id.split(":")[-1])
-                            segments = []
-                            for comp in push_comps:
-                                if hasattr(comp, 'file') and comp.file and comp.file.startswith("base64://"):
-                                    segments.append({"type": "image", "data": {"file": comp.file}})
-                                elif hasattr(comp, 'text'):
-                                    segments.append({"type": "text", "data": {"text": comp.text}})
-
-                            if self.compose:
-                                forward_node = {
-                                    "type": "node",
-                                    "data": {"uin": "0", "name": "Astrbot", "content": segments}
-                                }
-                                await self._aiocqhttp_bot.send_group_forward_msg(
-                                    group_id=gid_num, messages=[forward_node]
-                                )
-                            else:
-                                await self._aiocqhttp_bot.send_group_msg(
-                                    group_id=gid_num, message=segments
-                                )
-                            ret = True
-                            self.logger.info("[MyRSS] push ok (direct API) to %s", group_id)
-                        except Exception as e2:
-                            self.logger.error("[MyRSS] direct API push also failed to %s: %s", group_id, e2)
-                            ret = False
-
-                    if ret is not None and ret is not False:
-                        self._group_cooldown[group_id] = time.time()
-                        if ret is not True:
-                            self.logger.info("[MyRSS] push ok to %s", group_id)
-                    else:
-                        self.logger.warning("[MyRSS] push to %s failed all methods", group_id)
-                        # 保守清理：仅在明确“群不存在/被踢”错误时移除
-                        if self._is_invalid_group_error(e) if 'e' in locals() else False:
-                            self._prune_invalid_group(group_id, "global push error")
-
-                    delay = random.uniform(self.push_delay_min, self.push_delay_max)
-                    await asyncio.sleep(delay)
-
-                except Exception as e:
-                    self.logger.error("[MyRSS] global push failed to %s: %s", group_id, e)
-                    if self._is_invalid_group_error(e):
-                        self._prune_invalid_group(group_id, "global push exception")
-        # 有新内容推送了，重置退避
-        self._feed_miss_count[url] = 0
-        self._feed_tick[url] = 0
-        self._reset_activity()
-        self.logger.info("[MyRSS] global push done")
 
     async def _get_provider_id(self) -> str:
         """获取锐评用的provider ID"""
@@ -1690,11 +1149,6 @@ class MyRssPlugin(Star):
             self.logger.error("[MyRSS] content filter failed, treat as REJECT: %s", e)
             self._safe_cache[cache_key] = "REJECT"
             return "REJECT"
-
-    # 兼容旧布尔调用（保持向后兼容）
-    async def _check_content_safe_bool(self, item: RSSItem) -> bool:
-        status = await self._check_content_safe(item)
-        return status == "SAFE"
 
     def _get_avatar_url(self, item: RSSItem) -> str:
         """从存储的订阅数据里获取频道头像URL"""
@@ -1904,12 +1358,6 @@ class MyRssPlugin(Star):
                 delay = random.uniform(self.push_delay_min, self.push_delay_max)
                 await asyncio.sleep(delay)
 
-    async def _cron_cb(self, url: str, user: str) -> None:
-        """带锁的定时回调入口，防止同一订阅并发执行"""
-        lock = self._get_lock(url, user)
-        async with lock:
-            await self._cron_cb_inner(url, user)
-
     async def _cron_cb_inner(self, url: str, user: str, prefetched_items=None) -> None:
         await self._cron_cb_inner_impl(url, user, prefetched_items)
 
@@ -2117,13 +1565,6 @@ class MyRssPlugin(Star):
         )
         return
 
-        ret = await self._add(furl, cron_expr, event)
-        if isinstance(ret, MessageEventResult):
-            yield ret
-            return
-        self._reload_jobs()
-        yield event.plain_result("✅ 订阅成功！\\n📡 " + ret["title"] + "\\n📝 " + ret["description"] + "\\n⏰ 每" + str(show_interval) + unit + "\\n🔗 " + furl)
-
     @filter.llm_tool(name="myrss_list")
     async def tool_list(self, event: AstrMessageEvent, query: str = "all"):
         """用户问订阅了什么时调用。
@@ -2142,100 +1583,6 @@ class MyRssPlugin(Star):
             cr = self.dh.data[u]["subscribers"][user]["cron_expr"]
             txt += " " + str(i) + ". " + info["title"] + " [" + cr + "]\\n"
         yield event.plain_result(txt)
-
-    @filter.llm_tool(name="myrss_block_feed")
-    async def tool_block(self, event: AstrMessageEvent, feed_keyword: str = ""):
-        """当群友说不想看某个订阅源的推送时调用（如"别发推特了""不要马斯克的"）。
-
-        Args:
-            feed_keyword(string): 要屏蔽的源关键词（如elonmusk、flag__chan、bilibili等）
-        """
-        if not feed_keyword:
-            yield event.plain_result(
-                "请告诉我要屏蔽哪个源。当前全局订阅源：\\n" +
-                "\\n".join(f" {i}. {r}" for i, r in enumerate(self.global_feeds)) +
-                "\\n回复关键词即可屏蔽，如 'elonmusk' 或 'bilibili'"
-            )
-            return
-
-        group_id = event.unified_msg_origin
-        if "GroupMessage" not in group_id:
-            yield event.plain_result("此功能仅在群聊中可用。")
-            return
-
-        # 模糊匹配
-        matched = []
-        for route in self.global_feeds:
-            if feed_keyword.lower() in route.lower():
-                matched.append(route)
-
-        if not matched:
-            yield event.plain_result(
-                f"没找到包含 '{feed_keyword}' 的订阅源。当前全局源：\\n" +
-                "\\n".join(f" {r}" for r in self.global_feeds)
-            )
-            return
-
-        blocked = self._group_data.setdefault("blocked_feeds", {})
-        group_blocked = blocked.setdefault(group_id, [])
-
-        newly_blocked = []
-        for route in matched:
-            if route not in group_blocked:
-                group_blocked.append(route)
-                newly_blocked.append(route)
-
-        if not newly_blocked:
-            yield event.plain_result("这些源在本群已经屏蔽了：\\n" + "\\n".join(matched))
-            return
-
-        self._save_group_data()
-        yield event.plain_result(
-            "已在本群屏蔽以下推送：\\n" +
-            "\\n".join(f" ✅ {r}" for r in newly_blocked) +
-            "\\n其他群不受影响。如需恢复，说'恢复推送xxx'即可。"
-        )
-
-    @filter.llm_tool(name="myrss_unblock_feed")
-    async def tool_unblock(self, event: AstrMessageEvent, feed_keyword: str = ""):
-        """当群友说想恢复某个被屏蔽的推送时调用。
-
-        Args:
-            feed_keyword(string): 要恢复的源关键词
-        """
-        group_id = event.unified_msg_origin
-        if "GroupMessage" not in group_id:
-            yield event.plain_result("此功能仅在群聊中可用。")
-            return
-
-        blocked = self._group_data.get("blocked_feeds", {})
-        group_blocked = blocked.get(group_id, [])
-
-        if not group_blocked:
-            yield event.plain_result("本群没有屏蔽任何全局推送源。")
-            return
-
-        if not feed_keyword:
-            yield event.plain_result(
-                "本群当前屏蔽的源：\\n" +
-                "\\n".join(f" {i}. {r}" for i, r in enumerate(group_blocked)) +
-                "\\n告诉我要恢复哪个即可。"
-            )
-            return
-
-        matched = [r for r in group_blocked if feed_keyword.lower() in r.lower()]
-        if not matched:
-            yield event.plain_result(f"没找到包含 '{feed_keyword}' 的已屏蔽源。")
-            return
-
-        for r in matched:
-            group_blocked.remove(r)
-        self._save_group_data()
-
-        yield event.plain_result(
-            "已在本群恢复以下推送：\\n" +
-            "\\n".join(f" ✅ {r}" for r in matched)
-        )
 
     @filter.llm_tool(name="myrss_preview")
     async def tool_preview(self, event: AstrMessageEvent, url: str = ""):
@@ -2751,8 +2098,6 @@ class MyRssPlugin(Star):
             "✅ 测试完成！\\n"
             f" 过滤缓存大小: {len(self._safe_cache)}\\n"
             f" 锐评缓存大小: {len(self._comment_cache)}\\n"
-            f" 安全模式: {'开启' if self.safe_mode else '关闭'}\\n"
-            f" 测试群: {','.join(self.safe_mode_groups) if self.safe_mode_groups else '未配置'}\\n"
             "再次执行同样的命令可验证缓存是否命中（应显示 True）"
         )
 
@@ -2802,61 +2147,6 @@ class MyRssPlugin(Star):
         except Exception as e:
             self.logger.error("[MyRSS] get group list failed: %s", e, exc_info=True)
             yield event.plain_result("获取群列表失败：" + str(e))
-
-    @myrss.command("cooldown")
-    async def cmd_cooldown(self, event: AstrMessageEvent):
-        """查看各群的全局推送冷却状态"""
-        if not self._group_cooldown:
-            yield event.plain_result("当前没有任何群在冷却期内。")
-            return
-        now = time.time()
-        lines = ["📋 全局推送冷却状态："]
-        for gid, ts in sorted(self._group_cooldown.items(), key=lambda x: x[1], reverse=True):
-            elapsed = now - ts
-            remaining = self.group_cooldown_seconds - elapsed
-            if remaining > 0:
-                lines.append(f" 🔴 {gid} - 剩余 {int(remaining/60)} 分钟")
-            else:
-                lines.append(f" 🟢 {gid} - 已就绪")
-        yield event.plain_result("\\n".join(lines))
-
-    @myrss.command("resetglobal")
-    async def cmd_resetglobal(self, event: AstrMessageEvent):
-        """重置全局订阅的已推送记录，下次检查时重新推送"""
-        count = 0
-        for url, info in self.dh.data.items():
-            if url in ("rsshub_endpoints", "settings"):
-                continue
-            if info.get("global"):
-                info["global_seen_links"] = []
-                info["global_last_update"] = 0
-                count += 1
-        self.dh.save()
-        self._feed_miss_count.clear()
-        self._feed_tick.clear()
-        self._group_cooldown.clear()
-        yield event.plain_result(f"✅ 已重置 {count} 个全局源的推送记录和冷却\\n下次检查（~5分钟内）将重新推送")
-
-    
-
-    
-
-    async def _is_group_admin(self, group_id: str, user_id: str) -> bool:
-        """判断用户是否为群主或管理员"""
-        if not self._aiocqhttp_bot:
-            return False
-        try:
-            gid = int(group_id.split(":")[-1]) if ":" in group_id else int(group_id)
-            uid = int(user_id)
-            info = await self._aiocqhttp_bot.get_group_member_info(
-                group_id=gid, user_id=uid, no_cache=True
-            )
-            if isinstance(info, dict):
-                return info.get("role", "member") in ("owner", "admin")
-            return False
-        except Exception as e:
-            self.logger.warning("[MyRSS] get member info failed: %s", e)
-            return False
 
     # ============================================================
     # AstrBot 管理员权限 + 全局恶意黑名单
@@ -2925,7 +2215,7 @@ class MyRssPlugin(Star):
             if url in ("rsshub_endpoints", "settings"):
                 continue
             subs = info.get("subscribers", {})
-            if not subs and not info.get("global"):
+            if not subs:
                 continue
             title = info.get("info", {}).get("title", url)
             lines.append(f"\\n{idx}. 📡 {title}")
@@ -2946,109 +2236,33 @@ class MyRssPlugin(Star):
 
     @myrss.command("unbind")
     async def cmd_unbind(self, event: AstrMessageEvent, group_id: str = ""):
-        """把指定群从**所有订阅源+全局推送**中踢掉，并禁用该群的推送。
-        用法：/myrss unbind 721058477
-        """
+        """把指定群从所有订阅源中退订。用法：/myrss unbind 721058477"""
         if not group_id:
-            yield event.plain_result(
-                "用法: /myrss unbind <群号>\\n"
-                " 先用 /myrss subs 查看所有群号和订阅关系"
-            )
+            yield event.plain_result("用法: /myrss unbind <群号>\n 先用 /myrss subs 查看所有群号和订阅关系")
             return
 
-        gids = [g.strip() for g in re.split(r'[,，\\s]+', group_id) if g.strip()]
-        total_removed = 0
+        gids = [g.strip() for g in re.split(r'[,，\s]+', group_id) if g.strip()]
         removed_per_group = {}
-
         for target_gid in gids:
             removed = 0
-            # 构造该群的 unified_id
-            target_unified = f"aiocqhttp:GroupMessage:{target_gid}"
-            
-            # 1. 从所有订阅源中移除该群
             for url, info in self.dh.data.items():
                 if url in ("rsshub_endpoints", "settings"):
                     continue
                 subs = info.get("subscribers", {})
-                # 模糊匹配：群号可能只传了数字
-                to_del = [k for k in subs if target_gid in k]
-                for k in to_del:
-                    del subs[k]
+                for key in [k for k in subs if target_gid in k]:
+                    del subs[key]
                     removed += 1
             removed_per_group[target_gid] = removed
-            total_removed += removed
 
-            # 2. [关键修复] 强制标记为 disabled，无论是否找到订阅者
-            #    防止 _mark_active 和 _get_active_groups 继续处理该群
-            if target_unified not in self._group_data.get("groups", {}):
-                self._group_data.setdefault("groups", {})[target_unified] = {
-                    "active": False, "dormant": True, "disabled": True,
-                    "last_activity": 0
-                }
-            else:
-                self._group_data["groups"][target_unified]["disabled"] = True
-                self._group_data["groups"][target_unified]["active"] = False
-                self._group_data["groups"][target_unified]["dormant"] = True
-            
-            # 3. 从内存活跃集合中移除
-            self._active_groups.discard(target_unified)
-            
-            # 4. 从 disabled_groups 列表中也记录（双重保险）
-            if target_unified not in self._group_data.get("disabled_groups", []):
-                self._group_data.setdefault("disabled_groups", []).append(target_unified)
-            
-            # 5. 清除该群的冷却时间（防止冷却过期后又推送）
-            self._group_cooldown.pop(target_unified, None)
-
-        # 6. 保存所有数据
-        self.dh.save()
-        self._save_group_data()
-        self._reload_jobs()
-        
-        if total_removed > 0:
-            details = "\\n".join(
-                f" 群 {gid}: 退订 {cnt} 个源，已禁用全局推送，清除活跃状态"
-                for gid, cnt in removed_per_group.items() if cnt > 0
-            )
-            yield event.plain_result(
-                f"✅ 已从所有订阅源中踢出指定群，共 {total_removed} 条：\\n{details}\\n\\n"
-                f"该群已被永久禁用推送，直到你使用 /myrss enable <群号> 恢复。"
-            )
+        total_removed = sum(removed_per_group.values())
+        if total_removed:
+            self.dh.save()
+            self._reload_jobs()
+            details = "\n".join(f" 群 {gid}: 退订 {count} 个源" for gid, count in removed_per_group.items() if count)
+            yield event.plain_result(f"✅ 已退订，共 {total_removed} 条：\n{details}")
         else:
-            yield event.plain_result(
-                f"✅ 已禁用指定群的全局推送：{', '.join(gids)}\\n"
-                f"(未发现个人订阅，但已设置禁用标记)\\n"
-                f"如需恢复，使用 /myrss enable {','.join(gids)}"
-            )
+            yield event.plain_result(f"未发现指定群的订阅：{', '.join(gids)}")
 
-    @myrss.command("enable")
-    async def cmd_enable(self, event: AstrMessageEvent, group_id: str = ""):
-        """恢复被 /myrss unbind 禁用的群的推送。
-        用法：/myrss enable 721058477
-        """
-        if not group_id:
-            yield event.plain_result("用法: /myrss enable <群号>")
-            return
-
-        gids = [g.strip() for g in re.split(r'[,，\s]+', group_id) if g.strip()]
-        enabled = []
-        for target_gid in gids:
-            target_unified = f"aiocqhttp:GroupMessage:{target_gid}"
-            if target_unified in self._group_data.get("groups", {}):
-                if self._group_data["groups"][target_unified].get("disabled", False):
-                    self._group_data["groups"][target_unified]["disabled"] = False
-                    enabled.append(target_gid)
-            disabled_list = self._group_data.get("disabled_groups", [])
-            if target_unified in disabled_list:
-                disabled_list.remove(target_unified)
-                if target_gid not in enabled:
-                    enabled.append(target_gid)
-
-        if enabled:
-            self._save_group_data()
-            yield event.plain_result(f"✅ 已恢复以下群的推送：{', '.join(enabled)}")
-        else:
-            yield event.plain_result(f"群 {group_id} 未被禁用，无需恢复。")
     @myrss.command("reset")
     async def cmd_reset(self, event: AstrMessageEvent):
         """重置所有订阅源的推送基准。
@@ -3223,41 +2437,6 @@ class MyRssPlugin(Star):
             )
         else:
             yield event.plain_result("没有匹配的群号，请检查输入。")
-
-    @filter.llm_tool(name="myrss_cancel_recommend")
-    async def tool_cancel_rec(self, event: AstrMessageEvent, rec_id: str = "all"):
-        """用户想撤回/取消之前发出的推荐时调用。
-
-        Args:
-            rec_id(string): 推荐编号如R78813，或"all"撤回全部
-        """
-        if not self._pending_recs:
-            yield event.plain_result("当前没有待处理的推荐。")
-            return
-
-        if rec_id.lower() == "all":
-            count = 0
-            titles = []
-            for rid, rec in self._pending_recs.items():
-                for gid, gs in rec.get("groups", {}).items():
-                    if gs.get("status") == "pending":
-                        gs["status"] = "cancelled"
-                        count += 1
-                        titles.append(rec.get("title", "未知"))
-            self._save_recs()
-            yield event.plain_result(f"✅ 已撤回所有待定推荐（{count}个群）\\n涉及: {', '.join(set(titles))}")
-        else:
-            if rec_id not in self._pending_recs:
-                yield event.plain_result(f"找不到编号 {rec_id}")
-                return
-            rec = self._pending_recs[rec_id]
-            count = 0
-            for gid, gs in rec.get("groups", {}).items():
-                if gs.get("status") == "pending":
-                    gs["status"] = "cancelled"
-                    count += 1
-            self._save_recs()
-            yield event.plain_result(f"✅ 已撤回推荐「{rec.get('title', '')}」（{count}个群）")
 
     @filter.llm_tool(name="myrss_batch_unsub")
     async def tool_batch_unsub(self, event: AstrMessageEvent, keyword: str = "", group_ids: str = "all"):
