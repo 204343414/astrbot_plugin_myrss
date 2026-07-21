@@ -972,8 +972,8 @@ class MyRssPlugin(Star):
 
         return result
 
-    async def _add(self, url: str, cron_expr: str, event: AstrMessageEvent):
-        user = event.unified_msg_origin
+    async def _add(self, url: str, cron_expr: str, event: AstrMessageEvent, target_user: str = None):
+        user = target_user if target_user else event.unified_msg_origin
 
         async def poll_with_retry(u: str, retries: int = 3, sleep_s: int = 5):
             last = []
