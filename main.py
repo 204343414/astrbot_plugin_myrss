@@ -2530,7 +2530,12 @@ class MyRssPlugin(Star):
             return
         yield event.plain_result("action 只支持 list、subscribe、unsubscribe。")
 
-    @filter.command("面板", alias={"控制面板", "菜单"})
+    @filter.command_group("myrss")
+    def myrss(self):
+        pass
+
+
+    @myrss.command("面板")
     async def command_panel(self, event: AstrMessageEvent):
         """向当前 QQ 官方群发送一张 Markdown＋Keyboard 控制面板。"""
         origin = event.unified_msg_origin
@@ -2542,10 +2547,6 @@ class MyRssPlugin(Star):
             event.stop_event()
         except Exception as exc:
             yield event.plain_result(f"控制面板发送失败：{exc}")
-
-    @filter.command_group("myrss")
-    def myrss(self):
-        pass
 
     @myrss.command("eye")
     async def cmd_eye(self, event: AstrMessageEvent):
