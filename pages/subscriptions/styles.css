@@ -24,3 +24,6 @@ html,body{width:100%;min-width:0}
 .feed h3,.latest-preview h4{white-space:normal;overflow-wrap:anywhere;word-break:break-word;line-height:1.35}
 @media(max-width:900px){.workspace{grid-template-columns:240px minmax(0,1fr)}}
 @media(max-width:640px){.workspace{grid-template-columns:1fr}.shell{padding:10px}}
+/* 无首图时正文必须独占整行；否则会落入固定180px图片列，形成竖长方形 */
+.latest-preview.no-image{grid-template-columns:minmax(0,1fr)}
+.latest-preview.no-image>div{grid-column:1/-1;width:100%}
