@@ -810,6 +810,10 @@ class MyRssPlugin(Star):
         self._legacy_purge_preview = None
         self._ready_group_sessions = set()  # 本次进程启动后实际观察到消息的群会话
         self._eye_cooldown = {}
+        self._target_send_locks = {}
+        self._target_last_send = {}
+        self._official_send_delay_min = 5.0
+        self._official_send_delay_max = 10.0
         
         self._last_fetch_error = None  # 拉取错误追踪（新版本 _fetch 使用）
         self.push_delay_min = config.get("push_delay_min", 5.0)
@@ -879,6 +883,11 @@ class MyRssPlugin(Star):
                 continue
         return result
 
+    def _is_qq_official_origin(self, origin: str) -> bool:
+        platform_id = str(origin).split(":", 1)[0]
+        platform = self._loaded_platforms().get(platform_id)
+        return bool(platform and platform.get("name") == "qq_official")
+
     def _target_readiness(self, origin: str) -> tuple[bool, str]:
         platform_id = str(origin).split(":", 1)[0]
         platform = self._loaded_platforms().get(platform_id)
@@ -888,6 +897,41 @@ class MyRssPlugin(Star):
             if origin not in self._ready_group_sessions:
                 return False, "qq_official_waiting_group_message"
         return True, "ready"
+
+    def _get_target_send_lock(self, origin: str) -> asyncio.Lock:
+        if origin not in self._target_send_locks:
+            self._target_send_locks[origin] = asyncio.Lock()
+        return self._target_send_locks[origin]
+
+    async def _wait_target_send_slot(self, origin: str) -> None:
+        """QQ 官方同群主动发送间隔 5~10 秒；不丢消息、不做小时级冷却。"""
+        if not self._is_qq_official_origin(origin):
+            return
+        minimum = random.uniform(self._official_send_delay_min, self._official_send_delay_max)
+        elapsed = time.time() - self._target_last_send.get(origin, 0)
+        if elapsed < minimum:
+            await asyncio.sleep(minimum - elapsed)
+
+    async def _send_message_guarded(self, origin: str, chain: MessageChain) -> bool:
+        async with self._get_target_send_lock(origin):
+            await self._wait_target_send_slot(origin)
+            result = await self.ctx.send_message(origin, chain)
+            if result:
+                self._target_last_send[origin] = time.time()
+            return bool(result)
+
+    def _record_delivery_status(self, url: str, origin: str, status: str, category: str = "") -> None:
+        sub = self.dh.data.get(url, {}).get("subscribers", {}).get(origin)
+        if not isinstance(sub, dict):
+            return
+        now = int(time.time())
+        previous = sub.get("delivery_status") if isinstance(sub.get("delivery_status"), dict) else {}
+        sub["delivery_status"] = {
+            "status": status,
+            "attempted_at": now,
+            "delivered_at": now if status == "SUCCESS" else int(previous.get("delivered_at", 0) or 0),
+            "error_category": category[:80],
+        }
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def _observe_group_session(self, event: AstrMessageEvent):
@@ -967,6 +1011,7 @@ class MyRssPlugin(Star):
                 id=job_id,
                 replace_existing=True,
                 misfire_grace_time=120,
+                jitter=30,
             )
             if max_minutes < 60:
                 self.logger.info("RSS调度: %s 每%d分钟拉取，%d个订阅者", url, max_minutes, len(subs))
@@ -1644,7 +1689,7 @@ class MyRssPlugin(Star):
         out.seek(0)
         return base64.b64encode(out.read()).decode("utf-8")
 
-    async def _make_comps(self, item: RSSItem) -> list:
+    async def _make_comps(self, item: RSSItem, include_extra_images: bool = True) -> list:
         comps = []
         tb = None
         if self.read_pic and item.pic_urls:
@@ -1706,7 +1751,7 @@ class MyRssPlugin(Star):
             self.logger.error("卡片生成失败: %s", e)
             comps.append(Comp.Plain("📡 " + item.chan_title + "\\n📝 " + item.title + "\\n" + item.description))
 
-        if self.read_pic and item.pic_urls:
+        if include_extra_images and self.read_pic and item.pic_urls:
             mx = len(item.pic_urls) if self.max_pic == -1 else self.max_pic
             for pu in item.pic_urls[1:mx]:
                 try:
@@ -1856,6 +1901,7 @@ class MyRssPlugin(Star):
         if not new_items:
             return
         pn = user.split(":")[0]
+        official_target = self._is_qq_official_origin(user)
         merge_limit = 5
         batch = new_items[:merge_limit]
 
@@ -1869,31 +1915,34 @@ class MyRssPlugin(Star):
             merged = self._merge_cards_b64(cards)
             if not merged:
                 for it in batch:
-                    comps = await self._make_comps(it)
-                    result = await self.ctx.send_message(user, MessageChain(chain=comps, use_t2i_=self.t2i))
+                    comps = await self._make_comps(it, include_extra_images=not official_target)
+                    result = await self._send_message_guarded(user, MessageChain(chain=comps, use_t2i_=self.t2i))
                     send_ok = send_ok and bool(result)
             else:
                 comps = [Comp.Image.fromBase64(merged)]
                 if pn == "aiocqhttp" and self.compose:
                     node = Comp.Node(uin=0, name="Astrbot", content=comps)
-                    result = await self.ctx.send_message(user, MessageChain(chain=[node], use_t2i_=self.t2i))
+                    result = await self._send_message_guarded(user, MessageChain(chain=[node], use_t2i_=self.t2i))
                 else:
-                    result = await self.ctx.send_message(user, MessageChain(chain=comps, use_t2i_=self.t2i))
+                    result = await self._send_message_guarded(user, MessageChain(chain=comps, use_t2i_=self.t2i))
                 send_ok = bool(result)
         else:
             it = batch[0]
-            comps = await self._make_comps(it)
+            comps = await self._make_comps(it, include_extra_images=not official_target)
             if pn == "aiocqhttp" and self.compose:
                 node = Comp.Node(uin=0, name="Astrbot", content=comps)
-                result = await self.ctx.send_message(user, MessageChain(chain=[node], use_t2i_=self.t2i))
+                result = await self._send_message_guarded(user, MessageChain(chain=[node], use_t2i_=self.t2i))
             else:
-                result = await self.ctx.send_message(user, MessageChain(chain=comps, use_t2i_=self.t2i))
+                result = await self._send_message_guarded(user, MessageChain(chain=comps, use_t2i_=self.t2i))
             send_ok = bool(result)
 
         if send_ok:
+            self._record_delivery_status(url, user, "SUCCESS")
             self.logger.info("RSS推送完成: %s -> %s (%d条)", url, user, len(batch))
         else:
+            self._record_delivery_status(url, user, "FAILED", "SEND_RETURNED_FALSE")
             self.logger.error("RSS投递失败（seen_links 已保留以防循环重推）: %s -> %s (%d条)", url, user, len(batch))
+        self.dh.save()
 
         # ============================================================
         # LLM 工具
@@ -1983,6 +2032,9 @@ class MyRssPlugin(Star):
 
     async def _confirm_preview_subscription(self, event: AstrMessageEvent, state: dict, target_group: str):
         """幂等确认订阅；绝不对已有订阅再次调用 _add，避免重置 seen_links。"""
+        permission = self._require_subscription_operator(event, "确认新增订阅")
+        if permission:
+            return permission
         target_origin, error = self._subscription_target(event, target_group)
         if error:
             return error
@@ -2137,8 +2189,8 @@ class MyRssPlugin(Star):
 
         action 使用规则：
         - list：用户询问“我订阅了什么”“当前关注列表”时使用；不需要 preview_id。
-        - subscribe：只能在 myrss_preview 已成功生成安全卡片后使用。用户必须明确说
-          “确认订阅/确认关注”。插件自动读取当前会话最近一次有效预览；preview_id 可省略，
+        - subscribe：只能由 AstrBot 管理员或 MyRSS 操作员使用，并且必须先由 myrss_preview
+          成功生成安全卡片。用户必须明确说“确认订阅/确认关注”。插件自动读取当前会话最近一次有效预览；preview_id 可省略，
           即使模型漏填或抄错也不会串到其他会话。仅发送群号不算确认。
         - unsubscribe：用户明确要求取消关注、退订、取关某个现有动态源时使用；
           使用订阅列表编号或能唯一匹配的标题/URL关键词。
@@ -2375,11 +2427,44 @@ class MyRssPlugin(Star):
             if status != "SAFE":
                 yield event.plain_result("本次随机内容未通过安全审核，已停止；不会继续循环尝试其他源。")
                 return
-            comps = await self._make_comps(item)
+            comps = await self._make_comps(item, include_extra_images=not self._is_qq_official_origin(origin))
             yield event.chain_result(comps).use_t2i(self.t2i)
         finally:
             if old_entry is None:
                 self.dh.data.pop(full_url, None)
+
+    @myrss.command("testdelivery")
+    async def cmd_testdelivery(self, event: AstrMessageEvent):
+        """验证当前群的 QQ 官方主动图片投递链路；不读 RSS、不调用 LLM。"""
+        permission = self._require_subscription_operator(event, "主动投递自检")
+        if permission:
+            yield permission
+            return
+        origin = event.unified_msg_origin
+        if "GroupMessage" not in origin:
+            yield event.plain_result("❌ 请在目标群内执行 /myrss testdelivery。")
+            return
+        self._ready_group_sessions.add(origin)
+        ready, reason = self._target_readiness(origin)
+        if not ready:
+            yield event.plain_result(f"❌ 当前群主动投递未就绪：{reason}")
+            return
+        b64 = await self.card.make(
+            channel="MyRSS", title="QQ 官方主动推送自检",
+            desc="这是一张本地生成的测试卡片；没有抓取 RSS，也没有调用 LLM。",
+            link="", ts=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            thumb=None, avatar=None, comment="", bot_avatar=None, bot_provider_name="",
+        )
+        if not b64:
+            yield event.plain_result("❌ Browserless 测试卡片生成失败，尚未执行主动发送。")
+            return
+        ok = await self._send_message_guarded(
+            origin, MessageChain(chain=[Comp.Image.fromBase64(b64)], use_t2i_=self.t2i)
+        )
+        if ok:
+            yield event.plain_result("✅ 主动图片投递调用已返回成功。请同时确认群里确实出现测试卡片。")
+        else:
+            yield event.plain_result("❌ 主动投递返回失败；未执行自动重试。")
 
     @myrss.command("purgelegacy")
     async def cmd_purgelegacy(self, event: AstrMessageEvent, action: str = "preview"):

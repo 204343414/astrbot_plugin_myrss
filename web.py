@@ -95,6 +95,7 @@ class MyRssWebController:
                             "last_update": int(sub.get("last_update", 0) or 0),
                             "latest_link": sub.get("latest_link", ""),
                             "seen_count": len(sub.get("seen_links", [])),
+                            "delivery_status": sub.get("delivery_status") if isinstance(sub.get("delivery_status"), dict) else None,
                             "preview": preview,
                         }
                     )
