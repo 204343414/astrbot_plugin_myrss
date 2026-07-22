@@ -2142,6 +2142,73 @@ class MyRssPlugin(Star):
             f"删除前备份：{'、'.join(result['backups'])}"
         )
 
+    @myrss.command("debug")
+    async def cmd_debug(self, event: AstrMessageEvent):
+        """输出 MyRSS 持久化、调度器和只读页面诊断信息（仅管理员）。"""
+        admin_check = self._require_admin(event, "查看 MyRSS 诊断")
+        if admin_check:
+            yield admin_check
+            return
+        path = self.dh.get_data_path()
+        disk = self.dh._read_json(path) if os.path.exists(path) else None
+        valid = isinstance(disk, dict)
+        data = disk if valid else {}
+        source_count = 0
+        subscription_count = 0
+        group_subscriptions = {}
+        malformed = []
+        for url, feed in data.items():
+            if url in ("rsshub_endpoints", "settings"):
+                continue
+            source_count += 1
+            if not isinstance(feed, dict):
+                malformed.append(f"源不是对象: {url[:80]}")
+                continue
+            subscribers = feed.get("subscribers", {})
+            if not isinstance(subscribers, dict):
+                malformed.append(f"subscribers 不是对象: {url[:80]}")
+                continue
+            subscription_count += len(subscribers)
+            for origin, sub in subscribers.items():
+                if not isinstance(sub, dict):
+                    malformed.append(f"订阅记录不是对象: {str(origin)[:80]}")
+                    continue
+                if "GroupMessage" in str(origin):
+                    group_subscriptions[str(origin)] = group_subscriptions.get(str(origin), 0) + 1
+                for required in ("cron_expr", "last_update", "latest_link", "seen_links"):
+                    if required not in sub:
+                        malformed.append(f"缺少 {required}: {str(origin)[:50]} / {url[:50]}")
+                        break
+        runtime = builtins._ASTRBOT_MYRSS_RUNTIME
+        scheduler_running = bool(getattr(self.sched, "running", False))
+        try:
+            job_count = len(self.sched.get_jobs())
+        except Exception:
+            job_count = -1
+        legacy = self.dh.migration_snapshot()["legacy"]
+        file_size = os.path.getsize(path) if os.path.exists(path) else 0
+        file_mtime = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(os.path.getmtime(path))) if os.path.exists(path) else "—"
+        lines = [
+            "【MyRSS Debug】",
+            f"实例: {id(self)} / generation={self._runtime_generation} / current={self._is_current_runtime()}",
+            f"调度器: running={scheduler_running} / jobs={job_count} / runtime_owner={runtime.get('instance') is self}",
+            f"正式库: {path}",
+            f"文件: exists={os.path.exists(path)} / valid_json={valid} / size={file_size} / mtime={file_mtime}",
+            f"数据: {source_count} 个源 / {subscription_count} 条订阅 / {len(group_subscriptions)} 个订阅群",
+            f"内存与磁盘顶层一致: {set(self.dh.data.keys()) == set(data.keys()) if valid else False}",
+            f"Web路由: {', '.join(self.web.registered_routes) or '未登记'}",
+            f"Web最近错误: {self.web.last_error or '无'}",
+            f"旧库残留: {len(legacy)} 个",
+        ]
+        for origin, count in sorted(group_subscriptions.items()):
+            lines.append(f"- {origin}: {count} 个源")
+        if malformed:
+            lines.append(f"结构异常: {len(malformed)} 条（最多显示 10 条）")
+            lines.extend(f"! {item}" for item in malformed[:10])
+        else:
+            lines.append("结构异常: 0")
+        yield event.plain_result("\n".join(lines))
+
     @myrss.group("rsshub")
     def rsshub(self, event: AstrMessageEvent):
         pass

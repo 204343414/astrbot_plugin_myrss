@@ -20,14 +20,22 @@ class MyRssWebController:
     def __init__(self, context: Context, plugin: Any):
         self.context = context
         self.plugin = plugin
+        self.registered_routes: list[str] = []
+        self.last_error = ""
 
     def register_routes(self) -> None:
-        self.context.register_web_api(
-            f"/{PLUGIN_NAME}/subscriptions/bootstrap",
-            self._wrap(self.bootstrap),
-            ["GET"],
-            "MyRSS subscribed groups and feed status",
-        )
+        routes = [
+            ("/subscriptions/ping", self.ping, "MyRSS page health check"),
+            ("/subscriptions/bootstrap", self.bootstrap, "MyRSS subscribed groups and feed status"),
+        ]
+        for path, handler, description in routes:
+            self.context.register_web_api(
+                f"/{PLUGIN_NAME}{path}", self._wrap(handler), ["GET"], description
+            )
+            self.registered_routes.append(path)
+
+    async def ping(self) -> dict[str, Any]:
+        return {"message": "pong", "data_path": self.plugin.dh.get_data_path()}
 
     def _wrap(self, handler: Callable[[], Awaitable]):
         async def wrapped():
@@ -38,9 +46,10 @@ class MyRssWebController:
                     {"ok": True, "data": await handler()}
                 )
             except Exception as exc:
+                self.last_error = f"{type(exc).__name__}: {exc}"
                 logger.exception("MyRSS page request failed")
                 return cast(Callable[[dict], Any], quart_jsonify)(
-                    {"ok": False, "message": str(exc)}
+                    {"ok": False, "message": self.last_error}
                 ), 500
 
         wrapped.__name__ = handler.__name__
@@ -55,8 +64,12 @@ class MyRssWebController:
             for url, feed in data.items():
                 if url in ("rsshub_endpoints", "settings") or not isinstance(feed, dict):
                     continue
-                info = feed.get("info", {})
-                for origin, sub in feed.get("subscribers", {}).items():
+                info = feed.get("info") if isinstance(feed.get("info"), dict) else {}
+                subscribers = feed.get("subscribers")
+                if not isinstance(subscribers, dict):
+                    continue
+                for raw_origin, sub in subscribers.items():
+                    origin = str(raw_origin or "")
                     if "GroupMessage" not in origin or not isinstance(sub, dict):
                         continue
                     group = groups.setdefault(
