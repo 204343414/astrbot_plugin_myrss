@@ -9,7 +9,6 @@ import logging
 import asyncio
 import aiohttp
 import builtins
-import copy
 import hashlib
 from io import BytesIO
 from dataclasses import dataclass
@@ -29,9 +28,6 @@ from astrbot.api import AstrBotConfig
 import astrbot.api.message_components as Comp
 
 from .web import MyRssWebController
-from .qqofficial_keyboard import install_patch as install_keyboard_patch
-from .qqofficial_keyboard import register_handler as register_keyboard_handler
-from .qqofficial_keyboard import unregister_handler as unregister_keyboard_handler
 
 # [防冲突] 模块级变量追踪当前活跃的调度器
 # 插件热更新时新实例先通过此引用杀掉老调度器，避免新老并行双推
@@ -153,131 +149,9 @@ class DataHandler:
     def get_data_dir(self) -> str:
         return self.data_dir
 
-    def get_legacy_data_paths(self) -> list[str]:
-        paths = []
-        if self.plugin_dir:
-            paths.append(os.path.join(self.plugin_dir, "_data", "_data.json"))
-        paths.append(os.path.abspath("data/astrbot_plugin_myrss/_data.json"))
-        current = os.path.abspath(self.config_path)
-        result = []
-        for path in paths:
-            absolute = os.path.abspath(path)
-            if absolute != current and absolute not in result:
-                result.append(absolute)
-        return result
-
     @staticmethod
-    def _normalize_seen_link(link: str) -> str:
-        value = str(link or "").strip()
-        return value.split("#", 1)[0].split("?", 1)[0] if value else ""
 
     @classmethod
-    def merge_persistent_data(cls, current: dict, legacy: dict) -> dict:
-        """合并旧新库；断点取较新值，seen_links 做原值+归一化并集。"""
-        merged = copy.deepcopy(current if isinstance(current, dict) else {})
-        old = legacy if isinstance(legacy, dict) else {}
-        merged["rsshub_endpoints"] = list(dict.fromkeys(
-            list(merged.get("rsshub_endpoints", [])) + list(old.get("rsshub_endpoints", []))
-        ))
-        if isinstance(old.get("settings"), dict):
-            settings = merged.setdefault("settings", {})
-            for key, value in old["settings"].items():
-                if isinstance(value, list) and isinstance(settings.get(key), list):
-                    settings[key] = list(dict.fromkeys(settings[key] + value))
-                elif key not in settings:
-                    settings[key] = copy.deepcopy(value)
-
-        for url, old_feed in old.items():
-            if url in ("rsshub_endpoints", "settings") or not isinstance(old_feed, dict):
-                continue
-            if url not in merged or not isinstance(merged[url], dict):
-                merged[url] = copy.deepcopy(old_feed)
-                continue
-            feed = merged[url]
-            if not feed.get("info") and old_feed.get("info"):
-                feed["info"] = copy.deepcopy(old_feed["info"])
-            subscribers = feed.setdefault("subscribers", {})
-            for subscriber, old_sub in old_feed.get("subscribers", {}).items():
-                if subscriber not in subscribers or not isinstance(subscribers[subscriber], dict):
-                    subscribers[subscriber] = copy.deepcopy(old_sub)
-                    continue
-                new_sub = subscribers[subscriber]
-                old_ts = int(old_sub.get("last_update", 0) or 0)
-                new_ts = int(new_sub.get("last_update", 0) or 0)
-                combined = []
-                for raw in list(new_sub.get("seen_links", [])) + list(old_sub.get("seen_links", [])):
-                    raw = str(raw or "").strip()
-                    normalized = cls._normalize_seen_link(raw)
-                    for candidate in (raw, normalized):
-                        if candidate and candidate not in combined:
-                            combined.append(candidate)
-                new_sub["seen_links"] = combined[:1000]
-                if old_ts > new_ts:
-                    new_sub["last_update"] = old_ts
-                    if old_sub.get("latest_link"):
-                        new_sub["latest_link"] = old_sub["latest_link"]
-                else:
-                    new_sub["last_update"] = new_ts
-                if not new_sub.get("cron_expr") and old_sub.get("cron_expr"):
-                    new_sub["cron_expr"] = old_sub["cron_expr"]
-        return merged
-
-    def migration_snapshot(self) -> dict:
-        sources = []
-        for path in self.get_legacy_data_paths():
-            if not os.path.exists(path):
-                continue
-            data = self._read_json(path)
-            with open(path, "rb") as source_file:
-                file_hash = hashlib.sha256(source_file.read()).hexdigest()
-            sources.append({
-                "path": path,
-                "valid": isinstance(data, dict),
-                "sha256": file_hash,
-                "sources": len([k for k in data or {} if k not in ("rsshub_endpoints", "settings")]),
-                "subscriptions": sum(len(v.get("subscribers", {})) for k, v in (data or {}).items() if k not in ("rsshub_endpoints", "settings") and isinstance(v, dict)),
-            })
-        raw = json.dumps(sources, ensure_ascii=False, sort_keys=True)
-        return {"current": self.config_path, "legacy": sources, "fingerprint": hashlib.sha256(raw.encode()).hexdigest()[:16]}
-
-    def migrate_and_delete_legacy(self) -> dict:
-        """原子写新库、读回校验、备份旧库后才删除旧文件。"""
-        merged = copy.deepcopy(self.data)
-        valid_paths = []
-        for path in self.get_legacy_data_paths():
-            if not os.path.exists(path):
-                continue
-            legacy = self._read_json(path)
-            if not isinstance(legacy, dict):
-                raise ValueError(f"旧数据文件无法解析，未删除任何文件: {path}")
-            merged = self.merge_persistent_data(merged, legacy)
-            valid_paths.append(path)
-        if not valid_paths:
-            return {"merged": 0, "deleted": [], "current": self.config_path}
-
-        original = self.data
-        self.data = merged
-        try:
-            self._save()
-            verified = self._read_json(self.config_path)
-            if verified != merged:
-                raise RuntimeError("新数据写入后的读回校验不一致")
-        except Exception:
-            self.data = original
-            raise
-
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        backups = []
-        for path in valid_paths:
-            backup = path + f".pre_delete_{timestamp}.bak"
-            shutil.copy2(path, backup)
-            backups.append(backup)
-        deleted = []
-        for path in valid_paths:
-            os.remove(path)
-            deleted.append(path)
-        self.data = merged
-        return {"merged": len(valid_paths), "deleted": deleted, "backups": backups, "current": self.config_path}
 
     def _load(self):
         """加载数据，支持从旧路径迁移，并自动备份已有数据"""
@@ -829,21 +703,7 @@ class MyRssPlugin(Star):
         self.pic = PicHandler(self.adjust_pic)
         self.browserless_url = config.get("browserless_url", "http://browserless:3000")
         self.card = CardGen(browserless_url=self.browserless_url)
-        keyboard_config = config.get("keyboard", {}) or {}
-        self.keyboard_enabled = bool(keyboard_config.get("enabled", False))
-        self._keyboard_handler_name = f"myrss:{id(self)}"
-        if self.keyboard_enabled:
-            try:
-                install_keyboard_patch()
-                register_keyboard_handler(
-                    self._keyboard_handler_name, self._handle_keyboard_interaction
-                )
-            except Exception as exc:
-                self.keyboard_enabled = False
-                self.logger.exception(
-                    "[QQKeyboard] 兼容桥安装失败，已只禁用 Keyboard，MyRSS 其余功能继续运行: %s",
-                    exc,
-                )
+
 
         # 防并发锁，key = (url, user)
         self._locks: dict = {}
@@ -1057,114 +917,6 @@ class MyRssPlugin(Star):
             if old_entry is None and not self.dh.data.get(full_url, {}).get("subscribers"):
                 self.dh.data.pop(full_url, None)
 
-    def _keyboard_payload(self, origin: str) -> tuple[dict, dict]:
-        titles = []
-        success_count = failed_count = 0
-        for url, feed in self.dh.data.items():
-            if url in ("rsshub_endpoints", "settings") or not isinstance(feed, dict):
-                continue
-            sub = feed.get("subscribers", {}).get(origin)
-            if not isinstance(sub, dict):
-                continue
-            titles.append(str(feed.get("info", {}).get("title", url)))
-            delivery = sub.get("delivery_status", {}) if isinstance(sub.get("delivery_status"), dict) else {}
-            success_count += delivery.get("status") == "SUCCESS"
-            failed_count += delivery.get("status") == "FAILED"
-        shown = "、".join(title[:24] for title in titles[:8]) or "暂无订阅"
-        if len(titles) > 8:
-            shown += f" 等{len(titles)}个"
-        markdown = {
-            "content": (
-                f"# 头条Flag 群控制面板\n"
-                f"订阅源：{len(titles)} 个｜最近成功：{success_count}｜失败：{failed_count}\n"
-                f"{shown}\n"
-                "管理按钮由 QQ 平台执行权限校验。"
-            )
-        }
-
-        def button(button_id: str, label: str, action_type: int, data: str, permission: int, style: int = 0):
-            return {
-                "id": button_id,
-                "render_data": {"label": label, "visited_label": label, "style": style},
-                "action": {
-                    "type": action_type,
-                    "permission": {"type": permission},
-                    "data": data,
-                    "reply": False,
-                    "enter": False,
-                    "unsupport_tips": "当前 QQ 版本不支持该按钮",
-                },
-            }
-
-        keyboard = {"content": {"rows": [
-            {"buttons": [
-                button("myrss_refresh", "刷新面板", 1, "myrss:refresh", 2, 1),
-                button("myrss_test", "测试主动推送", 1, "myrss:test", 1, 0),
-            ]},
-            {"buttons": [
-                button("myrss_list", "查看订阅", 2, "/myrss list", 2, 0),
-                button("myrss_add", "添加订阅", 2, "添加订阅 ", 1, 1),
-                button("myrss_eye", "随机动态", 2, "/myrss eye", 2, 0),
-            ]},
-            {"buttons": [
-                button("daily_news", "今日新闻", 2, "/新闻", 2, 1),
-                button("video_download", "下载视频", 2, "/video ", 2, 0),
-                button("file_download", "下载文件", 2, "/download ", 2, 0),
-            ]},
-            {"buttons": [
-                button("news_status", "新闻状态", 2, "/新闻状态", 1, 0),
-                button("ban_list", "静默黑名单", 2, "/拉黑列表_", 1, 0),
-            ]},
-        ]}}
-        return markdown, keyboard
-
-    async def _send_keyboard_panel(self, origin: str, client=None) -> dict:
-        origin = str(origin or "")
-        if not self.keyboard_enabled:
-            raise ValueError("Keyboard 控制面板未启用")
-        platform_id = origin.split(":", 1)[0]
-        platform = self._loaded_platforms().get(platform_id)
-        if not platform or platform.get("name") != "qq_official":
-            raise ValueError("目标不是当前已加载的 QQ Official 群")
-        ready, reason = self._target_readiness(origin)
-        if not ready:
-            raise ValueError(f"目标群未就绪: {reason}")
-        adapter = platform.get("instance")
-        client = client or (adapter.get_client() if hasattr(adapter, "get_client") else getattr(adapter, "client", None))
-        if not client or not getattr(client, "api", None):
-            raise RuntimeError("无法取得 QQ Official botpy client")
-        markdown, keyboard = self._keyboard_payload(origin)
-        await client.api.post_group_message(
-            group_openid=origin.split(":", 2)[-1],
-            msg_type=2,
-            markdown=markdown,
-            keyboard=keyboard,
-            msg_seq=random.randint(1, 10000),
-        )
-        return {"sent": True}
-
-    async def send_keyboard_panel_from_ui(self, origin: str) -> dict:
-        return await self._send_keyboard_panel(origin)
-
-    async def _handle_keyboard_interaction(self, client, interaction):
-        data = str(getattr(getattr(interaction, "data", None), "resolved", None).button_data or "") if getattr(getattr(interaction, "data", None), "resolved", None) else ""
-        if not data.startswith("myrss:"):
-            return None
-        group_openid = str(getattr(interaction, "group_openid", "") or "")
-        if not group_openid:
-            return 1
-        origin = f"{client.platform.meta().id}:GroupMessage:{group_openid}"
-        if data == "myrss:refresh":
-            asyncio.create_task(self._send_keyboard_panel(origin, client=client))
-            return 0
-        if data == "myrss:test":
-            feed_url = next((url for url, feed in self.dh.data.items() if url not in ("rsshub_endpoints", "settings") and isinstance(feed, dict) and origin in feed.get("subscribers", {})), "")
-            if not feed_url:
-                return 1
-            asyncio.create_task(self.run_delivery_diagnostic(origin, feed_url))
-            return 0
-        return 1
-
 
     async def remove_subscription_from_ui(self, origin: str, feed_url: str) -> dict:
         """Dashboard 精确退订一个群-源关系，不清空其他群与源级缓存。"""
@@ -1204,8 +956,6 @@ class MyRssPlugin(Star):
     async def destroy(self):
         """插件卸载/禁用时停止调度器"""
         global _ACTIVE_SCHED
-        if self.keyboard_enabled:
-            unregister_keyboard_handler(self._keyboard_handler_name)
         try:
             if self.sched.running:
                 # [防冲突] wait=True：等正在执行的job跑完再关，避免推送到一半被掐断
@@ -2533,20 +2283,6 @@ class MyRssPlugin(Star):
     @filter.command_group("myrss")
     def myrss(self):
         pass
-
-
-    @myrss.command("面板")
-    async def command_panel(self, event: AstrMessageEvent):
-        """向当前 QQ 官方群发送一张 Markdown＋Keyboard 控制面板。"""
-        origin = event.unified_msg_origin
-        if "GroupMessage" not in origin:
-            yield event.plain_result("控制面板目前仅支持 QQ 官方群聊。")
-            return
-        try:
-            await self._send_keyboard_panel(origin)
-            event.stop_event()
-        except Exception as exc:
-            yield event.plain_result(f"控制面板发送失败：{exc}")
 
     @myrss.command("eye")
     async def cmd_eye(self, event: AstrMessageEvent):

@@ -122,24 +122,6 @@ async function runDeliveryTest(button) {
   }
 }
 
-async function sendKeyboardPanel(origin) {
-  const button = el("sendKeyboardPanelBtn");
-  button.disabled = true;
-  button.textContent = "发送中…";
-  setTestStatus("running", "正在向当前 QQ 官方群发送 Markdown＋Keyboard 控制面板……");
-  try {
-    const response = await bridge.apiPost("subscriptions/send-keyboard", { origin });
-    if (response?.ok === false) throw new Error(response.message || "控制面板发送失败");
-    const result = response?.ok === true ? response.data : (response?.data || response);
-    setTestStatus("success", "按钮控制面板已发送。请在群内确认 Markdown 和按钮可见，并测试“刷新面板”与仅管理者可用的“测试主动推送”。");
-  } catch (error) {
-    setTestStatus("error", `按钮控制面板发送失败：${error?.message || error}`);
-  } finally {
-    button.disabled = false;
-    button.textContent = "发送按钮控制面板到本群";
-  }
-}
-
 async function addSubscription(origin) {
   const input = el("addSubscriptionUrl");
   const button = el("addSubscriptionBtn");
@@ -206,8 +188,7 @@ function render() {
     el("detail").innerHTML = '<div class="empty">当前正式数据文件中没有群订阅</div>';
     return;
   }
-  el("detail").innerHTML = `<h2>群 ${escapeHtml(group.group_id)}</h2><p><span class="badge">${escapeHtml(group.platform)}</span>　${group.feeds.length} 个订阅源</p><div class="group-panel-actions"><button id="sendKeyboardPanelBtn">发送按钮控制面板到本群</button></div><div class="add-subscription-panel"><input id="addSubscriptionUrl" placeholder="输入账号网页 URL 或 /开头的 RSSHub 路由"/><button id="addSubscriptionBtn">安全预审并订阅</button></div>${group.feeds.map((feed) => renderFeed(feed, group.origin)).join("")}`;
-  el("sendKeyboardPanelBtn").onclick = () => sendKeyboardPanel(group.origin);
+  el("detail").innerHTML = `<h2>群 ${escapeHtml(group.group_id)}</h2><p><span class="badge">${escapeHtml(group.platform)}</span>　${group.feeds.length} 个订阅源</p><div class="add-subscription-panel"><input id="addSubscriptionUrl" placeholder="输入账号网页 URL 或 /开头的 RSSHub 路由"/><button id="addSubscriptionBtn">安全预审并订阅</button></div>${group.feeds.map((feed) => renderFeed(feed, group.origin)).join("")}`;
   el("addSubscriptionBtn").onclick = () => addSubscription(group.origin);
   document.querySelectorAll(".test-delivery").forEach((button) => {
     button.onclick = () => runDeliveryTest(button);

@@ -122,16 +122,5 @@
     "description": "reset 命令是否默认使用强制模式（不依赖拉取最新RSS，直接用当前 latest_link 重置为单条）。推荐开启，解决 poll 失败导致 reset 无效的问题。",
     "type": "bool",
     "default": true
-  },
-  "keyboard": {
-    "description": "QQ官方群 Markdown＋Keyboard 控制面板；启用后必须完整重启 AstrBot 以重新协商 interaction intent",
-    "type": "object",
-    "items": {
-      "enabled": {
-        "description": "启用 Keyboard 按钮与 INTERACTION_CREATE 兼容桥",
-        "type": "bool",
-        "default": false
-      }
-    }
   }
 }
