@@ -812,6 +812,7 @@ class MyRssPlugin(Star):
         self._eye_cooldown = {}
         self._target_send_locks = {}
         self._target_last_send = {}
+        self._delivery_test_cooldown = {}
         self._official_send_delay_min = 5.0
         self._official_send_delay_max = 10.0
         
@@ -919,6 +920,60 @@ class MyRssPlugin(Star):
             if result:
                 self._target_last_send[origin] = time.time()
             return bool(result)
+
+    async def run_delivery_diagnostic(self, origin: str, feed_url: str) -> dict:
+        """UI/命令共用的单次诊断：GET RSS + 合成卡片主动发送，不调用 LLM。"""
+        origin = str(origin or "")
+        feed_url = str(feed_url or "")
+        if "GroupMessage" not in origin:
+            raise ValueError("目标不是群会话")
+        feed = self.dh.data.get(feed_url)
+        if not isinstance(feed, dict) or origin not in feed.get("subscribers", {}):
+            raise ValueError("所选 RSS 源不属于该订阅群")
+        now = time.time()
+        remaining = 60 - (now - self._delivery_test_cooldown.get(origin, 0))
+        if remaining > 0:
+            raise ValueError(f"同群诊断冷却中，请 {int(remaining) + 1} 秒后再试")
+        ready, reason = self._target_readiness(origin)
+        if not ready:
+            raise ValueError(f"目标群尚未具备主动投递条件: {reason}")
+        self._delivery_test_cooldown[origin] = now
+
+        raw = await self._fetch(feed_url)
+        fetch_ok = False
+        item_count = 0
+        fetch_error = self._last_fetch_error or ""
+        if raw:
+            try:
+                root = etree.fromstring(raw)
+                item_count = len(root.xpath("//item"))
+                fetch_ok = item_count > 0
+                if not fetch_ok:
+                    fetch_error = "RSS_XML_HAS_NO_ITEM"
+            except Exception as exc:
+                fetch_error = f"XML_PARSE_{type(exc).__name__}"
+
+        title = feed.get("info", {}).get("title", feed_url) if isinstance(feed.get("info"), dict) else feed_url
+        diagnostic_text = (
+            f"RSS GET: {'成功' if fetch_ok else '失败'}\n"
+            f"解析条目: {item_count}\n"
+            f"主动目标: {origin}\n"
+            "本测试未调用 LLM、未修改 seen_links、未推送历史动态。"
+        )
+        b64 = await self.card.make(
+            channel="MyRSS 诊断", title=str(title)[:100], desc=diagnostic_text,
+            link="", ts=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            thumb=None, avatar=None, comment="", bot_avatar=None, bot_provider_name="",
+        )
+        if not b64:
+            return {"fetch_ok": fetch_ok, "item_count": item_count, "send_ok": False,
+                    "fetch_error": fetch_error, "send_error": "CARD_RENDER_FAILED"}
+        send_ok = await self._send_message_guarded(
+            origin, MessageChain(chain=[Comp.Image.fromBase64(b64)], use_t2i_=self.t2i)
+        )
+        return {"fetch_ok": fetch_ok, "item_count": item_count, "send_ok": send_ok,
+                "fetch_error": fetch_error if not fetch_ok else "",
+                "send_error": "" if send_ok else "SEND_RETURNED_FALSE"}
 
     def _record_delivery_status(self, url: str, origin: str, status: str, category: str = "") -> None:
         sub = self.dh.data.get(url, {}).get("subscribers", {}).get(origin)

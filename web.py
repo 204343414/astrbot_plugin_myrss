@@ -8,8 +8,10 @@ from astrbot.api.star import Context
 
 try:
     from quart import jsonify as quart_jsonify
+    from quart import request as quart_request
 except ImportError:
     quart_jsonify = None
+    quart_request = None
 
 
 PLUGIN_NAME = "astrbot_plugin_myrss"
@@ -26,17 +28,26 @@ class MyRssWebController:
 
     def register_routes(self) -> None:
         routes = [
-            ("/subscriptions/ping", self.ping, "MyRSS page health check"),
-            ("/subscriptions/bootstrap", self.bootstrap, "MyRSS subscribed groups and feed status"),
+            ("/subscriptions/ping", self.ping, ["GET"], "MyRSS page health check"),
+            ("/subscriptions/bootstrap", self.bootstrap, ["GET"], "MyRSS subscribed groups and feed status"),
+            ("/subscriptions/test-delivery", self.test_delivery, ["POST"], "Test RSS GET and proactive delivery"),
         ]
-        for path, handler, description in routes:
+        for path, handler, methods, description in routes:
             self.context.register_web_api(
-                f"/{PLUGIN_NAME}{path}", self._wrap(handler), ["GET"], description
+                f"/{PLUGIN_NAME}{path}", self._wrap(handler), methods, description
             )
             self.registered_routes.append(path)
 
     async def ping(self) -> dict[str, Any]:
         return {"message": "pong", "data_path": self.plugin.dh.get_data_path()}
+
+    async def test_delivery(self) -> dict[str, Any]:
+        if quart_request is None:
+            raise RuntimeError("Web request framework is unavailable")
+        payload = await quart_request.get_json(force=True, silent=True) or {}
+        origin = str(payload.get("origin", ""))
+        feed_url = str(payload.get("feed_url", ""))
+        return await self.plugin.run_delivery_diagnostic(origin, feed_url)
 
     def _wrap(self, handler: Callable[[], Awaitable]):
         async def wrapped():
