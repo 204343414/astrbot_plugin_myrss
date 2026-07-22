@@ -85,7 +85,7 @@ function render() {
   const list = payload.groups.filter((group) =>
     `${group.group_id}${group.platform}`.toLowerCase().includes(query));
   el("groups").innerHTML = list.length
-    ? list.map((group) => `<button class="group ${group.origin === selected ? "active" : ""}" data-id="${escapeHtml(group.origin)}"><b>群 ${escapeHtml(group.group_id)}</b><small>${escapeHtml(group.platform)} · ${group.feeds.length} 个动态源</small></button>`).join("")
+    ? list.map((group) => `<button class="group ${group.origin === selected ? "active" : ""}" data-id="${escapeHtml(group.origin)}"><b>${group.delivery_ready ? "🟢" : "🟡"} 群 ${escapeHtml(group.group_id)}</b><small>${escapeHtml(group.platform)} · ${group.feeds.length} 个动态源 · ${escapeHtml(group.delivery_reason || "unknown")}</small></button>`).join("")
     : '<div class="empty">没有订阅群</div>';
   document.querySelectorAll(".group").forEach((button) => {
     button.onclick = () => { selected = button.dataset.id; render(); };

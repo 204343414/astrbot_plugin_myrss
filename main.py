@@ -807,11 +807,19 @@ class MyRssPlugin(Star):
         self._preview_states = {}  # key=(origin, preview_id), value=一次性安全预览状态
         self._preview_ttl_seconds = 600
         self._migration_preview = None
+        self._legacy_purge_preview = None
+        self._ready_group_sessions = set()  # 本次进程启动后实际观察到消息的群会话
+        self._eye_cooldown = {}
         
         self._last_fetch_error = None  # 拉取错误追踪（新版本 _fetch 使用）
         self.push_delay_min = config.get("push_delay_min", 5.0)
         self.push_delay_max = config.get("push_delay_max", 8.0)
         self.filter_provider_id = config.get("filter_provider_id", "")
+        raw_operators = config.get("subscription_operator_ids", "") or ""
+        if isinstance(raw_operators, list):
+            self.subscription_operator_ids = {str(value).strip() for value in raw_operators if str(value).strip()}
+        else:
+            self.subscription_operator_ids = {value.strip() for value in re.split(r"[,，\n]+", str(raw_operators)) if value.strip()}
         self.pic = PicHandler(self.adjust_pic)
         self.browserless_url = config.get("browserless_url", "http://browserless:3000")
         self.card = CardGen(browserless_url=self.browserless_url)
@@ -854,6 +862,39 @@ class MyRssPlugin(Star):
     def _is_current_runtime(self) -> bool:
         runtime = builtins._ASTRBOT_MYRSS_RUNTIME
         return runtime.get("instance") is self and runtime.get("generation") == self._runtime_generation
+
+    def _loaded_platforms(self) -> dict:
+        result = {}
+        manager = getattr(self.ctx, "platform_manager", None)
+        instances = []
+        try:
+            instances = manager.get_insts() if manager and hasattr(manager, "get_insts") else getattr(manager, "platform_insts", [])
+        except Exception:
+            instances = []
+        for instance in instances or []:
+            try:
+                meta = instance.meta()
+                result[str(meta.id)] = {"name": str(meta.name), "instance": instance}
+            except Exception:
+                continue
+        return result
+
+    def _target_readiness(self, origin: str) -> tuple[bool, str]:
+        platform_id = str(origin).split(":", 1)[0]
+        platform = self._loaded_platforms().get(platform_id)
+        if not platform:
+            return False, "platform_not_loaded"
+        if platform.get("name") == "qq_official" and "GroupMessage" in str(origin):
+            if origin not in self._ready_group_sessions:
+                return False, "qq_official_waiting_group_message"
+        return True, "ready"
+
+    @filter.event_message_type(filter.EventMessageType.ALL)
+    async def _observe_group_session(self, event: AstrMessageEvent):
+        """只记录本次启动后真实出现过消息的群；不回复、不修改订阅。"""
+        origin = getattr(event, "unified_msg_origin", "")
+        if origin and "GroupMessage" in origin:
+            self._ready_group_sessions.add(origin)
 
     async def destroy(self):
         """插件卸载/禁用时停止调度器"""
@@ -1688,11 +1729,20 @@ class MyRssPlugin(Star):
         subs = self.dh.data[url].get("subscribers", {})
         if not subs:
             return
+        ready_users = []
+        for user in list(subs):
+            ready, reason = self._target_readiness(user)
+            if ready:
+                ready_users.append(user)
+            else:
+                self.logger.warning("RSS目标未就绪，拉取前跳过: target=%s reason=%s", user, reason)
+        if not ready_users:
+            return
 
-        self.logger.info("RSS公共拉取: %s -> %d个订阅者", url, len(subs))
+        self.logger.info("RSS公共拉取: %s -> %d/%d个目标已就绪", url, len(ready_users), len(subs))
 
-        # 所有订阅者中最早的 last_update（拉最多内容，再各自过滤）
-        min_ts = min(si.get("last_update", 0) for si in subs.values())
+        # 只根据可投递目标计算断点；离线旧平台不消耗 RSS/LLM。
+        min_ts = min(subs[user].get("last_update", 0) for user in ready_users)
         min_link = "" # 公共拉取不用after_link过滤，靠seen_links去重
 
         items = await self._poll(url, num=self.max_poll, after_ts=min_ts, after_link=min_link)
@@ -1700,15 +1750,19 @@ class MyRssPlugin(Star):
             return
 
         # 分发给每个订阅者（各自独立去重）
-        for i, user in enumerate(list(subs.keys())):
+        for i, user in enumerate(ready_users):
             if not self._is_current_runtime():
                 self.logger.warning("RSS分发中止：插件实例已被重载替换")
                 return
+            ready, reason = self._target_readiness(user)
+            if not ready:
+                self.logger.warning("RSS分发前目标失去就绪状态: target=%s reason=%s", user, reason)
+                continue
             lock = self._get_lock(url, user)
             async with lock:
                 await self._cron_cb_inner(url, user, prefetched_items=items)
             # 多个订阅者间随机延迟防风控
-            if i < len(subs) - 1:
+            if i < len(ready_users) - 1:
                 delay = random.uniform(self.push_delay_min, self.push_delay_max)
                 await asyncio.sleep(delay)
 
@@ -1805,6 +1859,7 @@ class MyRssPlugin(Star):
         merge_limit = 5
         batch = new_items[:merge_limit]
 
+        send_ok = True
         if len(batch) > 1:
             cards_raw = [await self._make_card_b64(it) for it in batch]
             cards = [c for c in cards_raw if c] # 过滤掉被内容审核拦截的空卡片
@@ -1815,24 +1870,30 @@ class MyRssPlugin(Star):
             if not merged:
                 for it in batch:
                     comps = await self._make_comps(it)
-                    await self.ctx.send_message(user, MessageChain(chain=comps, use_t2i_=self.t2i))
+                    result = await self.ctx.send_message(user, MessageChain(chain=comps, use_t2i_=self.t2i))
+                    send_ok = send_ok and bool(result)
             else:
                 comps = [Comp.Image.fromBase64(merged)]
                 if pn == "aiocqhttp" and self.compose:
                     node = Comp.Node(uin=0, name="Astrbot", content=comps)
-                    await self.ctx.send_message(user, MessageChain(chain=[node], use_t2i_=self.t2i))
+                    result = await self.ctx.send_message(user, MessageChain(chain=[node], use_t2i_=self.t2i))
                 else:
-                    await self.ctx.send_message(user, MessageChain(chain=comps, use_t2i_=self.t2i))
+                    result = await self.ctx.send_message(user, MessageChain(chain=comps, use_t2i_=self.t2i))
+                send_ok = bool(result)
         else:
             it = batch[0]
             comps = await self._make_comps(it)
             if pn == "aiocqhttp" and self.compose:
                 node = Comp.Node(uin=0, name="Astrbot", content=comps)
-                await self.ctx.send_message(user, MessageChain(chain=[node], use_t2i_=self.t2i))
+                result = await self.ctx.send_message(user, MessageChain(chain=[node], use_t2i_=self.t2i))
             else:
-                await self.ctx.send_message(user, MessageChain(chain=comps, use_t2i_=self.t2i))
+                result = await self.ctx.send_message(user, MessageChain(chain=comps, use_t2i_=self.t2i))
+            send_ok = bool(result)
 
-        self.logger.info("RSS推送完成: %s -> %s (%d条)", url, user, len(batch))
+        if send_ok:
+            self.logger.info("RSS推送完成: %s -> %s (%d条)", url, user, len(batch))
+        else:
+            self.logger.error("RSS投递失败（seen_links 已保留以防循环重推）: %s -> %s (%d条)", url, user, len(batch))
 
         # ============================================================
         # LLM 工具
@@ -1943,12 +2004,23 @@ class MyRssPlugin(Star):
                 state["target_origin"] = target_origin
                 return f"ℹ️「{state.get('title', feed_url)}」已经订阅到 {target_origin}，未重复写入。"
             ret = await self._add(feed_url, "*/15 * * * *", event, target_user=target_origin)
+            notice_groups = self.dh.data.setdefault("settings", {}).setdefault("proactive_notice_groups", [])
+            show_proactive_notice = "GroupMessage" in target_origin and target_origin not in notice_groups
+            if show_proactive_notice:
+                notice_groups.append(target_origin)
+                self.dh.save()
         if isinstance(ret, MessageEventResult):
             return ret
         state["consumed"] = True
         state["target_origin"] = target_origin
         self._reload_jobs()
-        return f"✅ 已订阅「{ret['title']}」\n目标：{target_origin}\n预览编号已消费。"
+        message = f"✅ 已订阅「{ret['title']}」\n目标：{target_origin}\n预览编号已消费。"
+        if show_proactive_notice:
+            message += (
+                "\n\n⚠️ 为确保定时动态能主动送达，请群主在 QQ 群设置 → 机器人 → 当前 Bot 中开启："
+                "\n1. 获取群内全部消息\n2. 机器人主动在群聊内发言"
+            )
+        return message
 
     @filter.llm_tool(name="myrss_preview")
     async def tool_preview(self, event: AstrMessageEvent, url: str = "",
@@ -2192,6 +2264,182 @@ class MyRssPlugin(Star):
             f"当前库：{result['current']}\n"
             f"已删除：{'、'.join(result['deleted'])}\n"
             f"删除前备份：{'、'.join(result['backups'])}"
+        )
+
+    @myrss.command("add")
+    async def cmd_add_direct(self, event: AstrMessageEvent, url: str = ""):
+        """安全直订当前群，固定 15 分钟。用法：/myrss add <URL或RSSHub路由>"""
+        permission = self._require_subscription_operator(event, "直接新增订阅")
+        if permission:
+            yield permission
+            return
+        origin = event.unified_msg_origin
+        if "GroupMessage" not in origin:
+            yield event.plain_result("❌ /myrss add 必须在目标群内执行，以便取得真实群会话 ID。")
+            return
+        full_url, route, error = self._resolve_feed_url(url)
+        if not full_url:
+            yield event.plain_result("❌ " + error)
+            return
+        raw = await self._fetch(full_url)
+        if not raw:
+            yield event.plain_result("❌ 无法访问该源，未建立订阅。")
+            return
+        try:
+            title, description, avatar = self.dh.parse_channel_info(raw)
+        except Exception as exc:
+            yield event.plain_result(f"❌ 频道解析失败：{exc}")
+            return
+        old_entry = self.dh.data.get(full_url)
+        if old_entry is None:
+            self.dh.data[full_url] = {"subscribers": {}, "info": {"title": title, "description": description, "avatar": avatar}}
+        try:
+            items = await self._poll(full_url, num=1)
+            if not items:
+                yield event.plain_result("❌ 该源没有可审核的最新动态，未建立订阅。")
+                return
+            status = await self._check_content_safe(items[0])
+            if status != "SAFE":
+                yield event.plain_result(f"🚫 最新动态安全审核结果为 {status}，未建立订阅。")
+                return
+            async with self._data_lock:
+                self.dh.data = self.dh._load()
+                if origin in self.dh.data.get(full_url, {}).get("subscribers", {}):
+                    yield event.plain_result(f"ℹ️ 本群已经订阅「{title}」，未重复写入。")
+                    return
+                result = await self._add(full_url, "*/15 * * * *", event, target_user=origin)
+                if isinstance(result, MessageEventResult):
+                    yield result
+                    return
+                subscriber = self.dh.data[full_url]["subscribers"][origin]
+                subscriber["created_by"] = {
+                    "session_origin": origin,
+                    "sender_openid": str(event.get_sender_id()),
+                }
+                subscriber["created_at"] = int(time.time())
+                notice_groups = self.dh.data.setdefault("settings", {}).setdefault("proactive_notice_groups", [])
+                show_notice = origin not in notice_groups
+                if show_notice:
+                    notice_groups.append(origin)
+                self.dh.save()
+                self._reload_jobs()
+            message = f"✅ 已订阅「{title}」\n固定每 15 分钟检查一次；当前历史动态不会立即推送。"
+            if show_notice:
+                message += (
+                    "\n\n⚠️ 请群主在 QQ 群设置 → 机器人 → 当前 Bot 中开启："
+                    "\n1. 获取群内全部消息\n2. 机器人主动在群聊内发言"
+                )
+            yield event.plain_result(message)
+        finally:
+            if old_entry is None and not self.dh.data.get(full_url, {}).get("subscribers"):
+                self.dh.data.pop(full_url, None)
+
+    @myrss.command("eye")
+    async def cmd_eye(self, event: AstrMessageEvent):
+        """随机查看一条科技/自然动态；不订阅、不修改 seen_links。"""
+        origin = event.unified_msg_origin
+        now = time.time()
+        if now - self._eye_cooldown.get(origin, 0) < 60:
+            yield event.plain_result("⏳ /myrss eye 每个会话 60 秒内只能使用一次。")
+            return
+        self._eye_cooldown[origin] = now
+        routes = [
+            "/twitter/user/NASA", "/twitter/user/esa", "/twitter/user/CERN",
+            "/twitter/user/OpenAI", "/twitter/user/AnthropicAI", "/twitter/user/WHO",
+            "/twitter/user/NatGeo", "/twitter/user/ScienceMagazine",
+        ]
+        route = random.choice(routes)
+        full_url, _, error = self._resolve_feed_url(route)
+        if not full_url:
+            yield event.plain_result("❌ " + error)
+            return
+        raw = await self._fetch(full_url)
+        if not raw:
+            yield event.plain_result("本次随机源暂时不可访问，请稍后再试。")
+            return
+        try:
+            title, description, avatar = self.dh.parse_channel_info(raw)
+        except Exception:
+            yield event.plain_result("本次随机源无法解析，请稍后再试。")
+            return
+        old_entry = self.dh.data.get(full_url)
+        if old_entry is None:
+            self.dh.data[full_url] = {"subscribers": {}, "info": {"title": title, "description": description, "avatar": avatar}}
+        try:
+            items = await self._poll(full_url, num=1)
+            if not items:
+                yield event.plain_result("本次随机源暂无可展示内容。")
+                return
+            item = items[0]
+            status = await self._check_content_safe(item)
+            if status != "SAFE":
+                yield event.plain_result("本次随机内容未通过安全审核，已停止；不会继续循环尝试其他源。")
+                return
+            comps = await self._make_comps(item)
+            yield event.chain_result(comps).use_t2i(self.t2i)
+        finally:
+            if old_entry is None:
+                self.dh.data.pop(full_url, None)
+
+    @myrss.command("purgelegacy")
+    async def cmd_purgelegacy(self, event: AstrMessageEvent, action: str = "preview"):
+        """两阶段清除旧 NapCat/nap端 订阅目标；保留 QQ 官方等新平台订阅。"""
+        admin_check = self._require_admin(event, "清除旧平台订阅")
+        if admin_check:
+            yield admin_check
+            return
+        async with self._data_lock:
+            self.dh.data = self.dh._load()
+            targets = []
+            for url, feed in self.dh.data.items():
+                if url in ("rsshub_endpoints", "settings") or not isinstance(feed, dict):
+                    continue
+                for origin in feed.get("subscribers", {}):
+                    platform_id = str(origin).split(":", 1)[0]
+                    if platform_id in ("nap端", "aiocqhttp"):
+                        targets.append((url, str(origin)))
+            fingerprint_source = json.dumps(sorted(targets), ensure_ascii=False)
+            fingerprint = hashlib.sha256(fingerprint_source.encode()).hexdigest()[:16]
+            if action.strip().lower() != "confirm":
+                by_origin = {}
+                for _, origin in targets:
+                    by_origin[origin] = by_origin.get(origin, 0) + 1
+                self._legacy_purge_preview = {"fingerprint": fingerprint, "created_at": time.time()}
+                lines = [
+                    "【旧平台订阅清理预检】",
+                    f"将删除 {len(targets)} 条旧目标关系，涉及 {len(by_origin)} 个旧群会话。",
+                    "只匹配平台 ID 为 nap端 或 aiocqhttp；头条flag 等 QQ 官方订阅不会删除。",
+                    f"预检指纹：{fingerprint}",
+                ]
+                lines.extend(f"- {origin}: {count} 个源" for origin, count in sorted(by_origin.items()))
+                lines.append("确认执行：/myrss purgelegacy confirm（10 分钟内有效）")
+                yield event.plain_result("\n".join(lines))
+                return
+            preview = self._legacy_purge_preview
+            if not preview or time.time() - preview.get("created_at", 0) > 600:
+                yield event.plain_result("❌ 清理预检不存在或已过期，请先执行 /myrss purgelegacy。")
+                return
+            if preview.get("fingerprint") != fingerprint:
+                self._legacy_purge_preview = None
+                yield event.plain_result("❌ 旧订阅在预检后发生变化，已拒绝删除；请重新预检。")
+                return
+            backup = self.dh.get_data_path() + ".pre_purgelegacy_" + datetime.now().strftime("%Y%m%d_%H%M%S") + ".bak"
+            shutil.copy2(self.dh.get_data_path(), backup)
+            removed = 0
+            for url, origin in targets:
+                subscribers = self.dh.data.get(url, {}).get("subscribers", {})
+                if origin in subscribers:
+                    del subscribers[origin]
+                    removed += 1
+            self.dh.save()
+            verified = self.dh._read_json(self.dh.get_data_path())
+            if not isinstance(verified, dict):
+                raise RuntimeError("清理后的正式库读回失败")
+            self._legacy_purge_preview = None
+            self._reload_jobs()
+        yield event.plain_result(
+            f"✅ 已清除 {removed} 条旧平台订阅关系。\n"
+            f"QQ 官方等其他平台订阅保持不变。\n备份：{backup}"
         )
 
     @myrss.command("debug")
@@ -2685,6 +2933,17 @@ class MyRssPlugin(Star):
         except Exception:
             pass
         return False
+
+    def _is_subscription_operator(self, event: AstrMessageEvent) -> bool:
+        return self._is_astrbot_admin(event) or str(event.get_sender_id()) in self.subscription_operator_ids
+
+    def _require_subscription_operator(self, event: AstrMessageEvent, action: str):
+        if not self._is_subscription_operator(event):
+            return event.plain_result(
+                f"⚠️ {action}仅 AstrBot 管理员或 MyRSS 操作员可用。"
+                f"\n当前 OpenID：{event.get_sender_id()}"
+            )
+        return None
 
     def _require_admin(self, event: AstrMessageEvent, action: str = "此操作"):
         """管理员权限检查，失败时直接 yield 回复"""

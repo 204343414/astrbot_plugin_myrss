@@ -101,6 +101,9 @@ class MyRssWebController:
             result = sorted(groups.values(), key=lambda item: item["group_id"])
             for group in result:
                 group["feeds"].sort(key=lambda item: item["title"])
+                ready, reason = self.plugin._target_readiness(group["origin"])
+                group["delivery_ready"] = ready
+                group["delivery_reason"] = reason
             raw_events = data.get("settings", {}).get("safety_events", []) if isinstance(data.get("settings"), dict) else []
             safety_events = []
             for event in raw_events[:20] if isinstance(raw_events, list) else []:
