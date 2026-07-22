@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any, Callable, Awaitable, cast
+import os
 
 from astrbot.api import logger
 from astrbot.api.star import Context
@@ -81,22 +82,39 @@ class MyRssWebController:
                             "feeds": [],
                         },
                     )
+                    preview = feed.get("last_item_preview")
+                    if not isinstance(preview, dict) or preview.get("safety_status") != "SAFE":
+                        preview = None
                     group["feeds"].append(
                         {
                             "title": info.get("title", url),
+                            "description": info.get("description", ""),
+                            "avatar": info.get("avatar", ""),
                             "url": url,
                             "cron_expr": sub.get("cron_expr", ""),
                             "last_update": int(sub.get("last_update", 0) or 0),
                             "latest_link": sub.get("latest_link", ""),
                             "seen_count": len(sub.get("seen_links", [])),
+                            "preview": preview,
                         }
                     )
             result = sorted(groups.values(), key=lambda item: item["group_id"])
             for group in result:
                 group["feeds"].sort(key=lambda item: item["title"])
+            raw_events = data.get("settings", {}).get("safety_events", []) if isinstance(data.get("settings"), dict) else []
+            safety_events = []
+            for event in raw_events[:20] if isinstance(raw_events, list) else []:
+                if not isinstance(event, dict):
+                    continue
+                # API 白名单字段，绝不向页面返回原始正文、图片或动态链接。
+                safety_events.append({key: event.get(key) for key in (
+                    "id", "status", "source", "reason", "blocked_at", "content_fingerprint"
+                )})
             return {
                 "data_path": self.plugin.dh.get_data_path(),
+                "data_mtime": int(os.path.getmtime(self.plugin.dh.get_data_path())) if os.path.exists(self.plugin.dh.get_data_path()) else 0,
                 "group_count": len(result),
                 "subscription_count": sum(len(group["feeds"]) for group in result),
+                "safety_events": safety_events,
                 "groups": result,
             }

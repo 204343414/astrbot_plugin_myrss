@@ -1462,6 +1462,42 @@ class MyRssPlugin(Star):
             self._safe_cache[cache_key] = "REJECT"
             return "REJECT"
 
+    def _record_safety_event(self, url: str, item: RSSItem, status: str, reason: str = "") -> None:
+        """记录不含违规正文/图片的安全事件；同一源同一动态只保留一条。"""
+        if status not in ("REJECT", "MALICIOUS"):
+            return
+        item_key = self._item_cache_key(item)
+        event_id = hashlib.sha256(f"{url}|{item_key}|{status}".encode()).hexdigest()[:16]
+        settings = self.dh.data.setdefault("settings", {})
+        events = settings.setdefault("safety_events", [])
+        if any(isinstance(event, dict) and event.get("id") == event_id for event in events):
+            return
+        events.insert(0, {
+            "id": event_id,
+            "status": status,
+            "source": item.chan_title or self.dh.data.get(url, {}).get("info", {}).get("title", "未知源"),
+            "reason": (reason or "综合内容审核未通过")[:160],
+            "blocked_at": int(time.time()),
+            "content_fingerprint": hashlib.sha256(item_key.encode()).hexdigest()[:12],
+        })
+        settings["safety_events"] = events[:100]
+
+    def _store_safe_item_preview(self, url: str, item: RSSItem) -> None:
+        """保存 UI 所需的最新安全内容，不增加抓取或 LLM 调用。"""
+        feed = self.dh.data.get(url)
+        if not isinstance(feed, dict):
+            return
+        feed["last_item_preview"] = {
+            "title": (item.title or "")[:160],
+            "description": (item.description or "")[:500],
+            "link": item.link or "",
+            "pub_date": item.pubDate or "",
+            "pub_timestamp": int(item.pubDate_timestamp or 0),
+            "image_url": item.pic_urls[0] if item.pic_urls else "",
+            "safety_status": "SAFE",
+            "updated_at": int(time.time()),
+        }
+
     def _get_avatar_url(self, item: RSSItem) -> str:
         """从存储的订阅数据里获取频道头像URL"""
         for url, info in self.dh.data.items():
@@ -1738,15 +1774,31 @@ class MyRssPlugin(Star):
         # 内容过滤（增强版）
         if self.content_filter:
             filtered = []
+            metadata_changed = False
             for it in new_items:
                 status = await self._check_content_safe(it)
                 if status == "SAFE":
                     filtered.append(it)
-                elif status == "MALICIOUS":
-                    self.logger.warning("[MyRSS] MALICIOUS filtered: %s", it.title[:30])
                 else:
-                    self.logger.info("[MyRSS] REJECT filtered: %s", it.title[:30])
+                    vision = self._vision_cache.get(self._item_cache_key(it), {})
+                    vision_status = vision.get("status") if isinstance(vision, dict) else None
+                    reason = (
+                        "图片审核未通过或无法可靠识别"
+                        if vision_status in ("REJECT", "MALICIOUS")
+                        else "正文与图片综合审核未通过"
+                    )
+                    self._record_safety_event(url, it, status, reason)
+                    metadata_changed = True
+                    if status == "MALICIOUS":
+                        self.logger.warning("[MyRSS] MALICIOUS filtered: %s", it.title[:30])
+                    else:
+                        self.logger.info("[MyRSS] REJECT filtered: %s", it.title[:30])
             new_items = filtered
+            if new_items:
+                self._store_safe_item_preview(url, new_items[0])
+                metadata_changed = True
+            if metadata_changed:
+                self.dh.save()
         if not new_items:
             return
         pn = user.split(":")[0]
