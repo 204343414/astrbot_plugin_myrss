@@ -806,8 +806,6 @@ class MyRssPlugin(Star):
         self.max_vision_images = 9
         self._preview_states = {}  # key=(origin, preview_id), value=一次性安全预览状态
         self._preview_ttl_seconds = 600
-        self._migration_preview = None
-        self._legacy_purge_preview = None
         self._ready_group_sessions = set()  # 本次进程启动后实际观察到消息的群会话
         self._eye_cooldown = {}
         self._target_send_locks = {}
@@ -983,6 +981,78 @@ class MyRssPlugin(Star):
         return {"fetch_ok": fetch_ok, "item_count": item_count, "send_ok": send_ok,
                 "fetch_error": fetch_error if not fetch_ok else "",
                 "send_error": "" if send_ok else "SEND_RETURNED_FALSE"}
+
+    async def add_subscription_from_ui(self, origin: str, value: str) -> dict:
+        """Dashboard 安全新增：预审最新动态后固定 15 分钟订阅，不推历史内容。"""
+        origin = str(origin or "")
+        if "GroupMessage" not in origin:
+            raise ValueError("目标不是群会话")
+        if origin not in {sub for feed_url, feed in self.dh.data.items() if feed_url not in ("rsshub_endpoints", "settings") and isinstance(feed, dict) for sub in feed.get("subscribers", {})}:
+            # UI 只管理已经被插件观察/登记过的群，不能构造任意 origin。
+            known_in_web = any(origin == group_origin for group_origin in self._ready_group_sessions)
+            if not known_in_web:
+                raise ValueError("目标群尚未被 MyRSS 观察到；请先在群内使用一次 Bot")
+        full_url, route, error = self._resolve_feed_url(value)
+        if not full_url:
+            raise ValueError(error)
+        raw = await self._fetch(full_url)
+        if not raw:
+            raise ValueError("无法访问该 RSS 源")
+        try:
+            title, description, avatar = self.dh.parse_channel_info(raw)
+        except Exception as exc:
+            raise ValueError(f"频道解析失败: {exc}") from exc
+        old_entry = self.dh.data.get(full_url)
+        if old_entry is None:
+            self.dh.data[full_url] = {
+                "subscribers": {},
+                "info": {"title": title, "description": description, "avatar": avatar},
+            }
+        try:
+            items = await self._poll(full_url, num=1)
+            if not items:
+                raise ValueError("该源没有可审核的最新动态")
+            status = await self._check_content_safe(items[0])
+            if status != "SAFE":
+                raise ValueError(f"最新动态未通过安全审核: {status}")
+            async with self._data_lock:
+                self.dh.data = self.dh._load()
+                if origin in self.dh.data.get(full_url, {}).get("subscribers", {}):
+                    return {"created": False, "title": title, "route": route, "message": "本群已经订阅该源"}
+                # 预审期间的临时 feed 不一定在磁盘，正式写入前补齐。
+                self.dh.data.setdefault(full_url, {
+                    "subscribers": {},
+                    "info": {"title": title, "description": description, "avatar": avatar},
+                })
+                self.dh.data[full_url].setdefault("subscribers", {})[origin] = {
+                    "cron_expr": "*/15 * * * *",
+                    "last_update": items[0].pubDate_timestamp,
+                    "latest_link": items[0].link,
+                    "seen_links": [self._item_cache_key(item) for item in items if self._item_cache_key(item)][:200],
+                    "created_by": {"source": "dashboard"},
+                    "created_at": int(time.time()),
+                }
+                self.dh.save()
+                self._reload_jobs()
+            return {"created": True, "title": title, "route": route, "message": "订阅成功，固定每15分钟检查"}
+        finally:
+            if old_entry is None and not self.dh.data.get(full_url, {}).get("subscribers"):
+                self.dh.data.pop(full_url, None)
+
+    async def remove_subscription_from_ui(self, origin: str, feed_url: str) -> dict:
+        """Dashboard 精确退订一个群-源关系，不清空其他群与源级缓存。"""
+        origin = str(origin or "")
+        feed_url = str(feed_url or "")
+        async with self._data_lock:
+            self.dh.data = self.dh._load()
+            feed = self.dh.data.get(feed_url)
+            if not isinstance(feed, dict) or origin not in feed.get("subscribers", {}):
+                raise ValueError("订阅关系不存在或已被删除")
+            title = feed.get("info", {}).get("title", feed_url) if isinstance(feed.get("info"), dict) else feed_url
+            del feed["subscribers"][origin]
+            self.dh.save()
+            self._reload_jobs()
+        return {"removed": True, "title": title}
 
     def _record_delivery_status(self, url: str, origin: str, status: str, category: str = "") -> None:
         sub = self.dh.data.get(url, {}).get("subscribers", {}).get(origin)
@@ -2335,121 +2405,6 @@ class MyRssPlugin(Star):
     def myrss(self):
         pass
 
-    @myrss.command("migrate")
-    async def cmd_migrate(self, event: AstrMessageEvent, action: str = "preview"):
-        """两阶段迁移旧持久化文件。先 /myrss migrate，再 /myrss migrate confirm。"""
-        admin_check = self._require_admin(event, "迁移订阅数据")
-        if admin_check:
-            yield admin_check
-            return
-        snapshot = self.dh.migration_snapshot()
-        if action.strip().lower() != "confirm":
-            self._migration_preview = {"fingerprint": snapshot["fingerprint"], "created_at": time.time()}
-            lines = [f"📂 当前库：{snapshot['current']}", f"🔎 迁移指纹：{snapshot['fingerprint']}"]
-            if not snapshot["legacy"]:
-                lines.append("未发现旧数据文件，无需迁移。")
-            else:
-                lines.append("发现旧数据：")
-                for item in snapshot["legacy"]:
-                    lines.append(
-                        f"- {item['path']} | JSON={'有效' if item['valid'] else '损坏'} | "
-                        f"{item['sources']} 个源 / {item['subscriptions']} 条订阅"
-                    )
-                lines.append("合并规则：seen_links 并集、last_update 取较大值、新库 cron 优先。")
-                lines.append("确认后会先备份旧文件，再删除旧 _data.json。执行：/myrss migrate confirm")
-            yield event.plain_result("\n".join(lines))
-            return
-
-        preview = self._migration_preview
-        if not preview or time.time() - preview["created_at"] > 600:
-            yield event.plain_result("❌ 迁移预检不存在或已超过 10 分钟，请先执行 /myrss migrate。")
-            return
-        if preview["fingerprint"] != snapshot["fingerprint"]:
-            self._migration_preview = None
-            yield event.plain_result("❌ 旧文件在预检后发生变化，已拒绝执行；请重新预检。")
-            return
-        async with self._data_lock:
-            result = self.dh.migrate_and_delete_legacy()
-            self._reload_jobs()
-        self._migration_preview = None
-        if not result["merged"]:
-            yield event.plain_result("未发现可迁移的旧文件。")
-            return
-        yield event.plain_result(
-            f"✅ 已合并 {result['merged']} 个旧文件并完成读回校验。\n"
-            f"当前库：{result['current']}\n"
-            f"已删除：{'、'.join(result['deleted'])}\n"
-            f"删除前备份：{'、'.join(result['backups'])}"
-        )
-
-    @myrss.command("add")
-    async def cmd_add_direct(self, event: AstrMessageEvent, url: str = ""):
-        """安全直订当前群，固定 15 分钟。用法：/myrss add <URL或RSSHub路由>"""
-        permission = self._require_subscription_operator(event, "直接新增订阅")
-        if permission:
-            yield permission
-            return
-        origin = event.unified_msg_origin
-        if "GroupMessage" not in origin:
-            yield event.plain_result("❌ /myrss add 必须在目标群内执行，以便取得真实群会话 ID。")
-            return
-        full_url, route, error = self._resolve_feed_url(url)
-        if not full_url:
-            yield event.plain_result("❌ " + error)
-            return
-        raw = await self._fetch(full_url)
-        if not raw:
-            yield event.plain_result("❌ 无法访问该源，未建立订阅。")
-            return
-        try:
-            title, description, avatar = self.dh.parse_channel_info(raw)
-        except Exception as exc:
-            yield event.plain_result(f"❌ 频道解析失败：{exc}")
-            return
-        old_entry = self.dh.data.get(full_url)
-        if old_entry is None:
-            self.dh.data[full_url] = {"subscribers": {}, "info": {"title": title, "description": description, "avatar": avatar}}
-        try:
-            items = await self._poll(full_url, num=1)
-            if not items:
-                yield event.plain_result("❌ 该源没有可审核的最新动态，未建立订阅。")
-                return
-            status = await self._check_content_safe(items[0])
-            if status != "SAFE":
-                yield event.plain_result(f"🚫 最新动态安全审核结果为 {status}，未建立订阅。")
-                return
-            async with self._data_lock:
-                self.dh.data = self.dh._load()
-                if origin in self.dh.data.get(full_url, {}).get("subscribers", {}):
-                    yield event.plain_result(f"ℹ️ 本群已经订阅「{title}」，未重复写入。")
-                    return
-                result = await self._add(full_url, "*/15 * * * *", event, target_user=origin)
-                if isinstance(result, MessageEventResult):
-                    yield result
-                    return
-                subscriber = self.dh.data[full_url]["subscribers"][origin]
-                subscriber["created_by"] = {
-                    "session_origin": origin,
-                    "sender_openid": str(event.get_sender_id()),
-                }
-                subscriber["created_at"] = int(time.time())
-                notice_groups = self.dh.data.setdefault("settings", {}).setdefault("proactive_notice_groups", [])
-                show_notice = origin not in notice_groups
-                if show_notice:
-                    notice_groups.append(origin)
-                self.dh.save()
-                self._reload_jobs()
-            message = f"✅ 已订阅「{title}」\n固定每 15 分钟检查一次；当前历史动态不会立即推送。"
-            if show_notice:
-                message += (
-                    "\n\n⚠️ 请群主在 QQ 群设置 → 机器人 → 当前 Bot 中开启："
-                    "\n1. 获取群内全部消息\n2. 机器人主动在群聊内发言"
-                )
-            yield event.plain_result(message)
-        finally:
-            if old_entry is None and not self.dh.data.get(full_url, {}).get("subscribers"):
-                self.dh.data.pop(full_url, None)
-
     @myrss.command("eye")
     async def cmd_eye(self, event: AstrMessageEvent):
         """随机查看一条科技/自然动态；不订阅、不修改 seen_links。"""
@@ -2497,262 +2452,6 @@ class MyRssPlugin(Star):
             if old_entry is None:
                 self.dh.data.pop(full_url, None)
 
-    @myrss.command("testdelivery")
-    async def cmd_testdelivery(self, event: AstrMessageEvent):
-        """验证当前群的 QQ 官方主动图片投递链路；不读 RSS、不调用 LLM。"""
-        permission = self._require_subscription_operator(event, "主动投递自检")
-        if permission:
-            yield permission
-            return
-        origin = event.unified_msg_origin
-        if "GroupMessage" not in origin:
-            yield event.plain_result("❌ 请在目标群内执行 /myrss testdelivery。")
-            return
-        self._ready_group_sessions.add(origin)
-        ready, reason = self._target_readiness(origin)
-        if not ready:
-            yield event.plain_result(f"❌ 当前群主动投递未就绪：{reason}")
-            return
-        b64 = await self.card.make(
-            channel="MyRSS", title="QQ 官方主动推送自检",
-            desc="这是一张本地生成的测试卡片；没有抓取 RSS，也没有调用 LLM。",
-            link="", ts=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            thumb=None, avatar=None, comment="", bot_avatar=None, bot_provider_name="",
-        )
-        if not b64:
-            yield event.plain_result("❌ Browserless 测试卡片生成失败，尚未执行主动发送。")
-            return
-        ok = await self._send_message_guarded(
-            origin, MessageChain(chain=[Comp.Image.fromBase64(b64)], use_t2i_=self.t2i)
-        )
-        if ok:
-            yield event.plain_result("✅ 主动图片投递调用已返回成功。请同时确认群里确实出现测试卡片。")
-        else:
-            yield event.plain_result("❌ 主动投递返回失败；未执行自动重试。")
-
-    @myrss.command("purgelegacy")
-    async def cmd_purgelegacy(self, event: AstrMessageEvent, action: str = "preview"):
-        """两阶段清除旧 NapCat/nap端 订阅目标；保留 QQ 官方等新平台订阅。"""
-        admin_check = self._require_admin(event, "清除旧平台订阅")
-        if admin_check:
-            yield admin_check
-            return
-        async with self._data_lock:
-            self.dh.data = self.dh._load()
-            targets = []
-            for url, feed in self.dh.data.items():
-                if url in ("rsshub_endpoints", "settings") or not isinstance(feed, dict):
-                    continue
-                for origin in feed.get("subscribers", {}):
-                    platform_id = str(origin).split(":", 1)[0]
-                    if platform_id in ("nap端", "aiocqhttp"):
-                        targets.append((url, str(origin)))
-            fingerprint_source = json.dumps(sorted(targets), ensure_ascii=False)
-            fingerprint = hashlib.sha256(fingerprint_source.encode()).hexdigest()[:16]
-            if action.strip().lower() != "confirm":
-                by_origin = {}
-                for _, origin in targets:
-                    by_origin[origin] = by_origin.get(origin, 0) + 1
-                self._legacy_purge_preview = {"fingerprint": fingerprint, "created_at": time.time()}
-                lines = [
-                    "【旧平台订阅清理预检】",
-                    f"将删除 {len(targets)} 条旧目标关系，涉及 {len(by_origin)} 个旧群会话。",
-                    "只匹配平台 ID 为 nap端 或 aiocqhttp；头条flag 等 QQ 官方订阅不会删除。",
-                    f"预检指纹：{fingerprint}",
-                ]
-                lines.extend(f"- {origin}: {count} 个源" for origin, count in sorted(by_origin.items()))
-                lines.append("确认执行：/myrss purgelegacy confirm（10 分钟内有效）")
-                yield event.plain_result("\n".join(lines))
-                return
-            preview = self._legacy_purge_preview
-            if not preview or time.time() - preview.get("created_at", 0) > 600:
-                yield event.plain_result("❌ 清理预检不存在或已过期，请先执行 /myrss purgelegacy。")
-                return
-            if preview.get("fingerprint") != fingerprint:
-                self._legacy_purge_preview = None
-                yield event.plain_result("❌ 旧订阅在预检后发生变化，已拒绝删除；请重新预检。")
-                return
-            backup = self.dh.get_data_path() + ".pre_purgelegacy_" + datetime.now().strftime("%Y%m%d_%H%M%S") + ".bak"
-            shutil.copy2(self.dh.get_data_path(), backup)
-            removed = 0
-            for url, origin in targets:
-                subscribers = self.dh.data.get(url, {}).get("subscribers", {})
-                if origin in subscribers:
-                    del subscribers[origin]
-                    removed += 1
-            self.dh.save()
-            verified = self.dh._read_json(self.dh.get_data_path())
-            if not isinstance(verified, dict):
-                raise RuntimeError("清理后的正式库读回失败")
-            self._legacy_purge_preview = None
-            self._reload_jobs()
-        yield event.plain_result(
-            f"✅ 已清除 {removed} 条旧平台订阅关系。\n"
-            f"QQ 官方等其他平台订阅保持不变。\n备份：{backup}"
-        )
-
-    @myrss.command("debug")
-    async def cmd_debug(self, event: AstrMessageEvent):
-        """输出 MyRSS 持久化、调度器和只读页面诊断信息（仅管理员）。"""
-        admin_check = self._require_admin(event, "查看 MyRSS 诊断")
-        if admin_check:
-            yield admin_check
-            return
-        path = self.dh.get_data_path()
-        disk = self.dh._read_json(path) if os.path.exists(path) else None
-        valid = isinstance(disk, dict)
-        data = disk if valid else {}
-        source_count = 0
-        subscription_count = 0
-        group_subscriptions = {}
-        malformed = []
-        for url, feed in data.items():
-            if url in ("rsshub_endpoints", "settings"):
-                continue
-            source_count += 1
-            if not isinstance(feed, dict):
-                malformed.append(f"源不是对象: {url[:80]}")
-                continue
-            subscribers = feed.get("subscribers", {})
-            if not isinstance(subscribers, dict):
-                malformed.append(f"subscribers 不是对象: {url[:80]}")
-                continue
-            subscription_count += len(subscribers)
-            for origin, sub in subscribers.items():
-                if not isinstance(sub, dict):
-                    malformed.append(f"订阅记录不是对象: {str(origin)[:80]}")
-                    continue
-                if "GroupMessage" in str(origin):
-                    group_subscriptions[str(origin)] = group_subscriptions.get(str(origin), 0) + 1
-                for required in ("cron_expr", "last_update", "latest_link", "seen_links"):
-                    if required not in sub:
-                        malformed.append(f"缺少 {required}: {str(origin)[:50]} / {url[:50]}")
-                        break
-        runtime = builtins._ASTRBOT_MYRSS_RUNTIME
-        scheduler_running = bool(getattr(self.sched, "running", False))
-        try:
-            job_count = len(self.sched.get_jobs())
-        except Exception:
-            job_count = -1
-        legacy = self.dh.migration_snapshot()["legacy"]
-        file_size = os.path.getsize(path) if os.path.exists(path) else 0
-        file_mtime = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(os.path.getmtime(path))) if os.path.exists(path) else "—"
-        lines = [
-            "【MyRSS Debug】",
-            f"实例: {id(self)} / generation={self._runtime_generation} / current={self._is_current_runtime()}",
-            f"调度器: running={scheduler_running} / jobs={job_count} / runtime_owner={runtime.get('instance') is self}",
-            f"正式库: {path}",
-            f"文件: exists={os.path.exists(path)} / valid_json={valid} / size={file_size} / mtime={file_mtime}",
-            f"数据: {source_count} 个源 / {subscription_count} 条订阅 / {len(group_subscriptions)} 个订阅群",
-            f"内存与磁盘顶层一致: {set(self.dh.data.keys()) == set(data.keys()) if valid else False}",
-            f"Web路由: {', '.join(self.web.registered_routes) or '未登记'}",
-            f"Web最近错误: {self.web.last_error or '无'}",
-            f"旧库残留: {len(legacy)} 个",
-        ]
-        for origin, count in sorted(group_subscriptions.items()):
-            lines.append(f"- {origin}: {count} 个源")
-        if malformed:
-            lines.append(f"结构异常: {len(malformed)} 条（最多显示 10 条）")
-            lines.extend(f"! {item}" for item in malformed[:10])
-        else:
-            lines.append("结构异常: 0")
-        yield event.plain_result("\n".join(lines))
-
-    @myrss.group("rsshub")
-    def rsshub(self, event: AstrMessageEvent):
-        pass
-
-    @rsshub.command("add")
-    async def rsshub_add(self, event: AstrMessageEvent, url: str):
-        """添加RSSHub端点（仅管理员）"""
-        admin_check = self._require_admin(event, "添加 RSSHub 端点")
-        if admin_check:
-            yield admin_check
-            return
-        if url.endswith("/"):
-            url = url[:-1]
-        if url in self.dh.data["rsshub_endpoints"]:
-            yield event.plain_result("已存在")
-            return
-        self.dh.data["rsshub_endpoints"].append(url)
-        self.dh.save()
-        yield event.plain_result("✅ 已添加: " + url)
-
-    @rsshub.command("list")
-    async def rsshub_list(self, event: AstrMessageEvent):
-        """列出所有RSSHub端点"""
-        eps = self.dh.data["rsshub_endpoints"]
-        if not eps:
-            yield event.plain_result("暂无端点，请先 /myrss rsshub add ")
-            return
-        txt = "RSSHub端点：\\n"
-        for i, x in enumerate(eps):
-            txt += " " + str(i) + ": " + x + "\\n"
-        yield event.plain_result(txt)
-
-    @rsshub.command("remove")
-    async def rsshub_rm(self, event: AstrMessageEvent, idx: int):
-        """删除RSSHub端点（仅管理员）"""
-        admin_check = self._require_admin(event, "删除 RSSHub 端点")
-        if admin_check:
-            yield admin_check
-            return
-        eps = self.dh.data["rsshub_endpoints"]
-        if idx < 0 or idx >= len(eps):
-            yield event.plain_result("编号越界")
-            return
-        removed = eps.pop(idx)
-        self.dh.save()
-        yield event.plain_result("✅ 已删除: " + removed)
-
-    # ============================================================
-    # 黑名单管理命令（仅管理员）
-    # ============================================================
-    @myrss.group("blacklist")
-    def blacklist(self, event: AstrMessageEvent):
-        pass
-
-    @blacklist.command("list")
-    async def blacklist_list(self, event: AstrMessageEvent):
-        """查看全局黑名单（仅管理员）"""
-        admin_check = self._require_admin(event, "查看黑名单")
-        if admin_check:
-            yield admin_check
-            return
-        settings = self.dh.data.setdefault("settings", {})
-        bl = settings.get("blacklisted_users", [])
-        if not bl:
-            yield event.plain_result("当前黑名单为空。")
-            return
-        txt = "🚫 全局黑名单用户：\n" + "\n".join(f"  - {uid}" for uid in bl)
-        yield event.plain_result(txt)
-
-    @blacklist.command("add")
-    async def blacklist_add(self, event: AstrMessageEvent, user_id: str):
-        """添加用户到全局黑名单（仅管理员）"""
-        admin_check = self._require_admin(event, "添加黑名单")
-        if admin_check:
-            yield admin_check
-            return
-        if not user_id:
-            yield event.plain_result("用法: /myrss blacklist add <用户ID>")
-            return
-        self._add_to_blacklist(user_id, "管理员手动添加")
-        yield event.plain_result(f"✅ 已将 {user_id} 加入全局黑名单。")
-
-    @blacklist.command("remove")
-    async def blacklist_remove(self, event: AstrMessageEvent, user_id: str):
-        """从全局黑名单移除用户（仅管理员）"""
-        admin_check = self._require_admin(event, "移除黑名单")
-        if admin_check:
-            yield admin_check
-            return
-        if not user_id:
-            yield event.plain_result("用法: /myrss blacklist remove <用户ID>")
-            return
-        self._remove_from_blacklist(user_id)
-        yield event.plain_result(f"✅ 已将 {user_id} 从黑名单移除。")
-
     @myrss.command("list")
     async def cmd_list(self, event: AstrMessageEvent):
         """列出当前订阅"""
@@ -2766,300 +2465,6 @@ class MyRssPlugin(Star):
             info = self.dh.data[u]["info"]
             txt += " " + str(i) + ". " + info["title"] + "\\n"
         yield event.plain_result(txt)
-
-    @myrss.command("remove")
-    async def cmd_rm(self, event: AstrMessageEvent, idx: int):
-        """取消订阅"""
-        user = event.unified_msg_origin
-        urls = self.dh.get_subs(user)
-        if idx < 0 or idx >= len(urls):
-            yield event.plain_result("编号越界")
-            return
-        u = urls[idx]
-        t = self.dh.data[u]["info"]["title"]
-        self.dh.data[u]["subscribers"].pop(user)
-        self.dh.save()
-        self._reload_jobs()
-        yield event.plain_result("✅ 已取消: " + t)
-
-    @myrss.command("get")
-    async def cmd_get(self, event: AstrMessageEvent, idx: int):
-        """获取最新内容"""
-        user = event.unified_msg_origin
-        urls = self.dh.get_subs(user)
-        if idx < 0 or idx >= len(urls):
-            yield event.plain_result("编号越界")
-            return
-        items = await self._poll(urls[idx])
-        if not items:
-            yield event.plain_result("暂无内容")
-            return
-        comps = await self._make_comps(items[0])
-        pn = user.split(":")[0]
-        if pn == "aiocqhttp" and self.compose:
-            yield event.chain_result([Comp.Node(uin=0, name="Astrbot", content=comps)]).use_t2i(self.t2i)
-        else:
-            yield event.chain_result(comps).use_t2i(self.t2i)
-    
-    @myrss.command("clearcache")
-    async def cmd_clearcache(self, event: AstrMessageEvent):
-        """清空过滤缓存和锐评缓存"""
-        safe_count = len(self._safe_cache)
-        comment_count = len(self._comment_cache)
-        vision_count = len(self._vision_cache)
-        self._safe_cache.clear()
-        self._comment_cache.clear()
-        self._vision_cache.clear()
-        yield event.plain_result(
-            f"✅ 缓存已清空\\n 过滤缓存: {safe_count} 条已清除"
-            f"\\n 锐评缓存: {comment_count} 条已清除"
-            f"\\n 识图缓存: {vision_count} 条已清除"
-        )
-
-    @myrss.command("clear")
-    async def cmd_clear(self, event: AstrMessageEvent, target: str = "all"):
-        """清空所有/指定源的已推送历史记录，从今天开始重新计数（不会重复推旧内容）。
-        用法：
-        /myrss clear          清空当前用户所有订阅的推送历史
-        /myrss clear all      清空当前用户所有订阅
-        /myrss clear 0,2,3    清空指定编号的订阅源
-        /myrss clear 推特      清空包含关键词的订阅源
-        """
-        user = event.unified_msg_origin
-        urls = self.dh.get_subs(user)
-        if not urls:
-            yield event.plain_result("当前没有任何订阅，无需清空。")
-            return
-
-        target_urls = []
-        t = target.strip().lower()
-
-        if t in ("all", "全部", "清空", ""):
-            target_urls = urls
-        else:
-            # 尝试解析为编号列表（逗号/空格分隔）
-            nums = [int(x) for x in re.findall(r"\d+", t)]
-            if nums and all(0 <= n < len(urls) for n in nums):
-                target_urls = [urls[n] for n in nums]
-            else:
-                # 模糊匹配关键词
-                for u in urls:
-                    info = self.dh.data.get(u, {}).get("info", {})
-                    title = info.get("title", "")
-                    if t in title.lower() or t in u.lower():
-                        target_urls.append(u)
-
-        if not target_urls:
-            yield event.plain_result(f"没找到匹配的订阅源。用 /myrss list 查看当前订阅。")
-            return
-
-        cleared = []
-        for u in target_urls:
-            if u in self.dh.data:
-                subs = self.dh.data[u].get("subscribers", {})
-                if user in subs:
-                    subs[user]["seen_links"] = []
-                    subs[user]["latest_link"] = ""
-                    # last_update 保持原值，不清空（避免下次全量拉取）
-                    cleared.append(self.dh.data[u].get("info", {}).get("title", u))
-
-        self.dh.save()
-        yield event.plain_result(
-            f"✅ 已清空以下源的推送历史记录：\\n" +
-            "\\n".join(f" - {x}" for x in cleared) +
-            "\\n\\n从此刻开始的新内容才会被推送，历史旧内容不会重推。"
-        )
-
-    @myrss.command("test")
-    async def cmd_test(self, event: AstrMessageEvent, route: str = "/twitter/user/AnthropicAI"):
-        """测试推送流程：拉取指定源的最新一条，走完整的过滤+锐评+缓存流程。
-        用法：
-        /myrss test （默认 Anthropic 推特）
-        /myrss test /twitter/user/elonmusk （RSSHub 路由）
-        /myrss test https://x.com/elonmusk （自动转路由）
-        /myrss test https://space.bilibili.com/2267573/dynamic
-        """
-        eps = self.dh.data.get("rsshub_endpoints", [])
-        if not eps:
-            yield event.plain_result("没有配置 RSSHub 端点，无法测试。")
-            return
-        # 健壮的URL提取：不管什么格式（[url](url)、++格式、纯URL），先提取真实URL再匹配
-        urls = re.findall(r'https?://[^\s)\]]+', route)
-        if urls:
-            route = urls[0]  # 取第一个提取到的URL
-
-        if not route.startswith("/"):
-            matched = URLMapper.match(route)
-            if matched:
-                converted_route, platform_name = matched
-                yield event.plain_result(f"🔄 识别为 {platform_name}，转换路由: {converted_route}")
-                route = converted_route
-            else:
-                suggest = URLMapper.suggest(route)
-                yield event.plain_result(f"❌ 无法识别该链接: {route}\n\n{suggest}\n\n请用 /开头的路由重试，例如 /twitter/user/用户名。")
-                return
-
-        url = eps[0].rstrip("/") + route
-
-        yield event.plain_result(f"⏳ 开始测试推送流程...\\n源: {route}\\n10秒后拉取（模拟真实延迟）")
-
-        await asyncio.sleep(10)
-
-        # 第1步：拉取
-        yield event.plain_result("📡 [1/4] 正在拉取 RSS...")
-        # [test] 先抓一次频道信息，写入 dh.data，让 _poll() 能拿到 chan_title（否则显示"未知"）
-        try:
-            txt = await self._fetch(url)
-            if txt:
-                t, d, a = self.dh.parse_channel_info(txt)
-                self.dh.data[url] = {
-                    "info": {"title": t, "description": d, "avatar": a},
-                    "subscribers": {},
-                    "is_test": True,
-                }
-            else:
-                last_err = getattr(self, "_last_fetch_error", "无响应数据")
-                yield event.plain_result(f"⚠️ [1/4] 预抓取频道信息失败，后台报错：{last_err}")
-        except Exception as e:
-            yield event.plain_result(f"⚠️ [1/4] 预抓取频道信息异常：{type(e).__name__}: {e}")
-
-        items = await self._poll(url, num=1)
-        if not items:
-            last_err = getattr(self, "_last_fetch_error", "未知错误")
-            # Try to get more context from recent logs or the actual exception during this test
-            debug_extra = ""
-            try:
-                # If the last operation raised, it may have been caught higher; show what we have
-                if last_err == "未知错误" or "All fetch attempts" in str(last_err):
-                    debug_extra = "\n注意：本次失败没有抛出 Python 异常（可能是 HTTP 非200、超时、或返回空/错误页）。请查看 AstrBot 容器日志获取 aiohttp 详细错误。"
-            except:
-                pass
-
-            yield event.plain_result(f"""❌ 拉取失败，源无内容或不可访问。
-
-🔍 调试排错信息：
- - 请求 URL: {url}
- - 错误详情: {last_err}{debug_extra}
-
-💡 修复建议：
- 1. 代理问题（最常见）：为内网 rsshub 设置 NO_PROXY=rsshub,localhost,127.0.0.1 在容器环境变量或 docker run -e。
- 2. Docker 网络问题：如果容器是单独 docker run 启动的，"rsshub" 主机名可能无法解析。请使用 docker-compose 把 astrbot 和 rsshub 放在同一个 network，或把端点改成宿主机 IP:1200（如 http://172.17.0.1:1200）。
- 3. 本插件已对 rsshub 等内网地址自动 trust_env=False 禁用代理，请确认更新已应用并重启 Bot。
- 4. 临时绕过：把 rsshub_endpoints 改成能从 astrbot 容器直达的地址测试（例如宿主机 IP）。
-""")
-            return
-        item = items[0]
-        # [Hack] 临时把测试源的信息注入 data，让 _make_card_b64 能查到头像/标题
-        if url not in self.dh.data:
-            # 尝试再 fetch 一次拿 channel info
-            try:
-                txt = await self._fetch(url)
-                if txt:
-                    t, d, a = self.dh.parse_channel_info(txt)
-                    self.dh.data[url] = {
-                        "info": {"title": t, "description": d, "avatar": a},
-                        "subscribers": {}, # 空订阅
-                        "is_test": True # 标记为测试
-                    }
-            except Exception:
-                pass
-        yield event.plain_result(f"✅ 拉取成功: {item.title[:80]}")
-
-        # 第2步：内容过滤（走真实函数，会用缓存）
-        yield event.plain_result("🔍 [2/4] 正在过滤内容（LLM审核）...")
-        norm_link = item.link.split("#", 1)[0].split("?", 1)[0] if item.link else ""
-        cache_key = norm_link or (item.title + "|" + str(item.pubDate_timestamp))
-        was_cached = cache_key in self._safe_cache
-        safe = await self._check_content_safe(item)
-        if safe != "SAFE":
-            yield event.plain_result(
-                f"🚫 内容被过滤（判定不安全），不会推送。\\n"
-                f" 缓存命中: {was_cached}\\n"
-                f" 标题: {item.title[:60]}\\n"
-                f" 如果这是误杀，可能需要调整过滤 prompt 或换一个过滤 provider。\\n"
-                f" 提示: 可以临时关闭 content_filter 再测试，确认是过滤器问题还是其他问题。"
-            )
-            return
-        yield event.plain_result(f"✅ 内容安全。缓存命中: {was_cached}")
-
-        # 第3步：生成锐评（走真实函数，会用缓存）
-        yield event.plain_result("💬 [3/4] 正在生成锐评（LLM评论）...")
-        comment = ""
-        if self.enable_comment:
-            comment_was_cached = cache_key in self._comment_cache
-            comment = await self._generate_comment(item)
-            if comment:
-                yield event.plain_result(f"✅ 锐评: {comment[:80]}\\n 缓存命中: {comment_was_cached}")
-            else:
-                yield event.plain_result("⚠️ 锐评生成失败或为空")
-        else:
-            yield event.plain_result("⏭️ 锐评已关闭，跳过")
-
-        # 第4步：生成卡片并发送（走真实函数）
-        yield event.plain_result("🎨 [4/4] 正在生成卡片...")
-        comps = await self._make_comps(item)
-
-        user = event.unified_msg_origin
-        pn = user.split(":")[0]
-        if pn == "aiocqhttp" and self.compose:
-            yield event.chain_result([Comp.Node(uin=0, name="[测试]Astrbot", content=comps)]).use_t2i(self.t2i)
-        else:
-            yield event.chain_result(comps).use_t2i(self.t2i)
-
-        yield event.plain_result(
-            "✅ 测试完成！\\n"
-            f" 过滤缓存大小: {len(self._safe_cache)}\\n"
-            f" 识图缓存大小: {len(self._vision_cache)}\\n"
-            f" 锐评缓存大小: {len(self._comment_cache)}\\n"
-            "再次执行同样的命令可验证缓存是否命中（应显示 True）"
-        )
-
-    @myrss.command("groups")
-    async def cmd_groups(self, event: AstrMessageEvent):
-        """列出机器人加入的群（需要 aiocqhttp / NapCat）"""
-        try:
-            if event.get_platform_name() != "aiocqhttp":
-                yield event.plain_result("当前平台不支持获取群列表（仅 aiocqhttp/NapCat 支持）。")
-                return
-
-            # AstrBot 官方文档要求的调用方式
-            from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
-            if not isinstance(event, AiocqhttpMessageEvent):
-                yield event.plain_result("事件类型不匹配，无法调用协议端 API。")
-                return
-
-            client = event.bot
-            if not client:
-                yield event.plain_result("无法获取协议端 client。")
-                return
-
-            ret = await client.api.call_action('get_group_list')
-
-            # NapCat 返回格式可能是 list 或 dict{"data": list}
-            if isinstance(ret, list):
-                data = ret
-            elif isinstance(ret, dict):
-                data = ret.get("data", [])
-            else:
-                data = []
-
-            if not data:
-                yield event.plain_result("群列表为空，或协议端未返回数据。\\n返回值类型: " + str(type(ret).__name__))
-                return
-
-            lines = ["📋 机器人所在群列表："]
-            for i, g in enumerate(data):
-                if isinstance(g, dict):
-                    gid = g.get("group_id", "")
-                    gname = g.get("group_name", "")
-                    lines.append(f" {i}. {gname} ({gid})")
-                else:
-                    lines.append(f" {i}. {g}")
-
-            yield event.plain_result("\\n".join(lines))
-        except Exception as e:
-            self.logger.error("[MyRSS] get group list failed: %s", e, exc_info=True)
-            yield event.plain_result("获取群列表失败：" + str(e))
 
     # ============================================================
     # AstrBot 管理员权限 + 全局恶意黑名单
@@ -3093,272 +2498,3 @@ class MyRssPlugin(Star):
                 f"\n当前 OpenID：{event.get_sender_id()}"
             )
         return None
-
-    def _require_admin(self, event: AstrMessageEvent, action: str = "此操作"):
-        """管理员权限检查，失败时直接 yield 回复"""
-        if not self._is_astrbot_admin(event):
-            return event.plain_result(f"⚠️ {action}仅 AstrBot 管理员可用。\n普通用户请用自然语言对我说「关注 xxx」或「订阅 xxx」。")
-        return None
-
-    # 全局黑名单（存在 dh.data["settings"]["blacklisted_users"]）
-    def _is_blacklisted(self, user_id: str) -> bool:
-        settings = self.dh.data.setdefault("settings", {})
-        bl = settings.get("blacklisted_users", [])
-        is_bl = str(user_id) in [str(x) for x in bl]
-        if is_bl:
-            self.logger.info("[MyRSS] 黑名单命中: %s", user_id)
-        return is_bl
-
-    def _add_to_blacklist(self, user_id: str, reason: str = ""):
-        settings = self.dh.data.setdefault("settings", {})
-        bl = settings.setdefault("blacklisted_users", [])
-        uid = str(user_id)
-        if uid not in bl:
-            bl.append(uid)
-            self.dh.save()
-            self.logger.warning("[MyRSS] 用户 %s 已被加入全局黑名单，原因: %s", uid, reason)
-
-    def _remove_from_blacklist(self, user_id: str):
-        settings = self.dh.data.setdefault("settings", {})
-        bl = settings.get("blacklisted_users", [])
-        uid = str(user_id)
-        if uid in bl:
-            bl.remove(uid)
-            self.dh.save()
-
-    
-
-    
-
-    @myrss.command("subs")
-    async def cmd_subs(self, event: AstrMessageEvent):
-        """查看所有订阅源及其订阅群列表"""
-        lines = ["📋 所有订阅源："]
-        idx = 0
-        for url, info in self.dh.data.items():
-            if url in ("rsshub_endpoints", "settings"):
-                continue
-            subs = info.get("subscribers", {})
-            if not subs:
-                continue
-            title = info.get("info", {}).get("title", url)
-            lines.append(f"\\n{idx}. 📡 {title}")
-            lines.append(f" 路由: {url.split(':1200')[-1] if ':1200' in url else url}")
-            if subs:
-                for sub_id in subs:
-                    gid_short = sub_id.split(":")[-1]
-                    platform = sub_id.split(":")[0]
-                    cron = subs[sub_id].get("cron_expr", "?")
-                    lines.append(f" └ {gid_short} ({platform}) [{cron}]")
-            else:
-                lines.append(f" └ (无订阅者)")
-            idx += 1
-        if idx == 0:
-            yield event.plain_result("当前没有任何订阅源。")
-            return
-        yield event.plain_result("\\n".join(lines))
-
-    @myrss.command("unbind")
-    async def cmd_unbind(self, event: AstrMessageEvent, group_id: str = ""):
-        """把指定群从所有订阅源中退订。用法：/myrss unbind 721058477"""
-        if not group_id:
-            yield event.plain_result("用法: /myrss unbind <群号>\n 先用 /myrss subs 查看所有群号和订阅关系")
-            return
-
-        gids = [g.strip() for g in re.split(r'[,，\s]+', group_id) if g.strip()]
-        removed_per_group = {}
-        for target_gid in gids:
-            removed = 0
-            for url, info in self.dh.data.items():
-                if url in ("rsshub_endpoints", "settings"):
-                    continue
-                subs = info.get("subscribers", {})
-                for key in [k for k in subs if target_gid in k]:
-                    del subs[key]
-                    removed += 1
-            removed_per_group[target_gid] = removed
-
-        total_removed = sum(removed_per_group.values())
-        if total_removed:
-            self.dh.save()
-            self._reload_jobs()
-            details = "\n".join(f" 群 {gid}: 退订 {count} 个源" for gid, count in removed_per_group.items() if count)
-            yield event.plain_result(f"✅ 已退订，共 {total_removed} 条：\n{details}")
-        else:
-            yield event.plain_result(f"未发现指定群的订阅：{', '.join(gids)}")
-
-    @myrss.command("reset")
-    async def cmd_reset(self, event: AstrMessageEvent):
-        """重置所有订阅源的推送基准。
-        根据配置 force_reset_without_poll 决定是否依赖 poll 拉取最新内容。
-        默认（推荐）使用强制模式：直接把每个订阅的 seen_links 重置为只有当前 latest_link 的一条。
-        执行后会回传实际使用的数据文件路径和证据。
-        （仅管理员）
-        """
-        admin_check = self._require_admin(event, "重置推送记录")
-        if admin_check:
-            yield admin_check
-            return
-        use_force = self.cfg.get("force_reset_without_poll", True)
-        
-        mode = "强制模式（不依赖网络，拉当前 latest_link）" if use_force else "智能模式（尝试拉最新 RSS 作为基准）"
-        yield event.plain_result(f"⏳ 正在重置...（{mode} + 清理缓存 + 强制保存）")
-        
-        # 1. 清空内存缓存
-        self._safe_cache.clear()
-        self._comment_cache.clear()
-        self._vision_cache.clear()
-        self.logger.info("[MyRSS] 内存缓存已清空")
-        
-        count = 0
-        force_count = 0
-        
-        for url, info in self.dh.data.items():
-            if url in ("rsshub_endpoints", "settings"):
-                continue
-            subs = info.get("subscribers", {})
-            if not subs:
-                continue
-            
-            did_update = False
-            
-            if not use_force:
-                # 智能模式：尝试拉最新
-                try:
-                    items = await self._poll(url, num=1)
-                    if items:
-                        item = items[0]
-                        ik = item.link.split("#", 1)[0].split("?", 1)[0] if item.link else f"{item.title}|{item.pubDate_timestamp}"
-                        for user, sub_data in subs.items():
-                            if item.pubDate_timestamp > 0:
-                                sub_data["last_update"] = item.pubDate_timestamp
-                            sub_data["latest_link"] = item.link
-                            sub_data["seen_links"] = [ik]
-                        did_update = True
-                except Exception as e:
-                    self.logger.warning(f"[MyRSS] reset poll failed for {url}: {e}")
-            
-            if not did_update or use_force:
-                # 强制模式或 poll 失败时：直接用已有的 latest_link 设为单条
-                for user, sub_data in subs.items():
-                    latest = sub_data.get("latest_link", "")
-                    sub_data["seen_links"] = [latest] if latest else []
-                force_count += 1
-                did_update = True
-            
-            if did_update:
-                count += 1
-
-        # 2. 强制保存
-        self.dh.save()
-        self._reload_jobs()
-        
-        # 3. 读回文件发证据（关键：用 dh.get_data_path() 确保显示真实路径）
-        actual_path = self.dh.get_data_path()
-        try:
-            with open(actual_path, "r", encoding="utf-8") as f:
-                content = f.read()
-            sample = content[:600]
-            msg = (
-                f"✅ 重置完成！共影响 {count} 个源（其中 {force_count} 个使用强制单条模式）。\n"
-                f"📂 实际数据文件路径：{actual_path}\n"
-                f"📋 证据（文件内容片段）：\n{sample}..."
-            )
-            yield event.plain_result(msg)
-        except Exception as e:
-            yield event.plain_result(f"✅ 重置完成，但读取文件失败：{e}\n实际路径应为：{actual_path}")
-    @myrss.command("datapath")
-    async def cmd_datapath(self, event: AstrMessageEvent):
-        """显示当前实际使用的数据文件路径和基本统计。强烈建议每次遇到路径问题时先跑这个。"""
-        admin_check = self._require_admin(event, "查看数据路径")
-        if admin_check:
-            yield admin_check
-            return
-        try:
-            path = self.dh.get_data_path()
-            data_dir = self.dh.get_data_dir()
-            total_sources = len([k for k in self.dh.data if k not in ("rsshub_endpoints", "settings")])
-            
-            total_subs = 0
-            for url, info in self.dh.data.items():
-                if url in ("rsshub_endpoints", "settings"):
-                    continue
-                total_subs += len(info.get("subscribers", {}))
-            
-            import os, time
-            size = os.path.getsize(path) if os.path.exists(path) else 0
-            mtime = ""
-            if os.path.exists(path):
-                mtime = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(os.path.getmtime(path)))
-            
-            msg = (
-                f"📂 当前实际数据文件路径：\n{path}\n\n"
-                f"📁 数据目录：{data_dir}\n"
-                f"📊 统计：{total_sources} 个订阅源，{total_subs} 个订阅记录\n"
-                f"📦 文件大小：{size} bytes\n"
-                f"🕒 最后修改：{mtime}\n\n"
-                "⚠️ 重要提示：\n"
-                "1. 看到这个路径说明数据实际写在这里。\n"
-                "2. 默认路径应位于 AstrBot data/plugin_data/astrbot_plugin_myrss，不应位于插件源码目录。\n"
-                "3. Docker 用户必须持久化挂载整个 AstrBot data 目录，否则容器重建后仍会丢失订阅和 seen_links。"
-            )
-            yield event.plain_result(msg)
-        except Exception as e:
-            yield event.plain_result(f"获取数据路径失败: {e}")
-
-    @myrss.command("unsub")
-    async def cmd_unsub(self, event: AstrMessageEvent, route: str = "", group_ids: str = ""):
-        """从指定源批量退订群
-        用法：/myrss unsub /bilibili/user/dynamic/2107422684 721058477,123456
-        /myrss unsub /bilibili/user/dynamic/2107422684 all
-        """
-        if not route:
-            yield event.plain_result(
-                "用法: /myrss unsub <路由> <群号列表>\\n"
-                " 群号用逗号分隔，或填 all 退订所有群\\n"
-                " 先用 /myrss subs 查看路由和群号"
-            )
-            return
-
-        # 找到匹配的URL
-        target_url = None
-        for url in self.dh.data:
-            if url in ("rsshub_endpoints", "settings"):
-                continue
-            if route in url:
-                target_url = url
-                break
-
-        if not target_url:
-            yield event.plain_result(f"找不到包含 '{route}' 的订阅源\\n用 /myrss subs 查看")
-            return
-
-        subs = self.dh.data[target_url].get("subscribers", {})
-        if not subs:
-            yield event.plain_result("该源没有订阅者。")
-            return
-
-        title = self.dh.data[target_url].get("info", {}).get("title", route)
-
-        if not group_ids or group_ids.strip().lower() == "all":
-            removed = list(subs.keys())
-            subs.clear()
-        else:
-            gids = [g.strip() for g in re.split(r'[,，\\s]+', group_ids) if g.strip()]
-            removed = []
-            for gid in gids:
-                # 模糊匹配：群号可能只传了数字
-                to_del = [k for k in subs if gid in k]
-                for key in to_del:
-                    del subs[key]
-                    removed.append(key.split(":")[-1])
-
-        if removed:
-            self.dh.save()
-            self._reload_jobs()
-            yield event.plain_result(
-                f"✅ 已从「{title}」退订 {len(removed)} 个群:\\n" +
-                "\\n".join(f" - {g}" for g in removed)
-            )
-        else:
-            yield event.plain_result("没有匹配的群号，请检查输入。")

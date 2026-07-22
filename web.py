@@ -31,6 +31,8 @@ class MyRssWebController:
             ("/subscriptions/ping", self.ping, ["GET"], "MyRSS page health check"),
             ("/subscriptions/bootstrap", self.bootstrap, ["GET"], "MyRSS subscribed groups and feed status"),
             ("/subscriptions/test-delivery", self.test_delivery, ["POST"], "Test RSS GET and proactive delivery"),
+            ("/subscriptions/add", self.add_subscription, ["POST"], "Add a safety-reviewed subscription"),
+            ("/subscriptions/remove", self.remove_subscription, ["POST"], "Remove one group subscription"),
         ]
         for path, handler, methods, description in routes:
             self.context.register_web_api(
@@ -48,6 +50,22 @@ class MyRssWebController:
         origin = str(payload.get("origin", ""))
         feed_url = str(payload.get("feed_url", ""))
         return await self.plugin.run_delivery_diagnostic(origin, feed_url)
+
+    async def add_subscription(self) -> dict[str, Any]:
+        if quart_request is None:
+            raise RuntimeError("Web request framework is unavailable")
+        payload = await quart_request.get_json(force=True, silent=True) or {}
+        return await self.plugin.add_subscription_from_ui(
+            str(payload.get("origin", "")), str(payload.get("url", ""))
+        )
+
+    async def remove_subscription(self) -> dict[str, Any]:
+        if quart_request is None:
+            raise RuntimeError("Web request framework is unavailable")
+        payload = await quart_request.get_json(force=True, silent=True) or {}
+        return await self.plugin.remove_subscription_from_ui(
+            str(payload.get("origin", "")), str(payload.get("feed_url", ""))
+        )
 
     def _wrap(self, handler: Callable[[], Awaitable]):
         async def wrapped():
@@ -116,6 +134,16 @@ class MyRssWebController:
                             "preview": preview,
                         }
                     )
+            # 已观察但当前零订阅的群也保留在 UI，便于退订最后一个源后重新新增。
+            for origin in self.plugin._ready_group_sessions:
+                if "GroupMessage" not in origin or origin in groups:
+                    continue
+                groups[origin] = {
+                    "origin": origin,
+                    "platform": origin.split(":", 1)[0],
+                    "group_id": origin.split(":")[-1],
+                    "feeds": [],
+                }
             result = sorted(groups.values(), key=lambda item: item["group_id"])
             for group in result:
                 group["feeds"].sort(key=lambda item: item["title"])
