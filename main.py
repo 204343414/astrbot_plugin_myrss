@@ -826,6 +826,10 @@ class MyRssPlugin(Star):
         self.pic = PicHandler(self.adjust_pic)
         self.browserless_url = config.get("browserless_url", "http://browserless:3000")
         self.card = CardGen(browserless_url=self.browserless_url)
+        ark_config = config.get("ark", {}) or {}
+        self.ark_enabled = bool(ark_config.get("enabled", False))
+        self.ark_template_id = int(ark_config.get("template_id", 23))
+        self.ark_dashboard_url = str(ark_config.get("public_dashboard_url", "") or "").rstrip("/")
 
         # 防并发锁，key = (url, user)
         self._locks: dict = {}
@@ -1038,6 +1042,66 @@ class MyRssPlugin(Star):
         finally:
             if old_entry is None and not self.dh.data.get(full_url, {}).get("subscribers"):
                 self.dh.data.pop(full_url, None)
+
+    async def send_ark_panel_from_ui(self, origin: str) -> dict:
+        """向当前 QQ 官方群主动发送一张只读 ARK 管理入口卡。"""
+        origin = str(origin or "")
+        if not self.ark_enabled:
+            raise ValueError("ARK 管理卡未启用，请先在插件配置中开启 ark.enabled")
+        if not self.ark_dashboard_url.startswith("https://"):
+            raise ValueError("ARK 管理入口必须配置稳定的 HTTPS public_dashboard_url")
+        platform_id = origin.split(":", 1)[0]
+        platform = self._loaded_platforms().get(platform_id)
+        if not platform or platform.get("name") != "qq_official":
+            raise ValueError("目标不是当前已加载的 QQ Official 群")
+        ready, reason = self._target_readiness(origin)
+        if not ready:
+            raise ValueError(f"目标群未就绪: {reason}")
+        group_openid = origin.split(":", 2)[-1]
+        subscriptions = []
+        success_count = 0
+        failed_count = 0
+        for url, feed in self.dh.data.items():
+            if url in ("rsshub_endpoints", "settings") or not isinstance(feed, dict):
+                continue
+            sub = feed.get("subscribers", {}).get(origin)
+            if not isinstance(sub, dict):
+                continue
+            subscriptions.append(feed.get("info", {}).get("title", url))
+            delivery = sub.get("delivery_status", {}) if isinstance(sub.get("delivery_status"), dict) else {}
+            success_count += delivery.get("status") == "SUCCESS"
+            failed_count += delivery.get("status") == "FAILED"
+        blocked_count = len(self.dh.data.get("settings", {}).get("safety_events", []))
+        ark = {
+            "template_id": self.ark_template_id,
+            "kv": [
+                {"key": "#DESC#", "value": "MyRSS 订阅管理"},
+                {"key": "#PROMPT#", "value": f"本群已关注 {len(subscriptions)} 个动态源"},
+                {"key": "#LIST#", "obj": [
+                    {"obj_kv": [{"key": "desc", "value": f"订阅源：{len(subscriptions)} 个"}]},
+                    {"obj_kv": [{"key": "desc", "value": f"最近成功：{success_count}，失败：{failed_count}"}]},
+                    {"obj_kv": [{"key": "desc", "value": f"近期安全拦截：{blocked_count}"}]},
+                    {"obj_kv": [
+                        {"key": "desc", "value": "打开 AstrBot 管理面板"},
+                        {"key": "link", "value": self.ark_dashboard_url},
+                    ]},
+                ]},
+            ],
+        }
+        adapter = platform.get("instance")
+        client = adapter.get_client() if hasattr(adapter, "get_client") else getattr(adapter, "client", None)
+        if not client or not getattr(client, "api", None):
+            raise RuntimeError("无法取得 QQ Official botpy client")
+        try:
+            await client.api.post_group_message(
+                group_openid=group_openid,
+                msg_type=3,
+                ark=ark,
+                msg_seq=random.randint(1, 10000),
+            )
+        except Exception as exc:
+            raise RuntimeError(f"ARK 发送失败: {type(exc).__name__}: {exc}") from exc
+        return {"sent": True, "subscription_count": len(subscriptions)}
 
     async def remove_subscription_from_ui(self, origin: str, feed_url: str) -> dict:
         """Dashboard 精确退订一个群-源关系，不清空其他群与源级缓存。"""

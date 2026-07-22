@@ -27,3 +27,4 @@ html,body{width:100%;min-width:0}
 /* 无首图时正文必须独占整行；否则会落入固定180px图片列，形成竖长方形 */
 .latest-preview.no-image{grid-template-columns:minmax(0,1fr)}
 .latest-preview.no-image>div{grid-column:1/-1;width:100%}
+.group-panel-actions{display:flex;justify-content:flex-end;margin:8px 0 12px}.group-panel-actions button{background:#0f766e}.group-panel-actions button:disabled{opacity:.55}

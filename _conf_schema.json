@@ -122,5 +122,26 @@
     "description": "reset 命令是否默认使用强制模式（不依赖拉取最新RSS，直接用当前 latest_link 重置为单条）。推荐开启，解决 poll 失败导致 reset 无效的问题。",
     "type": "bool",
     "default": true
+  },
+  "ark": {
+    "description": "QQ官方 MyRSS ARK 管理入口卡（只读统计+跳转Dashboard）",
+    "type": "object",
+    "items": {
+      "enabled": {
+        "description": "启用ARK管理入口卡",
+        "type": "bool",
+        "default": false
+      },
+      "template_id": {
+        "description": "ARK模板ID，默认23文本列表模板",
+        "type": "int",
+        "default": 23
+      },
+      "public_dashboard_url": {
+        "description": "稳定的HTTPS AstrBot Dashboard入口；需加入QQ开放平台消息URL白名单",
+        "type": "string",
+        "default": ""
+      }
+    }
   }
 }

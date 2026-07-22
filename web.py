@@ -33,6 +33,7 @@ class MyRssWebController:
             ("/subscriptions/test-delivery", self.test_delivery, ["POST"], "Test RSS GET and proactive delivery"),
             ("/subscriptions/add", self.add_subscription, ["POST"], "Add a safety-reviewed subscription"),
             ("/subscriptions/remove", self.remove_subscription, ["POST"], "Remove one group subscription"),
+            ("/subscriptions/send-ark", self.send_ark, ["POST"], "Send QQ Official ARK management card"),
         ]
         for path, handler, methods, description in routes:
             self.context.register_web_api(
@@ -66,6 +67,12 @@ class MyRssWebController:
         return await self.plugin.remove_subscription_from_ui(
             str(payload.get("origin", "")), str(payload.get("feed_url", ""))
         )
+
+    async def send_ark(self) -> dict[str, Any]:
+        if quart_request is None:
+            raise RuntimeError("Web request framework is unavailable")
+        payload = await quart_request.get_json(force=True, silent=True) or {}
+        return await self.plugin.send_ark_panel_from_ui(str(payload.get("origin", "")))
 
     def _wrap(self, handler: Callable[[], Awaitable]):
         async def wrapped():
