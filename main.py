@@ -29,6 +29,9 @@ from astrbot.api import AstrBotConfig
 import astrbot.api.message_components as Comp
 
 from .web import MyRssWebController
+from .qqofficial_keyboard import install_patch as install_keyboard_patch
+from .qqofficial_keyboard import register_handler as register_keyboard_handler
+from .qqofficial_keyboard import unregister_handler as unregister_keyboard_handler
 
 # [防冲突] 模块级变量追踪当前活跃的调度器
 # 插件热更新时新实例先通过此引用杀掉老调度器，避免新老并行双推
@@ -826,10 +829,12 @@ class MyRssPlugin(Star):
         self.pic = PicHandler(self.adjust_pic)
         self.browserless_url = config.get("browserless_url", "http://browserless:3000")
         self.card = CardGen(browserless_url=self.browserless_url)
-        ark_config = config.get("ark", {}) or {}
-        self.ark_enabled = bool(ark_config.get("enabled", False))
-        self.ark_template_id = int(ark_config.get("template_id", 23))
-        self.ark_dashboard_url = str(ark_config.get("public_dashboard_url", "") or "").rstrip("/")
+        keyboard_config = config.get("keyboard", {}) or {}
+        self.keyboard_enabled = bool(keyboard_config.get("enabled", False))
+        self._keyboard_handler_name = f"myrss:{id(self)}"
+        if self.keyboard_enabled:
+            install_keyboard_patch()
+            register_keyboard_handler(self._keyboard_handler_name, self._handle_keyboard_interaction)
 
         # 防并发锁，key = (url, user)
         self._locks: dict = {}
@@ -1043,13 +1048,62 @@ class MyRssPlugin(Star):
             if old_entry is None and not self.dh.data.get(full_url, {}).get("subscribers"):
                 self.dh.data.pop(full_url, None)
 
-    async def send_ark_panel_from_ui(self, origin: str) -> dict:
-        """向当前 QQ 官方群主动发送一张只读 ARK 管理入口卡。"""
+    def _keyboard_payload(self, origin: str) -> tuple[dict, dict]:
+        titles = []
+        success_count = failed_count = 0
+        for url, feed in self.dh.data.items():
+            if url in ("rsshub_endpoints", "settings") or not isinstance(feed, dict):
+                continue
+            sub = feed.get("subscribers", {}).get(origin)
+            if not isinstance(sub, dict):
+                continue
+            titles.append(str(feed.get("info", {}).get("title", url)))
+            delivery = sub.get("delivery_status", {}) if isinstance(sub.get("delivery_status"), dict) else {}
+            success_count += delivery.get("status") == "SUCCESS"
+            failed_count += delivery.get("status") == "FAILED"
+        shown = "、".join(title[:24] for title in titles[:8]) or "暂无订阅"
+        if len(titles) > 8:
+            shown += f" 等{len(titles)}个"
+        markdown = {
+            "content": (
+                f"# MyRSS 本群控制面板\n"
+                f"订阅源：{len(titles)} 个｜最近成功：{success_count}｜失败：{failed_count}\n"
+                f"{shown}\n"
+                "管理按钮由 QQ 平台执行权限校验。"
+            )
+        }
+
+        def button(button_id: str, label: str, action_type: int, data: str, permission: int, style: int = 0):
+            return {
+                "id": button_id,
+                "render_data": {"label": label, "visited_label": label, "style": style},
+                "action": {
+                    "type": action_type,
+                    "permission": {"type": permission},
+                    "data": data,
+                    "reply": False,
+                    "enter": False,
+                    "unsupport_tips": "当前 QQ 版本不支持该按钮",
+                },
+            }
+
+        keyboard = {"content": {"rows": [
+            {"buttons": [
+                button("myrss_refresh", "刷新面板", 1, "myrss:refresh", 2, 1),
+                button("myrss_test", "测试主动推送", 1, "myrss:test", 1, 0),
+            ]},
+            {"buttons": [
+                button("myrss_list", "查看订阅", 2, "/myrss list", 2, 0),
+                button("myrss_add", "添加订阅", 2, "添加订阅 ", 1, 1),
+                button("myrss_eye", "随机动态", 2, "/myrss eye", 2, 0),
+            ]},
+        ]}}
+        return markdown, keyboard
+
+    async def _send_keyboard_panel(self, origin: str, client=None) -> dict:
         origin = str(origin or "")
-        if not self.ark_enabled:
-            raise ValueError("ARK 管理卡未启用，请先在插件配置中开启 ark.enabled")
-        if not self.ark_dashboard_url.startswith("https://"):
-            raise ValueError("ARK 管理入口必须配置稳定的 HTTPS public_dashboard_url")
+        if not self.keyboard_enabled:
+            raise ValueError("Keyboard 控制面板未启用")
         platform_id = origin.split(":", 1)[0]
         platform = self._loaded_platforms().get(platform_id)
         if not platform or platform.get("name") != "qq_official":
@@ -1057,51 +1111,42 @@ class MyRssPlugin(Star):
         ready, reason = self._target_readiness(origin)
         if not ready:
             raise ValueError(f"目标群未就绪: {reason}")
-        group_openid = origin.split(":", 2)[-1]
-        subscriptions = []
-        success_count = 0
-        failed_count = 0
-        for url, feed in self.dh.data.items():
-            if url in ("rsshub_endpoints", "settings") or not isinstance(feed, dict):
-                continue
-            sub = feed.get("subscribers", {}).get(origin)
-            if not isinstance(sub, dict):
-                continue
-            subscriptions.append(feed.get("info", {}).get("title", url))
-            delivery = sub.get("delivery_status", {}) if isinstance(sub.get("delivery_status"), dict) else {}
-            success_count += delivery.get("status") == "SUCCESS"
-            failed_count += delivery.get("status") == "FAILED"
-        blocked_count = len(self.dh.data.get("settings", {}).get("safety_events", []))
-        ark = {
-            "template_id": self.ark_template_id,
-            "kv": [
-                {"key": "#DESC#", "value": "MyRSS 订阅管理"},
-                {"key": "#PROMPT#", "value": f"本群已关注 {len(subscriptions)} 个动态源"},
-                {"key": "#LIST#", "obj": [
-                    {"obj_kv": [{"key": "desc", "value": f"订阅源：{len(subscriptions)} 个"}]},
-                    {"obj_kv": [{"key": "desc", "value": f"最近成功：{success_count}，失败：{failed_count}"}]},
-                    {"obj_kv": [{"key": "desc", "value": f"近期安全拦截：{blocked_count}"}]},
-                    {"obj_kv": [
-                        {"key": "desc", "value": "打开 AstrBot 管理面板"},
-                        {"key": "link", "value": self.ark_dashboard_url},
-                    ]},
-                ]},
-            ],
-        }
         adapter = platform.get("instance")
-        client = adapter.get_client() if hasattr(adapter, "get_client") else getattr(adapter, "client", None)
+        client = client or (adapter.get_client() if hasattr(adapter, "get_client") else getattr(adapter, "client", None))
         if not client or not getattr(client, "api", None):
             raise RuntimeError("无法取得 QQ Official botpy client")
-        try:
-            await client.api.post_group_message(
-                group_openid=group_openid,
-                msg_type=3,
-                ark=ark,
-                msg_seq=random.randint(1, 10000),
-            )
-        except Exception as exc:
-            raise RuntimeError(f"ARK 发送失败: {type(exc).__name__}: {exc}") from exc
-        return {"sent": True, "subscription_count": len(subscriptions)}
+        markdown, keyboard = self._keyboard_payload(origin)
+        await client.api.post_group_message(
+            group_openid=origin.split(":", 2)[-1],
+            msg_type=2,
+            markdown=markdown,
+            keyboard=keyboard,
+            msg_seq=random.randint(1, 10000),
+        )
+        return {"sent": True}
+
+    async def send_keyboard_panel_from_ui(self, origin: str) -> dict:
+        return await self._send_keyboard_panel(origin)
+
+    async def _handle_keyboard_interaction(self, client, interaction):
+        data = str(getattr(getattr(interaction, "data", None), "resolved", None).button_data or "") if getattr(getattr(interaction, "data", None), "resolved", None) else ""
+        if not data.startswith("myrss:"):
+            return None
+        group_openid = str(getattr(interaction, "group_openid", "") or "")
+        if not group_openid:
+            return 1
+        origin = f"{client.platform.meta().id}:GroupMessage:{group_openid}"
+        if data == "myrss:refresh":
+            asyncio.create_task(self._send_keyboard_panel(origin, client=client))
+            return 0
+        if data == "myrss:test":
+            feed_url = next((url for url, feed in self.dh.data.items() if url not in ("rsshub_endpoints", "settings") and isinstance(feed, dict) and origin in feed.get("subscribers", {})), "")
+            if not feed_url:
+                return 1
+            asyncio.create_task(self.run_delivery_diagnostic(origin, feed_url))
+            return 0
+        return 1
+
 
     async def remove_subscription_from_ui(self, origin: str, feed_url: str) -> dict:
         """Dashboard 精确退订一个群-源关系，不清空其他群与源级缓存。"""
@@ -1141,6 +1186,8 @@ class MyRssPlugin(Star):
     async def destroy(self):
         """插件卸载/禁用时停止调度器"""
         global _ACTIVE_SCHED
+        if self.keyboard_enabled:
+            unregister_keyboard_handler(self._keyboard_handler_name)
         try:
             if self.sched.running:
                 # [防冲突] wait=True：等正在执行的job跑完再关，避免推送到一半被掐断

@@ -123,24 +123,14 @@
     "type": "bool",
     "default": true
   },
-  "ark": {
-    "description": "QQ官方 MyRSS ARK 管理入口卡（只读统计+跳转Dashboard）",
+  "keyboard": {
+    "description": "QQ官方群 Markdown＋Keyboard 控制面板；启用后必须完整重启 AstrBot 以重新协商 interaction intent",
     "type": "object",
     "items": {
       "enabled": {
-        "description": "启用ARK管理入口卡",
+        "description": "启用 Keyboard 按钮与 INTERACTION_CREATE 兼容桥",
         "type": "bool",
         "default": false
-      },
-      "template_id": {
-        "description": "ARK模板ID，默认23文本列表模板",
-        "type": "int",
-        "default": 23
-      },
-      "public_dashboard_url": {
-        "description": "稳定的HTTPS AstrBot Dashboard入口；需加入QQ开放平台消息URL白名单",
-        "type": "string",
-        "default": ""
       }
     }
   }
