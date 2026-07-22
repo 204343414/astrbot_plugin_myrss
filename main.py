@@ -149,10 +149,6 @@ class DataHandler:
     def get_data_dir(self) -> str:
         return self.data_dir
 
-    @staticmethod
-
-    @classmethod
-
     def _load(self):
         """加载数据，支持从旧路径迁移，并自动备份已有数据"""
         if os.path.exists(self.config_path):
