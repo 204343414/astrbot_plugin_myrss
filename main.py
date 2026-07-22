@@ -1075,7 +1075,7 @@ class MyRssPlugin(Star):
             shown += f" 等{len(titles)}个"
         markdown = {
             "content": (
-                f"# MyRSS 本群控制面板\n"
+                f"# 头条Flag 群控制面板\n"
                 f"订阅源：{len(titles)} 个｜最近成功：{success_count}｜失败：{failed_count}\n"
                 f"{shown}\n"
                 "管理按钮由 QQ 平台执行权限校验。"
@@ -1105,6 +1105,15 @@ class MyRssPlugin(Star):
                 button("myrss_list", "查看订阅", 2, "/myrss list", 2, 0),
                 button("myrss_add", "添加订阅", 2, "添加订阅 ", 1, 1),
                 button("myrss_eye", "随机动态", 2, "/myrss eye", 2, 0),
+            ]},
+            {"buttons": [
+                button("daily_news", "今日新闻", 2, "/新闻", 2, 1),
+                button("video_download", "下载视频", 2, "/video ", 2, 0),
+                button("file_download", "下载文件", 2, "/download ", 2, 0),
+            ]},
+            {"buttons": [
+                button("news_status", "新闻状态", 2, "/新闻状态", 1, 0),
+                button("ban_list", "静默黑名单", 2, "/拉黑列表_", 1, 0),
             ]},
         ]}}
         return markdown, keyboard
@@ -2520,6 +2529,19 @@ class MyRssPlugin(Star):
             yield event.plain_result(f"✅ 已取关：{title}")
             return
         yield event.plain_result("action 只支持 list、subscribe、unsubscribe。")
+
+    @filter.command("面板", alias={"控制面板", "菜单"})
+    async def command_panel(self, event: AstrMessageEvent):
+        """向当前 QQ 官方群发送一张 Markdown＋Keyboard 控制面板。"""
+        origin = event.unified_msg_origin
+        if "GroupMessage" not in origin:
+            yield event.plain_result("控制面板目前仅支持 QQ 官方群聊。")
+            return
+        try:
+            await self._send_keyboard_panel(origin)
+            event.stop_event()
+        except Exception as exc:
+            yield event.plain_result(f"控制面板发送失败：{exc}")
 
     @filter.command_group("myrss")
     def myrss(self):
