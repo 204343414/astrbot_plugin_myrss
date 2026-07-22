@@ -82,29 +82,40 @@ function renderFeed(feed, origin) {
   return `<section class="feed"><div class="source-header">${avatar ? `<img class="avatar" src="${escapeHtml(avatar)}" referrerpolicy="no-referrer" />` : `<div class="avatar avatar-fallback">${escapeHtml((feed.title || "?").slice(0, 1))}</div>`}<div><h3>${escapeHtml(feed.title)}</h3><div class="muted">${escapeHtml(feed.cron_expr || "—")} · 去重 ${feed.seen_count} 条</div></div></div>${feed.description ? `<p class="source-description">${escapeHtml(feed.description)}</p>` : ""}<p class="muted">${deliveryLabel}</p><div class="grid"><span class="label">路由 / URL</span><span class="value">${escapeHtml(feed.url)}</span><span class="label">最后断点</span><span>${fmt(feed.last_update)}</span></div>${preview ? `<div class="latest-preview">${image ? `<img src="${escapeHtml(image)}" referrerpolicy="no-referrer" />` : ""}<div><h4>${escapeHtml(preview.title || "最新安全动态")}</h4><p>${escapeHtml(preview.description || "暂无摘要")}</p><span class="muted">${fmt(preview.pub_timestamp || preview.updated_at)}</span>${link ? `　<a class="open-link" href="${escapeHtml(link)}" target="_blank" rel="noopener noreferrer">打开动态 ↗</a>` : ""}</div></div>` : `<p class="muted">暂无安全内容缓存；下一次出现并通过审核的新动态后自动补齐。</p>`}<div class="feed-actions"><button class="test-delivery" data-origin="${escapeHtml(origin)}" data-feed="${escapeHtml(feed.url)}">测试 GET + 主动推送</button></div></section>`;
 }
 
+function setTestStatus(kind, message) {
+  const panel = el("testStatus");
+  panel.className = `test-status ${kind}`;
+  panel.textContent = message;
+  panel.classList.remove("hidden");
+  panel.scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+
 async function runDeliveryTest(button) {
   const origin = button.dataset.origin;
   const feedUrl = button.dataset.feed;
-  if (!window.confirm("将对该 RSS 执行一次 GET，并向所选群主动发送一张诊断卡片。\n不会调用 LLM、不会修改 seen_links。是否继续？")) return;
   const oldText = button.textContent;
   button.disabled = true;
   button.textContent = "测试中…";
+  setTestStatus("running", "正在执行一次 RSS GET，并向目标群主动发送诊断卡片……\n不会调用 LLM，也不会修改 seen_links。");
   try {
+    if (!bridge?.apiPost) throw new Error("AstrBotPluginPage.apiPost 不可用");
     const response = await bridge.apiPost("subscriptions/test-delivery", {
       origin, feed_url: feedUrl,
     });
     if (response?.ok === false) throw new Error(response.message || "测试失败");
     const result = response?.ok === true ? response.data : (response?.data || response);
     if (!result || typeof result !== "object") throw new Error(`响应格式异常：${JSON.stringify(response)}`);
-    window.alert(
-      `RSS GET：${result.fetch_ok ? "成功" : "失败"}\n` +
-      `RSS 条目：${result.item_count ?? 0}\n` +
-      `主动推送：${result.send_ok ? "成功" : "失败"}\n` +
-      `${result.fetch_error ? `GET错误：${result.fetch_error}\n` : ""}` +
-      `${result.send_error ? `发送错误：${result.send_error}` : "请确认目标群确实出现诊断卡片。"}`
-    );
+    const lines = [
+      `RSS GET：${result.fetch_ok ? "成功" : "失败"}`,
+      `RSS 条目：${result.item_count ?? 0}`,
+      `主动推送：${result.send_ok ? "成功" : "失败"}`,
+    ];
+    if (result.fetch_error) lines.push(`GET 错误：${result.fetch_error}`);
+    if (result.send_error) lines.push(`发送错误：${result.send_error}`);
+    if (result.send_ok) lines.push("请同时确认目标群确实出现了诊断卡片。");
+    setTestStatus(result.fetch_ok && result.send_ok ? "success" : "error", lines.join("\n"));
   } catch (error) {
-    window.alert(`诊断失败：${error?.message || error}`);
+    setTestStatus("error", `诊断失败：${error?.message || error}`);
   } finally {
     button.disabled = false;
     button.textContent = oldText;
