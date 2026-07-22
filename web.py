@@ -57,6 +57,12 @@ class MyRssWebController:
                 return cast(Callable[[dict], Any], quart_jsonify)(
                     {"ok": True, "data": await handler()}
                 )
+            except ValueError as exc:
+                # 冷却、目标未就绪、参数不匹配都属于可预期的用户态诊断结果。
+                self.last_error = f"ValueError: {exc}"
+                return cast(Callable[[dict], Any], quart_jsonify)(
+                    {"ok": False, "message": str(exc)}
+                ), 400
             except Exception as exc:
                 self.last_error = f"{type(exc).__name__}: {exc}"
                 logger.exception("MyRSS page request failed")

@@ -895,8 +895,17 @@ class MyRssPlugin(Star):
         if not platform:
             return False, "platform_not_loaded"
         if platform.get("name") == "qq_official" and "GroupMessage" in str(origin):
-            if origin not in self._ready_group_sessions:
-                return False, "qq_official_waiting_group_message"
+            if origin in self._ready_group_sessions:
+                return True, "ready"
+            # 插件热重载会清空自身集合，但 QQ Official 平台实例通常仍保留已观察群场景。
+            # 读取 AstrBot v4.26.x 适配器维护的 _session_scene，避免误判必须重新发言。
+            session_id = str(origin).split(":", 2)[-1]
+            adapter = platform.get("instance")
+            scenes = getattr(adapter, "_session_scene", {})
+            if isinstance(scenes, dict) and scenes.get(session_id) == "group":
+                self._ready_group_sessions.add(origin)
+                return True, "ready_from_platform_scene"
+            return False, "qq_official_waiting_group_message"
         return True, "ready"
 
     def _get_target_send_lock(self, origin: str) -> asyncio.Lock:
