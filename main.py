@@ -8,6 +8,9 @@ import base64
 import logging
 import asyncio
 import aiohttp
+import builtins
+import copy
+import hashlib
 from io import BytesIO
 from dataclasses import dataclass
 from urllib.parse import urlparse
@@ -25,10 +28,17 @@ from astrbot.api.star import Context, Star, register
 from astrbot.api import AstrBotConfig
 import astrbot.api.message_components as Comp
 
+from .web import MyRssWebController
+
 # [防冲突] 模块级变量追踪当前活跃的调度器
 # 插件热更新时新实例先通过此引用杀掉老调度器，避免新老并行双推
 _ACTIVE_SCHED = None
-_ALL_SCHEDS = set() # 追踪所有调度器，防多实例
+_ALL_SCHEDS = set() # 同一模块对象内追踪调度器
+
+# builtins 在同一 Python 进程的插件模块重载之间保持共享。
+# 用它登记唯一活跃实例，弥补模块级全局变量在“重新安装但不重启”时可能分叉的问题。
+if not hasattr(builtins, "_ASTRBOT_MYRSS_RUNTIME"):
+    builtins._ASTRBOT_MYRSS_RUNTIME = {"generation": 0, "instance": None, "scheduler": None}
 
 @dataclass
 class RSSItem:
@@ -139,6 +149,132 @@ class DataHandler:
 
     def get_data_dir(self) -> str:
         return self.data_dir
+
+    def get_legacy_data_paths(self) -> list[str]:
+        paths = []
+        if self.plugin_dir:
+            paths.append(os.path.join(self.plugin_dir, "_data", "_data.json"))
+        paths.append(os.path.abspath("data/astrbot_plugin_myrss/_data.json"))
+        current = os.path.abspath(self.config_path)
+        result = []
+        for path in paths:
+            absolute = os.path.abspath(path)
+            if absolute != current and absolute not in result:
+                result.append(absolute)
+        return result
+
+    @staticmethod
+    def _normalize_seen_link(link: str) -> str:
+        value = str(link or "").strip()
+        return value.split("#", 1)[0].split("?", 1)[0] if value else ""
+
+    @classmethod
+    def merge_persistent_data(cls, current: dict, legacy: dict) -> dict:
+        """合并旧新库；断点取较新值，seen_links 做原值+归一化并集。"""
+        merged = copy.deepcopy(current if isinstance(current, dict) else {})
+        old = legacy if isinstance(legacy, dict) else {}
+        merged["rsshub_endpoints"] = list(dict.fromkeys(
+            list(merged.get("rsshub_endpoints", [])) + list(old.get("rsshub_endpoints", []))
+        ))
+        if isinstance(old.get("settings"), dict):
+            settings = merged.setdefault("settings", {})
+            for key, value in old["settings"].items():
+                if isinstance(value, list) and isinstance(settings.get(key), list):
+                    settings[key] = list(dict.fromkeys(settings[key] + value))
+                elif key not in settings:
+                    settings[key] = copy.deepcopy(value)
+
+        for url, old_feed in old.items():
+            if url in ("rsshub_endpoints", "settings") or not isinstance(old_feed, dict):
+                continue
+            if url not in merged or not isinstance(merged[url], dict):
+                merged[url] = copy.deepcopy(old_feed)
+                continue
+            feed = merged[url]
+            if not feed.get("info") and old_feed.get("info"):
+                feed["info"] = copy.deepcopy(old_feed["info"])
+            subscribers = feed.setdefault("subscribers", {})
+            for subscriber, old_sub in old_feed.get("subscribers", {}).items():
+                if subscriber not in subscribers or not isinstance(subscribers[subscriber], dict):
+                    subscribers[subscriber] = copy.deepcopy(old_sub)
+                    continue
+                new_sub = subscribers[subscriber]
+                old_ts = int(old_sub.get("last_update", 0) or 0)
+                new_ts = int(new_sub.get("last_update", 0) or 0)
+                combined = []
+                for raw in list(new_sub.get("seen_links", [])) + list(old_sub.get("seen_links", [])):
+                    raw = str(raw or "").strip()
+                    normalized = cls._normalize_seen_link(raw)
+                    for candidate in (raw, normalized):
+                        if candidate and candidate not in combined:
+                            combined.append(candidate)
+                new_sub["seen_links"] = combined[:1000]
+                if old_ts > new_ts:
+                    new_sub["last_update"] = old_ts
+                    if old_sub.get("latest_link"):
+                        new_sub["latest_link"] = old_sub["latest_link"]
+                else:
+                    new_sub["last_update"] = new_ts
+                if not new_sub.get("cron_expr") and old_sub.get("cron_expr"):
+                    new_sub["cron_expr"] = old_sub["cron_expr"]
+        return merged
+
+    def migration_snapshot(self) -> dict:
+        sources = []
+        for path in self.get_legacy_data_paths():
+            if not os.path.exists(path):
+                continue
+            data = self._read_json(path)
+            with open(path, "rb") as source_file:
+                file_hash = hashlib.sha256(source_file.read()).hexdigest()
+            sources.append({
+                "path": path,
+                "valid": isinstance(data, dict),
+                "sha256": file_hash,
+                "sources": len([k for k in data or {} if k not in ("rsshub_endpoints", "settings")]),
+                "subscriptions": sum(len(v.get("subscribers", {})) for k, v in (data or {}).items() if k not in ("rsshub_endpoints", "settings") and isinstance(v, dict)),
+            })
+        raw = json.dumps(sources, ensure_ascii=False, sort_keys=True)
+        return {"current": self.config_path, "legacy": sources, "fingerprint": hashlib.sha256(raw.encode()).hexdigest()[:16]}
+
+    def migrate_and_delete_legacy(self) -> dict:
+        """原子写新库、读回校验、备份旧库后才删除旧文件。"""
+        merged = copy.deepcopy(self.data)
+        valid_paths = []
+        for path in self.get_legacy_data_paths():
+            if not os.path.exists(path):
+                continue
+            legacy = self._read_json(path)
+            if not isinstance(legacy, dict):
+                raise ValueError(f"旧数据文件无法解析，未删除任何文件: {path}")
+            merged = self.merge_persistent_data(merged, legacy)
+            valid_paths.append(path)
+        if not valid_paths:
+            return {"merged": 0, "deleted": [], "current": self.config_path}
+
+        original = self.data
+        self.data = merged
+        try:
+            self._save()
+            verified = self._read_json(self.config_path)
+            if verified != merged:
+                raise RuntimeError("新数据写入后的读回校验不一致")
+        except Exception:
+            self.data = original
+            raise
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backups = []
+        for path in valid_paths:
+            backup = path + f".pre_delete_{timestamp}.bak"
+            shutil.copy2(path, backup)
+            backups.append(backup)
+        deleted = []
+        for path in valid_paths:
+            os.remove(path)
+            deleted.append(path)
+        self.data = merged
+        return {"merged": len(valid_paths), "deleted": deleted, "backups": backups, "current": self.config_path}
 
     def _load(self):
         """加载数据，支持从旧路径迁移，并自动备份已有数据"""
@@ -626,7 +762,7 @@ class CardGen:
 
 
 
-@register("astrbot_plugin_myrss", "MyRSS", "RSS订阅插件(LLM增强版)", "1.0.0", "")
+@register("astrbot_plugin_myrss", "MyRSS", "RSS订阅插件(LLM增强版)", "1.1.0", "")
 class MyRssPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -670,6 +806,7 @@ class MyRssPlugin(Star):
         self.max_vision_images = 9
         self._preview_states = {}  # key=(origin, preview_id), value=一次性安全预览状态
         self._preview_ttl_seconds = 600
+        self._migration_preview = None
         
         self._last_fetch_error = None  # 拉取错误追踪（新版本 _fetch 使用）
         self.push_delay_min = config.get("push_delay_min", 5.0)
@@ -682,28 +819,42 @@ class MyRssPlugin(Star):
         # 防并发锁，key = (url, user)
         self._locks: dict = {}
         self._data_lock = asyncio.Lock() # 保护 dh.data 读写
+        self.web = MyRssWebController(self.ctx, self)
+        self.web.register_routes()
         # 推荐系统已移除
         # [防冲突] 在创建新调度器前，先杀掉模块级残留的老调度器
         # 场景：插件热更新时框架直接创建新实例，老实例的destroy()可能未被调用
         # 如果不杀，老调度器继续运行老代码的job，和新调度器同时推送→双推
         global _ACTIVE_SCHED, _ALL_SCHEDS
-        # 杀掉所有残留的调度器（不只是上一个）
-        for old_sched in list(_ALL_SCHEDS):
+        runtime = builtins._ASTRBOT_MYRSS_RUNTIME
+        stale_schedulers = list(_ALL_SCHEDS)
+        process_old = runtime.get("scheduler")
+        if process_old is not None and process_old not in stale_schedulers:
+            stale_schedulers.append(process_old)
+        for old_sched in stale_schedulers:
             try:
                 if old_sched.running:
                     old_sched.shutdown(wait=False)
-                    self.logger.warning("MyRSS: 停止残留调度器 id=%s", id(old_sched))
-            except Exception:
-                pass
+                    self.logger.warning("MyRSS: 停止跨重载残留调度器 id=%s", id(old_sched))
+            except Exception as exc:
+                self.logger.warning("MyRSS: 停止残留调度器失败: %s", exc)
         _ALL_SCHEDS.clear()
         _ACTIVE_SCHED = None
 
+        runtime["generation"] = int(runtime.get("generation", 0)) + 1
+        self._runtime_generation = runtime["generation"]
         self.sched = AsyncIOScheduler()
+        runtime["instance"] = self
+        runtime["scheduler"] = self.sched
         _ACTIVE_SCHED = self.sched
         _ALL_SCHEDS.add(self.sched)
         self.sched.start()
         self._reload_jobs()
     
+    def _is_current_runtime(self) -> bool:
+        runtime = builtins._ASTRBOT_MYRSS_RUNTIME
+        return runtime.get("instance") is self and runtime.get("generation") == self._runtime_generation
+
     async def destroy(self):
         """插件卸载/禁用时停止调度器"""
         global _ACTIVE_SCHED
@@ -717,6 +868,10 @@ class MyRssPlugin(Star):
                 if _ACTIVE_SCHED is self.sched:
                     _ACTIVE_SCHED = None
                 _ALL_SCHEDS.discard(self.sched)
+                runtime = builtins._ASTRBOT_MYRSS_RUNTIME
+                if runtime.get("instance") is self:
+                    runtime["instance"] = None
+                    runtime["scheduler"] = None
         except Exception as e:
             self.logger.error("MyRSS: 停止调度器失败: %s", e)
 
@@ -1487,6 +1642,9 @@ class MyRssPlugin(Star):
 
     async def _cron_cb_url(self, url: str) -> None:
         """每个URL只拉取一次，结果分发给所有订阅者"""
+        if not self._is_current_runtime():
+            self.logger.warning("RSS跳过失效插件实例: instance=%s url=%s", id(self), url)
+            return
         # [诊断] 打印实例ID和调度器ID，如果日志里同一url出现两个不同的id就是双实例并行
         self.logger.info("RSS拉取开始: instance=%s sched=%s url=%s", id(self), id(self.sched), url)
         if url not in self.dh.data:
@@ -1507,6 +1665,9 @@ class MyRssPlugin(Star):
 
         # 分发给每个订阅者（各自独立去重）
         for i, user in enumerate(list(subs.keys())):
+            if not self._is_current_runtime():
+                self.logger.warning("RSS分发中止：插件实例已被重载替换")
+                return
             lock = self._get_lock(url, user)
             async with lock:
                 await self._cron_cb_inner(url, user, prefetched_items=items)
@@ -1516,11 +1677,13 @@ class MyRssPlugin(Star):
                 await asyncio.sleep(delay)
 
     async def _cron_cb_inner(self, url: str, user: str, prefetched_items=None) -> None:
-        await self._cron_cb_inner_impl(url, user, prefetched_items)
+        # 必须覆盖“读库→更新 seen_links→保存”整个事务。
+        # 旧代码只锁住 _load，另一个 job 随后替换 dh.data，会让前一个 job 保存错对象。
+        async with self._data_lock:
+            await self._cron_cb_inner_impl(url, user, prefetched_items)
 
     async def _cron_cb_inner_impl(self, url: str, user: str, prefetched_items=None) -> None:
-        async with self._data_lock:
-            self.dh.data = self.dh._load()
+        self.dh.data = self.dh._load()
 
         if url not in self.dh.data or user not in self.dh.data[url].get("subscribers", {}):
             return
@@ -1719,7 +1882,15 @@ class MyRssPlugin(Star):
             return f"ℹ️「{state.get('title', feed_url)}」已经订阅到 {target_origin}，未重复写入。"
         if state.get("consumed"):
             return f"❌ 最近一次预览已经用于 {state.get('target_origin', '其他目标')}，如需换群请重新预览。"
-        ret = await self._add(feed_url, "*/15 * * * *", event, target_user=target_origin)
+        async with self._data_lock:
+            # 订阅落库与定时 job 的读改写事务互斥，防止刚新增的群订阅被旧快照覆盖。
+            self.dh.data = self.dh._load()
+            # 锁内再次检查，避免等待锁期间其他请求已经完成同一订阅。
+            if target_origin in self.dh.data.get(feed_url, {}).get("subscribers", {}):
+                state["consumed"] = True
+                state["target_origin"] = target_origin
+                return f"ℹ️「{state.get('title', feed_url)}」已经订阅到 {target_origin}，未重复写入。"
+            ret = await self._add(feed_url, "*/15 * * * *", event, target_user=target_origin)
         if isinstance(ret, MessageEventResult):
             return ret
         state["consumed"] = True
@@ -1923,6 +2094,53 @@ class MyRssPlugin(Star):
     @filter.command_group("myrss")
     def myrss(self):
         pass
+
+    @myrss.command("migrate")
+    async def cmd_migrate(self, event: AstrMessageEvent, action: str = "preview"):
+        """两阶段迁移旧持久化文件。先 /myrss migrate，再 /myrss migrate confirm。"""
+        admin_check = self._require_admin(event, "迁移订阅数据")
+        if admin_check:
+            yield admin_check
+            return
+        snapshot = self.dh.migration_snapshot()
+        if action.strip().lower() != "confirm":
+            self._migration_preview = {"fingerprint": snapshot["fingerprint"], "created_at": time.time()}
+            lines = [f"📂 当前库：{snapshot['current']}", f"🔎 迁移指纹：{snapshot['fingerprint']}"]
+            if not snapshot["legacy"]:
+                lines.append("未发现旧数据文件，无需迁移。")
+            else:
+                lines.append("发现旧数据：")
+                for item in snapshot["legacy"]:
+                    lines.append(
+                        f"- {item['path']} | JSON={'有效' if item['valid'] else '损坏'} | "
+                        f"{item['sources']} 个源 / {item['subscriptions']} 条订阅"
+                    )
+                lines.append("合并规则：seen_links 并集、last_update 取较大值、新库 cron 优先。")
+                lines.append("确认后会先备份旧文件，再删除旧 _data.json。执行：/myrss migrate confirm")
+            yield event.plain_result("\n".join(lines))
+            return
+
+        preview = self._migration_preview
+        if not preview or time.time() - preview["created_at"] > 600:
+            yield event.plain_result("❌ 迁移预检不存在或已超过 10 分钟，请先执行 /myrss migrate。")
+            return
+        if preview["fingerprint"] != snapshot["fingerprint"]:
+            self._migration_preview = None
+            yield event.plain_result("❌ 旧文件在预检后发生变化，已拒绝执行；请重新预检。")
+            return
+        async with self._data_lock:
+            result = self.dh.migrate_and_delete_legacy()
+            self._reload_jobs()
+        self._migration_preview = None
+        if not result["merged"]:
+            yield event.plain_result("未发现可迁移的旧文件。")
+            return
+        yield event.plain_result(
+            f"✅ 已合并 {result['merged']} 个旧文件并完成读回校验。\n"
+            f"当前库：{result['current']}\n"
+            f"已删除：{'、'.join(result['deleted'])}\n"
+            f"删除前备份：{'、'.join(result['backups'])}"
+        )
 
     @myrss.group("rsshub")
     def rsshub(self, event: AstrMessageEvent):
