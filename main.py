@@ -833,8 +833,17 @@ class MyRssPlugin(Star):
         self.keyboard_enabled = bool(keyboard_config.get("enabled", False))
         self._keyboard_handler_name = f"myrss:{id(self)}"
         if self.keyboard_enabled:
-            install_keyboard_patch()
-            register_keyboard_handler(self._keyboard_handler_name, self._handle_keyboard_interaction)
+            try:
+                install_keyboard_patch()
+                register_keyboard_handler(
+                    self._keyboard_handler_name, self._handle_keyboard_interaction
+                )
+            except Exception as exc:
+                self.keyboard_enabled = False
+                self.logger.exception(
+                    "[QQKeyboard] 兼容桥安装失败，已只禁用 Keyboard，MyRSS 其余功能继续运行: %s",
+                    exc,
+                )
 
         # 防并发锁，key = (url, user)
         self._locks: dict = {}

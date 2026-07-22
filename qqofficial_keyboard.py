@@ -42,8 +42,12 @@ def install_patch() -> None:
         original_init(self, *args, **kwargs)
         # Plugins are instantiated before platform adapters during a full AstrBot start.
         self.intents.interaction = True
-        self.client.intents.interaction = True
-        logger.info("[QQKeyboard] interaction intent enabled for platform %s", self.config.get("id"))
+        # botpy.Client.intents 是 int 位图，不是 Intents 对象。
+        self.client.intents = self.intents.value
+        logger.info(
+            "[QQKeyboard] interaction intent enabled for platform %s value=%s",
+            self.config.get("id"), self.client.intents,
+        )
 
     async def on_interaction_create(client, interaction):
         code = 1  # operation failed unless a handler claims it
