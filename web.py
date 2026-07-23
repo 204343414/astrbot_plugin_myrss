@@ -33,6 +33,7 @@ class MyRssWebController:
             ("/subscriptions/test-delivery", self.test_delivery, ["POST"], "Test RSS GET and proactive delivery"),
             ("/subscriptions/add", self.add_subscription, ["POST"], "Add a safety-reviewed subscription"),
             ("/subscriptions/remove", self.remove_subscription, ["POST"], "Remove one group subscription"),
+            ("/moderation/resolve", self.resolve_moderation, ["POST"], "Resolve a severe moderation review"),
         ]
         for path, handler, methods, description in routes:
             self.context.register_web_api(
@@ -65,6 +66,15 @@ class MyRssWebController:
         payload = await quart_request.get_json(force=True, silent=True) or {}
         return await self.plugin.remove_subscription_from_ui(
             str(payload.get("origin", "")), str(payload.get("feed_url", ""))
+        )
+
+    async def resolve_moderation(self) -> dict[str, Any]:
+        if quart_request is None:
+            raise RuntimeError("Web request framework is unavailable")
+        payload = await quart_request.get_json(force=True, silent=True) or {}
+        return await self.plugin.resolve_moderation_review(
+            str(payload.get("review_id", "")),
+            str(payload.get("action", "")),
         )
 
     def _wrap(self, handler: Callable[[], Awaitable]):
@@ -131,6 +141,8 @@ class MyRssWebController:
                             "latest_link": sub.get("latest_link", ""),
                             "seen_count": len(sub.get("seen_links", [])),
                             "delivery_status": sub.get("delivery_status") if isinstance(sub.get("delivery_status"), dict) else None,
+                            "created_by": sub.get("created_by") if isinstance(sub.get("created_by"), dict) else {"source": "legacy"},
+                            "paused_by_moderation": bool(sub.get("paused_by_moderation", False)),
                             "preview": preview,
                         }
                     )
@@ -159,11 +171,22 @@ class MyRssWebController:
                 safety_events.append({key: event.get(key) for key in (
                     "id", "status", "source", "reason", "blocked_at", "content_fingerprint"
                 )})
+            settings = data.get("settings", {}) if isinstance(data.get("settings"), dict) else {}
+            reviews = [
+                review for review in settings.get("moderation_reviews", [])
+                if isinstance(review, dict) and review.get("state") == "pending"
+            ][:100]
+            bans = [
+                value for value in settings.get("subscription_bans", {}).values()
+                if isinstance(value, dict) and value.get("banned")
+            ]
             return {
                 "data_path": self.plugin.dh.get_data_path(),
                 "data_mtime": int(os.path.getmtime(self.plugin.dh.get_data_path())) if os.path.exists(self.plugin.dh.get_data_path()) else 0,
                 "group_count": len(result),
                 "subscription_count": sum(len(group["feeds"]) for group in result),
                 "safety_events": safety_events,
+                "moderation_reviews": reviews,
+                "subscription_bans": bans,
                 "groups": result,
             }

@@ -117,5 +117,10 @@
     "description": "reset 命令是否默认使用强制模式（不依赖拉取最新RSS，直接用当前 latest_link 重置为单条）。推荐开启，解决 poll 失败导致 reset 无效的问题。",
     "type": "bool",
     "default": true
+  },
+  "moderation_strike_threshold": {
+    "description": "管理员确认严重违规达到多少次后，禁止该OpenID在当前群新增订阅",
+    "type": "int",
+    "default": 2
   }
 }

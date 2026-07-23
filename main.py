@@ -672,6 +672,9 @@ class MyRssPlugin(Star):
         self.bot_provider_name = config.get("bot_provider_name", "")
         # 安全审核为强制生产不变量：不能通过配置绕过。
         self.content_filter = True
+        self.moderation_strike_threshold = max(
+            int(config.get("moderation_strike_threshold", 2)), 1
+        )
         self._comment_cache = {} # key=item_link, value=comment_text
         self._safe_cache = {} # key=item_link, value=bool(safe)
         self._vision_cache = {} # key=item_link, value=融合图单次识别结果（失败也缓存）
@@ -849,11 +852,34 @@ class MyRssPlugin(Star):
                 "fetch_error": fetch_error if not fetch_ok else "",
                 "send_error": "" if send_ok else "SEND_RETURNED_FALSE"}
 
-    async def add_subscription_from_ui(self, origin: str, value: str) -> dict:
+    @staticmethod
+    def _creator_key(origin: str, creator_openid: str) -> str:
+        return f"{origin}|{creator_openid}"
+
+    def _creator_ban(self, origin: str, creator_openid: str) -> dict | None:
+        if not creator_openid:
+            return None
+        bans = self.dh.data.get("settings", {}).get("subscription_bans", {})
+        value = bans.get(self._creator_key(origin, creator_openid)) if isinstance(bans, dict) else None
+        return value if isinstance(value, dict) and value.get("banned") else None
+
+    async def add_subscription_from_ui(
+        self,
+        origin: str,
+        value: str,
+        creator_openid: str = "",
+        creator_name: str = "",
+        creator_source: str = "dashboard",
+    ) -> dict:
         """Dashboard 安全新增：预审最新动态后固定 15 分钟订阅，不推历史内容。"""
         origin = str(origin or "")
         if "GroupMessage" not in origin:
             raise ValueError("目标不是群会话")
+        existing_ban = self._creator_ban(origin, creator_openid)
+        if existing_ban:
+            raise ValueError(
+                f"当前 OpenID 已被禁止在本群新增订阅：{existing_ban.get('reason', '管理员确认严重违规')}"
+            )
         if origin not in {sub for feed_url, feed in self.dh.data.items() if feed_url not in ("rsshub_endpoints", "settings") and isinstance(feed, dict) for sub in feed.get("subscribers", {})}:
             # UI 只管理已经被插件观察/登记过的群，不能构造任意 origin。
             known_in_web = any(origin == group_origin for group_origin in self._ready_group_sessions)
@@ -896,7 +922,11 @@ class MyRssPlugin(Star):
                     "last_update": items[0].pubDate_timestamp,
                     "latest_link": items[0].link,
                     "seen_links": [self._item_cache_key(item) for item in items if self._item_cache_key(item)][:200],
-                    "created_by": {"source": "dashboard"},
+                    "created_by": {
+                        "source": creator_source,
+                        "openid": creator_openid,
+                        "name": creator_name,
+                    },
                     "created_at": int(time.time()),
                 }
                 self.dh.save()
@@ -921,6 +951,64 @@ class MyRssPlugin(Star):
             self.dh.save()
             self._reload_jobs()
         return {"removed": True, "title": title}
+
+    async def resolve_moderation_review(
+        self, review_id: str, action: str
+    ) -> dict:
+        """Resolve one severe review from the authenticated Dashboard."""
+        if action not in {"restore", "confirm", "ban"}:
+            raise ValueError("action 只支持 restore / confirm / ban")
+        async with self._data_lock:
+            self.dh.data = self.dh._load()
+            settings = self.dh.data.setdefault("settings", {})
+            reviews = settings.setdefault("moderation_reviews", [])
+            review = next(
+                (item for item in reviews if isinstance(item, dict) and item.get("id") == review_id),
+                None,
+            )
+            if review is None:
+                raise ValueError("待复核记录不存在")
+            if review.get("state") != "pending":
+                raise ValueError("该记录已经处理")
+            origin, feed_url = str(review.get("origin", "")), str(review.get("feed_url", ""))
+            sub = self.dh.data.get(feed_url, {}).get("subscribers", {}).get(origin)
+            creator = review.get("created_by", {}) if isinstance(review.get("created_by"), dict) else {}
+            creator_openid = str(creator.get("openid", "") or "")
+            creator_key = self._creator_key(origin, creator_openid) if creator_openid else ""
+            bans = settings.setdefault("subscription_bans", {})
+            if action == "restore":
+                if isinstance(sub, dict):
+                    sub["paused_by_moderation"] = False
+                review["state"] = "false_positive"
+            else:
+                record = bans.setdefault(creator_key, {
+                    "openid": creator_openid,
+                    "name": str(creator.get("name", "") or ""),
+                    "origin": origin,
+                    "strikes": 0,
+                    "banned": False,
+                    "reason": "",
+                }) if creator_key else None
+                if record is not None:
+                    if action == "confirm":
+                        record["strikes"] = int(record.get("strikes", 0)) + 1
+                        if record["strikes"] >= self.moderation_strike_threshold:
+                            record["banned"] = True
+                    else:
+                        record["banned"] = True
+                    record["reason"] = "管理员确认严重内容订阅"
+                    record["updated_at"] = int(time.time())
+                review["state"] = "confirmed" if action == "confirm" else "creator_banned"
+            review["resolved_at"] = int(time.time())
+            self.dh.save()
+            self._reload_jobs()
+            return {
+                "id": review_id,
+                "state": review["state"],
+                "creator_openid": creator_openid,
+                "banned": bool(bans.get(creator_key, {}).get("banned")) if creator_key else False,
+                "strikes": int(bans.get(creator_key, {}).get("strikes", 0)) if creator_key else 0,
+            }
 
     def _record_delivery_status(self, url: str, origin: str, status: str, category: str = "") -> None:
         sub = self.dh.data.get(url, {}).get("subscribers", {}).get(origin)
@@ -1550,25 +1638,55 @@ class MyRssPlugin(Star):
             self._safe_cache[cache_key] = "REJECT"
             return "REJECT"
 
-    def _record_safety_event(self, url: str, item: RSSItem, status: str, reason: str = "") -> None:
-        """记录不含违规正文/图片的安全事件；同一源同一动态只保留一条。"""
+    def _record_safety_event(
+        self, url: str, origin: str, item: RSSItem, status: str, reason: str = ""
+    ) -> None:
+        """Persist safety history and create a review item for severe blocks."""
         if status not in ("REJECT", "MALICIOUS"):
             return
         item_key = self._item_cache_key(item)
-        event_id = hashlib.sha256(f"{url}|{item_key}|{status}".encode()).hexdigest()[:16]
+        event_id = hashlib.sha256(
+            f"{url}|{origin}|{item_key}|{status}".encode()
+        ).hexdigest()[:16]
         settings = self.dh.data.setdefault("settings", {})
         events = settings.setdefault("safety_events", [])
-        if any(isinstance(event, dict) and event.get("id") == event_id for event in events):
+        if not any(isinstance(event, dict) and event.get("id") == event_id for event in events):
+            events.insert(0, {
+                "id": event_id,
+                "status": status,
+                "source": item.chan_title or self.dh.data.get(url, {}).get("info", {}).get("title", "未知源"),
+                "reason": (reason or "综合内容审核未通过")[:160],
+                "blocked_at": int(time.time()),
+                "content_fingerprint": hashlib.sha256(item_key.encode()).hexdigest()[:12],
+            })
+            settings["safety_events"] = events[:100]
+
+        if status != "MALICIOUS":
             return
-        events.insert(0, {
+        sub = self.dh.data.get(url, {}).get("subscribers", {}).get(origin)
+        creator = sub.get("created_by", {}) if isinstance(sub, dict) else {}
+        if isinstance(sub, dict):
+            sub["paused_by_moderation"] = True
+        reviews = settings.setdefault("moderation_reviews", [])
+        if any(isinstance(review, dict) and review.get("id") == event_id for review in reviews):
+            return
+        reviews.insert(0, {
             "id": event_id,
+            "state": "pending",
             "status": status,
-            "source": item.chan_title or self.dh.data.get(url, {}).get("info", {}).get("title", "未知源"),
-            "reason": (reason or "综合内容审核未通过")[:160],
-            "blocked_at": int(time.time()),
-            "content_fingerprint": hashlib.sha256(item_key.encode()).hexdigest()[:12],
+            "origin": origin,
+            "feed_url": url,
+            "source": item.chan_title,
+            "title": (item.title or "")[:180],
+            "description": (item.description or "")[:500],
+            "image_url": item.pic_urls[0] if item.pic_urls else "",
+            "link": item.link or "",
+            "reason": (reason or "严重内容审核未通过")[:160],
+            "created_by": creator if isinstance(creator, dict) else {},
+            "created_at": int(time.time()),
         })
-        settings["safety_events"] = events[:100]
+        settings["moderation_reviews"] = reviews[:100]
+
 
     def _store_safe_item_preview(self, url: str, item: RSSItem) -> None:
         """保存 UI 所需的最新安全内容，不增加抓取或 LLM 调用。"""
@@ -1778,6 +1896,9 @@ class MyRssPlugin(Star):
             return
         ready_users = []
         for user in list(subs):
+            if isinstance(subs.get(user), dict) and subs[user].get("paused_by_moderation"):
+                self.logger.info("RSS订阅因严重审核待复核而暂停: %s -> %s", url, user)
+                continue
             ready, reason = self._target_readiness(user)
             if ready:
                 ready_users.append(user)
@@ -1888,7 +2009,7 @@ class MyRssPlugin(Star):
                         if vision_status in ("REJECT", "MALICIOUS")
                         else "正文与图片综合审核未通过"
                     )
-                    self._record_safety_event(url, it, status, reason)
+                    self._record_safety_event(url, user, it, status, reason)
                     metadata_changed = True
                     if status == "MALICIOUS":
                         self.logger.warning("[MyRSS] MALICIOUS filtered: %s", it.title[:30])
@@ -1989,7 +2110,13 @@ class MyRssPlugin(Star):
             return
         self._ready_group_sessions.add(origin)
         try:
-            result = await self.add_subscription_from_ui(origin, value)
+            result = await self.add_subscription_from_ui(
+                origin,
+                value,
+                creator_openid=str(event.get_sender_id()),
+                creator_name=str(event.get_sender_name() or ""),
+                creator_source="command",
+            )
             yield event.plain_result(
                 f"{'✅' if result.get('created') else 'ℹ️'} {result.get('message')}\n"
                 f"源：{result.get('title') or result.get('route') or value}"

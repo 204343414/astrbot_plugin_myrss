@@ -45,6 +45,7 @@ async function load() {
     el("subCount").textContent = payload.subscription_count;
     el("blockedCount").textContent = payload.safety_events?.length || 0;
     renderSafety();
+    renderModeration();
     if (!payload.groups.some((group) => group.origin === selected)) {
       selected = payload.groups[0]?.origin || "";
     }
@@ -72,6 +73,51 @@ function renderSafety() {
   panel.innerHTML = `<h2>🛡️ 近期未通过安全审核的动态（仅元数据）</h2><div class="safety-list">${events.map((event) => `<div class="safety-event"><span class="${event.status === "MALICIOUS" ? "danger" : "reject"}">${escapeHtml(event.status)}</span><span><b>${escapeHtml(event.source || "未知源")}</b>　${escapeHtml(event.reason || "审核未通过")}</span><span class="muted">${fmt(event.blocked_at)} · ${escapeHtml(event.content_fingerprint || "")}</span></div>`).join("")}</div>`;
 }
 
+const moderationConfirmUntil = new Map();
+function creatorLabel(creator) {
+  if (!creator || creator.source === "legacy") return "历史订阅（创建者未知）";
+  if (creator.source === "dashboard") return "Dashboard 管理员";
+  const id = String(creator.openid || "");
+  return `${creator.name || "OpenID"}${id ? ` · ${id}` : ""}`;
+}
+function renderModeration() {
+  const reviews = Array.isArray(payload.moderation_reviews) ? payload.moderation_reviews : [];
+  const reviewPanel = el("reviewPanel");
+  if (!reviews.length) { reviewPanel.classList.add("hidden"); reviewPanel.innerHTML = ""; }
+  else {
+    reviewPanel.classList.remove("hidden");
+    reviewPanel.innerHTML = `<h2>⚠️ 严重拦截待复核</h2><div class="review-list">${reviews.map((review) => {
+      const image = safeHttpUrl(review.image_url), link = safeHttpUrl(review.link);
+      return `<article class="review-item">${image ? `<img src="${escapeHtml(image)}" referrerpolicy="no-referrer">` : ""}<div><h3>${escapeHtml(review.source || "未知源")}</h3><p>${escapeHtml(review.title || "")}</p><p class="muted">${escapeHtml(review.description || "")}</p><p>创建者：${escapeHtml(creatorLabel(review.created_by))}</p><p class="muted">${fmt(review.created_at)} · ${escapeHtml(review.reason || "严重审核未通过")}${link ? ` · <a href="${escapeHtml(link)}" target="_blank" rel="noopener noreferrer">查看原链接</a>` : ""}</p><div class="review-actions"><button data-review="${escapeHtml(review.id)}" data-action="restore">误判恢复</button><button data-review="${escapeHtml(review.id)}" data-action="confirm" class="warn-button">确认违规+1</button><button data-review="${escapeHtml(review.id)}" data-action="ban" class="danger-button">立即禁止创建者新增</button></div></div></article>`;
+    }).join("")}</div>`;
+    reviewPanel.querySelectorAll("[data-review]").forEach((button) => { button.onclick = () => resolveReview(button); });
+  }
+  const bans = Array.isArray(payload.subscription_bans) ? payload.subscription_bans : [];
+  const banPanel = el("banPanel");
+  if (!bans.length) { banPanel.classList.add("hidden"); banPanel.innerHTML = ""; }
+  else {
+    banPanel.classList.remove("hidden");
+    banPanel.innerHTML = `<h2>🚫 禁止新增订阅</h2>${bans.map((item) => `<div class="ban-item"><b>${escapeHtml(item.name || "OpenID")}</b> · ${escapeHtml(item.openid || "未知")} · strikes=${Number(item.strikes || 0)}<br><span class="muted">${escapeHtml(item.origin || "")} · ${escapeHtml(item.reason || "")}</span></div>`).join("")}`;
+  }
+}
+async function resolveReview(button) {
+  const action = button.dataset.action, id = button.dataset.review, key = `${id}:${action}`;
+  if (action !== "restore" && (moderationConfirmUntil.get(key) || 0) < Date.now()) {
+    moderationConfirmUntil.set(key, Date.now() + 5000);
+    const old = button.textContent; button.textContent = "5秒内再次点击确认";
+    setTimeout(() => { if ((moderationConfirmUntil.get(key) || 0) <= Date.now()) button.textContent = old; }, 5100);
+    return;
+  }
+  moderationConfirmUntil.delete(key); button.disabled = true;
+  try {
+    const response = await bridge.apiPost("moderation/resolve", { review_id: id, action });
+    if (response?.ok === false) throw new Error(response.message || "处理失败");
+    const result = response?.ok === true ? response.data : (response?.data || response);
+    setTestStatus("success", `复核完成：${result.state}${result.creator_openid ? `\n创建者：${result.creator_openid}\nstrikes=${result.strikes} banned=${result.banned}` : ""}`);
+    await load();
+  } catch (error) { setTestStatus("error", `复核失败：${error?.message || error}`); button.disabled = false; }
+}
+
 function renderFeed(feed, origin) {
   const avatar = safeHttpUrl(feed.avatar);
   const preview = feed.preview && feed.preview.safety_status === "SAFE" ? feed.preview : null;
@@ -79,7 +125,7 @@ function renderFeed(feed, origin) {
   const link = safeHttpUrl(preview?.link || feed.latest_link);
   const delivery = feed.delivery_status;
   const deliveryLabel = !delivery ? "⚪ 尚无投递记录" : delivery.status === "SUCCESS" ? `🟢 最近投递成功 ${fmt(delivery.delivered_at)}` : `🔴 最近投递失败 ${fmt(delivery.attempted_at)} · ${escapeHtml(delivery.error_category || "UNKNOWN")}`;
-  return `<section class="feed"><div class="source-header">${avatar ? `<img class="avatar" src="${escapeHtml(avatar)}" referrerpolicy="no-referrer" />` : `<div class="avatar avatar-fallback">${escapeHtml((feed.title || "?").slice(0, 1))}</div>`}<div><h3>${escapeHtml(feed.title)}</h3><div class="muted">${escapeHtml(feed.cron_expr || "—")} · 去重 ${feed.seen_count} 条</div></div></div>${feed.description ? `<p class="source-description">${escapeHtml(feed.description)}</p>` : ""}<p class="muted">${deliveryLabel}</p><div class="grid"><span class="label">路由 / URL</span><span class="value">${escapeHtml(feed.url)}</span><span class="label">最后断点</span><span>${fmt(feed.last_update)}</span></div>${preview ? `<div class="latest-preview ${image ? "has-image" : "no-image"}">${image ? `<img src="${escapeHtml(image)}" referrerpolicy="no-referrer" />` : ""}<div><h4>${escapeHtml(preview.title || "最新安全动态")}</h4><p>${escapeHtml(preview.description || "暂无摘要")}</p><span class="muted">${fmt(preview.pub_timestamp || preview.updated_at)}</span>${link ? `　<a class="open-link" href="${escapeHtml(link)}" target="_blank" rel="noopener noreferrer">打开动态 ↗</a>` : ""}</div></div>` : `<p class="muted">暂无安全内容缓存；下一次出现并通过审核的新动态后自动补齐。</p>`}<div class="feed-actions"><button class="test-delivery" data-origin="${escapeHtml(origin)}" data-feed="${escapeHtml(feed.url)}">测试 GET + 主动推送</button><button class="remove-subscription danger-button" data-origin="${escapeHtml(origin)}" data-feed="${escapeHtml(feed.url)}">退订此源</button></div></section>`;
+  return `<section class="feed"><div class="source-header">${avatar ? `<img class="avatar" src="${escapeHtml(avatar)}" referrerpolicy="no-referrer" />` : `<div class="avatar avatar-fallback">${escapeHtml((feed.title || "?").slice(0, 1))}</div>`}<div><h3>${escapeHtml(feed.title)}</h3><div class="muted">${escapeHtml(feed.cron_expr || "—")} · 去重 ${feed.seen_count} 条</div></div></div>${feed.description ? `<p class="source-description">${escapeHtml(feed.description)}</p>` : ""}<p class="muted">创建者：${escapeHtml(creatorLabel(feed.created_by))}${feed.paused_by_moderation ? " · ⚠️ 严重审核待复核，已暂停" : ""}</p><p class="muted">${deliveryLabel}</p><div class="grid"><span class="label">路由 / URL</span><span class="value">${escapeHtml(feed.url)}</span><span class="label">最后断点</span><span>${fmt(feed.last_update)}</span></div>${preview ? `<div class="latest-preview ${image ? "has-image" : "no-image"}">${image ? `<img src="${escapeHtml(image)}" referrerpolicy="no-referrer" />` : ""}<div><h4>${escapeHtml(preview.title || "最新安全动态")}</h4><p>${escapeHtml(preview.description || "暂无摘要")}</p><span class="muted">${fmt(preview.pub_timestamp || preview.updated_at)}</span>${link ? `　<a class="open-link" href="${escapeHtml(link)}" target="_blank" rel="noopener noreferrer">打开动态 ↗</a>` : ""}</div></div>` : `<p class="muted">暂无安全内容缓存；下一次出现并通过审核的新动态后自动补齐。</p>`}<div class="feed-actions"><button class="test-delivery" data-origin="${escapeHtml(origin)}" data-feed="${escapeHtml(feed.url)}">测试 GET + 主动推送</button><button class="remove-subscription danger-button" data-origin="${escapeHtml(origin)}" data-feed="${escapeHtml(feed.url)}">退订此源</button></div></section>`;
 }
 
 function setTestStatus(kind, message) {
