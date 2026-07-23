@@ -88,11 +88,6 @@
     "default": "",
     "_special": "select_provider"
   },
-  "subscription_operator_ids": {
-    "description": "MyRSS 订阅操作员 OpenID，多个用逗号或换行分隔。仅授予 MyRSS add/eye/迁移管理权限，不等同 AstrBot 管理员。",
-    "type": "text",
-    "default": ""
-  },
   "push_delay_min": {
     "description": "推送间隔最小秒数（防风控）",
     "type": "float",
