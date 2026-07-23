@@ -1010,6 +1010,28 @@ class MyRssPlugin(Star):
                 "strikes": int(bans.get(creator_key, {}).get("strikes", 0)) if creator_key else 0,
             }
 
+    async def unban_subscription_creator(
+        self, origin: str, creator_openid: str
+    ) -> dict:
+        async with self._data_lock:
+            self.dh.data = self.dh._load()
+            bans = self.dh.data.setdefault("settings", {}).setdefault(
+                "subscription_bans", {}
+            )
+            key = self._creator_key(str(origin), str(creator_openid))
+            record = bans.get(key)
+            if not isinstance(record, dict) or not record.get("banned"):
+                raise ValueError("该 OpenID 当前未被禁止新增")
+            record["banned"] = False
+            record["reason"] = "Dashboard 管理员解除"
+            record["updated_at"] = int(time.time())
+            self.dh.save()
+            return {
+                "openid": creator_openid,
+                "origin": origin,
+                "strikes": int(record.get("strikes", 0)),
+            }
+
     def _record_delivery_status(self, url: str, origin: str, status: str, category: str = "") -> None:
         sub = self.dh.data.get(url, {}).get("subscribers", {}).get(origin)
         if not isinstance(sub, dict):

@@ -97,9 +97,26 @@ function renderModeration() {
   if (!bans.length) { banPanel.classList.add("hidden"); banPanel.innerHTML = ""; }
   else {
     banPanel.classList.remove("hidden");
-    banPanel.innerHTML = `<h2>🚫 禁止新增订阅</h2>${bans.map((item) => `<div class="ban-item"><b>${escapeHtml(item.name || "OpenID")}</b> · ${escapeHtml(item.openid || "未知")} · strikes=${Number(item.strikes || 0)}<br><span class="muted">${escapeHtml(item.origin || "")} · ${escapeHtml(item.reason || "")}</span></div>`).join("")}`;
+    banPanel.innerHTML = `<h2>🚫 禁止新增订阅</h2>${bans.map((item) => `<div class="ban-item"><b>${escapeHtml(item.name || "OpenID")}</b> · ${escapeHtml(item.openid || "未知")} · strikes=${Number(item.strikes || 0)}<br><span class="muted">${escapeHtml(item.origin || "")} · ${escapeHtml(item.reason || "")}</span><div class="review-actions"><button class="unban-creator" data-origin="${escapeHtml(item.origin || "")}" data-openid="${escapeHtml(item.openid || "")}">解除禁止新增</button></div></div>`).join("")}`;
+    banPanel.querySelectorAll(".unban-creator").forEach((button) => { button.onclick = () => unbanCreator(button); });
   }
 }
+async function unbanCreator(button) {
+  button.disabled = true;
+  try {
+    const response = await bridge.apiPost("moderation/unban", {
+      origin: button.dataset.origin,
+      openid: button.dataset.openid,
+    });
+    if (response?.ok === false) throw new Error(response.message || "解除失败");
+    setTestStatus("success", `已允许 ${button.dataset.openid} 在该群重新新增订阅；历史 strikes 保留。`);
+    await load();
+  } catch (error) {
+    setTestStatus("error", `解除禁止失败：${error?.message || error}`);
+    button.disabled = false;
+  }
+}
+
 async function resolveReview(button) {
   const action = button.dataset.action, id = button.dataset.review, key = `${id}:${action}`;
   if (action !== "restore" && (moderationConfirmUntil.get(key) || 0) < Date.now()) {

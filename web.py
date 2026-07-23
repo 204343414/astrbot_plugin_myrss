@@ -34,6 +34,7 @@ class MyRssWebController:
             ("/subscriptions/add", self.add_subscription, ["POST"], "Add a safety-reviewed subscription"),
             ("/subscriptions/remove", self.remove_subscription, ["POST"], "Remove one group subscription"),
             ("/moderation/resolve", self.resolve_moderation, ["POST"], "Resolve a severe moderation review"),
+            ("/moderation/unban", self.unban_creator, ["POST"], "Allow a creator to add subscriptions again"),
         ]
         for path, handler, methods, description in routes:
             self.context.register_web_api(
@@ -75,6 +76,15 @@ class MyRssWebController:
         return await self.plugin.resolve_moderation_review(
             str(payload.get("review_id", "")),
             str(payload.get("action", "")),
+        )
+
+    async def unban_creator(self) -> dict[str, Any]:
+        if quart_request is None:
+            raise RuntimeError("Web request framework is unavailable")
+        payload = await quart_request.get_json(force=True, silent=True) or {}
+        return await self.plugin.unban_subscription_creator(
+            str(payload.get("origin", "")),
+            str(payload.get("openid", "")),
         )
 
     def _wrap(self, handler: Callable[[], Awaitable]):
