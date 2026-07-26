@@ -28,6 +28,9 @@ from astrbot.api import AstrBotConfig
 import astrbot.api.message_components as Comp
 
 from .web import MyRssWebController
+from . import qq_group_event_bridge
+
+PLUGIN_NAME = "astrbot_plugin_myrss"
 
 # [防冲突] 模块级变量追踪当前活跃的调度器
 # 插件热更新时新实例先通过此引用杀掉老调度器，避免新老并行双推
@@ -635,7 +638,7 @@ class CardGen:
 
 
 
-@register("astrbot_plugin_myrss", "MyRSS", "RSS订阅插件(LLM增强版)", "1.2.0", "")
+@register("astrbot_plugin_myrss", "MyRSS", "RSS订阅插件(LLM增强版)", "1.3.0", "")
 class MyRssPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -733,6 +736,7 @@ class MyRssPlugin(Star):
         _ALL_SCHEDS.add(self.sched)
         self.sched.start()
         self._reload_jobs()
+        qq_group_event_bridge.install(PLUGIN_NAME, self._on_group_del_robot)
     
     def _is_current_runtime(self) -> bool:
         runtime = builtins._ASTRBOT_MYRSS_RUNTIME
@@ -1115,8 +1119,62 @@ class MyRssPlugin(Star):
         if origin and "GroupMessage" in origin:
             self._ready_group_sessions.add(origin)
 
+    async def _on_group_del_robot(self, client, event) -> None:
+        group_openid = str(getattr(event, "group_openid", "") or "").strip()
+        platform = getattr(client, "platform", None)
+        if not group_openid or platform is None:
+            return
+        origin = f"{platform.meta().id}:GroupMessage:{group_openid}"
+        removed_relations = 0
+        async with self._data_lock:
+            self.dh.data = self.dh._load()
+            for feed_url in list(self.dh.data):
+                if feed_url in ("rsshub_endpoints", "settings"):
+                    continue
+                feed = self.dh.data.get(feed_url)
+                if not isinstance(feed, dict):
+                    continue
+                subscribers = feed.get("subscribers", {})
+                if isinstance(subscribers, dict) and origin in subscribers:
+                    subscribers.pop(origin, None)
+                    removed_relations += 1
+                if isinstance(subscribers, dict) and not subscribers:
+                    self.dh.data.pop(feed_url, None)
+
+            settings = self.dh.data.setdefault("settings", {})
+            reviews = settings.get("moderation_reviews", [])
+            if isinstance(reviews, list):
+                settings["moderation_reviews"] = [
+                    review
+                    for review in reviews
+                    if not isinstance(review, dict)
+                    or str(review.get("origin", "")) != origin
+                ]
+            bans = settings.get("subscription_bans", {})
+            if isinstance(bans, dict):
+                for key in list(bans):
+                    record = bans.get(key)
+                    if str(key).startswith(origin + "|") or (
+                        isinstance(record, dict)
+                        and str(record.get("origin", "")) == origin
+                    ):
+                        bans.pop(key, None)
+            self.dh.save()
+            self._reload_jobs()
+
+        self._ready_group_sessions.discard(origin)
+        self._target_last_send.pop(origin, None)
+        self._target_last_send_error.pop(origin, None)
+        self._delivery_test_cooldown.pop(origin, None)
+        self.logger.warning(
+            "MyRSS: Bot被移出群，已清空订阅和群级审核状态: %s relations=%d",
+            origin,
+            removed_relations,
+        )
+
     async def destroy(self):
         """插件卸载/禁用时停止调度器"""
+        qq_group_event_bridge.detach(PLUGIN_NAME)
         global _ACTIVE_SCHED
         try:
             if self.sched.running:
