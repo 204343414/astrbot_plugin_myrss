@@ -635,7 +635,7 @@ class CardGen:
 
 
 
-@register("astrbot_plugin_myrss", "MyRSS", "RSS订阅插件(LLM增强版)", "1.1.0", "")
+@register("astrbot_plugin_myrss", "MyRSS", "RSS订阅插件(LLM增强版)", "1.2.0", "")
 class MyRssPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -684,7 +684,9 @@ class MyRssPlugin(Star):
         self._eye_cooldown = {}
         self._target_send_locks = {}
         self._target_last_send = {}
+        self._target_last_send_error = {}
         self._delivery_test_cooldown = {}
+        self.max_subscriptions_per_group = 5
         self._official_send_delay_min = 5.0
         self._official_send_delay_max = 10.0
         
@@ -790,13 +792,35 @@ class MyRssPlugin(Star):
         if elapsed < minimum:
             await asyncio.sleep(minimum - elapsed)
 
+    @staticmethod
+    def _is_active_message_permission_error(error: object) -> bool:
+        """Only classify QQ's explicit proactive-send permission rejection."""
+        text = re.sub(r"\s+", "", str(error or "")).lower()
+        return "主动消息失败" in text and "无权限" in text
+
     async def _send_message_guarded(self, origin: str, chain: MessageChain) -> bool:
         async with self._get_target_send_lock(origin):
             await self._wait_target_send_slot(origin)
-            result = await self.ctx.send_message(origin, chain)
-            if result:
+            try:
+                # QQ Official send_message() returns None after success. Only
+                # an exception is a failure signal; never use bool(result).
+                await self.ctx.send_message(origin, chain)
                 self._target_last_send[origin] = time.time()
-            return bool(result)
+                self._target_last_send_error.pop(origin, None)
+                return True
+            except Exception as exc:
+                self._target_last_send_error[origin] = str(exc)
+                self.logger.warning("RSS主动发送失败: target=%s error=%s", origin, exc)
+                return False
+
+    def _subscription_count(self, origin: str) -> int:
+        return sum(
+            1
+            for feed_url, feed in self.dh.data.items()
+            if feed_url not in ("rsshub_endpoints", "settings")
+            and isinstance(feed, dict)
+            and origin in feed.get("subscribers", {})
+        )
 
     async def run_delivery_diagnostic(self, origin: str, feed_url: str) -> dict:
         """UI/命令共用的单次诊断：GET RSS + 合成卡片主动发送，不调用 LLM。"""
@@ -870,6 +894,7 @@ class MyRssPlugin(Star):
         creator_openid: str = "",
         creator_name: str = "",
         creator_source: str = "dashboard",
+        require_active_probe: bool = False,
     ) -> dict:
         """Dashboard 安全新增：预审最新动态后固定 15 分钟订阅，不推历史内容。"""
         origin = str(origin or "")
@@ -888,6 +913,18 @@ class MyRssPlugin(Star):
         full_url, route, error = self._resolve_feed_url(value)
         if not full_url:
             raise ValueError(error)
+        if origin in self.dh.data.get(full_url, {}).get("subscribers", {}):
+            title = self.dh.data.get(full_url, {}).get("info", {}).get("title", "")
+            return {
+                "created": False,
+                "title": title,
+                "route": route,
+                "message": "本群已经订阅该源",
+            }
+        if self._subscription_count(origin) >= self.max_subscriptions_per_group:
+            raise ValueError(
+                f"当前群最多订阅 {self.max_subscriptions_per_group} 个动态源，请先用 /myrss - 退订一个。"
+            )
         raw = await self._fetch(full_url)
         if not raw:
             raise ValueError("无法访问该 RSS 源")
@@ -908,10 +945,30 @@ class MyRssPlugin(Star):
             status = await self._check_content_safe(items[0])
             if status != "SAFE":
                 raise ValueError(f"最新动态未通过安全审核: {status}")
+            confirmation_sent = False
+            if require_active_probe:
+                send_ok = await self._send_message_guarded(
+                    origin,
+                    MessageChain().message(
+                        f"✅ MyRSS 主动推送测试通过，已订阅：{title or route}"
+                    ),
+                )
+                if not send_ok:
+                    error_text = self._target_last_send_error.get(origin, "主动消息发送失败")
+                    if self._is_active_message_permission_error(error_text):
+                        raise ValueError(
+                            "请@群主开启 Bot 的“机器人主动在群聊内发言”功能后重试"
+                        )
+                    raise ValueError(f"主动推送测试失败：{error_text}")
+                confirmation_sent = True
             async with self._data_lock:
                 self.dh.data = self.dh._load()
                 if origin in self.dh.data.get(full_url, {}).get("subscribers", {}):
                     return {"created": False, "title": title, "route": route, "message": "本群已经订阅该源"}
+                if self._subscription_count(origin) >= self.max_subscriptions_per_group:
+                    raise ValueError(
+                        f"当前群最多订阅 {self.max_subscriptions_per_group} 个动态源，请先退订一个。"
+                    )
                 # 预审期间的临时 feed 不一定在磁盘，正式写入前补齐。
                 self.dh.data.setdefault(full_url, {
                     "subscribers": {},
@@ -931,7 +988,13 @@ class MyRssPlugin(Star):
                 }
                 self.dh.save()
                 self._reload_jobs()
-            return {"created": True, "title": title, "route": route, "message": "订阅成功，固定每15分钟检查"}
+            return {
+                "created": True,
+                "title": title,
+                "route": route,
+                "message": "订阅成功，固定每15分钟检查",
+                "confirmation_sent": confirmation_sent,
+            }
         finally:
             if old_entry is None and not self.dh.data.get(full_url, {}).get("subscribers"):
                 self.dh.data.pop(full_url, None)
@@ -2085,8 +2148,32 @@ class MyRssPlugin(Star):
             self._record_delivery_status(url, user, "SUCCESS")
             self.logger.info("RSS推送完成: %s -> %s (%d条)", url, user, len(batch))
         else:
-            self._record_delivery_status(url, user, "FAILED", "SEND_RETURNED_FALSE")
-            self.logger.error("RSS投递失败（seen_links 已保留以防循环重推）: %s -> %s (%d条)", url, user, len(batch))
+            send_error = self._target_last_send_error.get(user, "SEND_FAILED")
+            self._record_delivery_status(url, user, "FAILED", send_error)
+            if self._is_active_message_permission_error(send_error):
+                # QQ explicitly reports that proactive messaging is disabled.
+                # Remove only this group's current source; transient network or
+                # HTTP failures never unsubscribe. seen_links remain committed.
+                subscribers = self.dh.data.get(url, {}).get("subscribers", {})
+                subscribers.pop(user, None)
+                if not subscribers:
+                    self.dh.data.pop(url, None)
+                self.logger.warning(
+                    "RSS因主动消息无权限自动退订当前源: %s -> %s error=%s",
+                    url,
+                    user,
+                    send_error,
+                )
+                self.dh.save()
+                self._reload_jobs()
+                return
+            self.logger.error(
+                "RSS投递失败但保留订阅（seen_links 已保留）: %s -> %s (%d条) error=%s",
+                url,
+                user,
+                len(batch),
+                send_error,
+            )
         self.dh.save()
 
         # ============================================================
@@ -2138,11 +2225,15 @@ class MyRssPlugin(Star):
                 creator_openid=str(event.get_sender_id()),
                 creator_name=str(event.get_sender_name() or ""),
                 creator_source="command",
+                require_active_probe=True,
             )
-            yield event.plain_result(
-                f"{'✅' if result.get('created') else 'ℹ️'} {result.get('message')}\n"
-                f"源：{result.get('title') or result.get('route') or value}"
-            )
+            # The proactive probe itself is the sole success confirmation.
+            # Existing subscriptions do not probe, so they still need a reply.
+            if not result.get("confirmation_sent"):
+                yield event.plain_result(
+                    f"{'✅' if result.get('created') else 'ℹ️'} {result.get('message')}\n"
+                    f"源：{result.get('title') or result.get('route') or value}"
+                )
         except Exception as exc:
             yield event.plain_result(f"❌ 订阅失败：{exc}")
 
