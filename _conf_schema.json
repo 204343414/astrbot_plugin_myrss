@@ -122,5 +122,46 @@
     "description": "管理员确认严重违规达到多少次后，禁止该OpenID在当前群新增订阅",
     "type": "int",
     "default": 2
+  },
+  "enable_natural_language_subscribe": {
+    "description": "启用自然语言订阅（v1.4.0 新增）。开启后，/myrss + 后面可以跟自然语言（如 '帮我订阅 OpenAI 的推特'），插件会临时起一个 LLM agent run 来识别意图。关闭时仅支持显式 URL / 路由。",
+    "type": "bool",
+    "default": false
+  },
+  "nl_provider_id": {
+    "description": "自然语言订阅用的 LLM 提供商 ID（留空则用当前会话 provider）。建议选便宜快速的模型。",
+    "type": "string",
+    "default": "",
+    "_special": "select_provider"
+  },
+  "nl_enable_websearch": {
+    "description": "自然语言订阅时是否允许 LLM 调联网搜索（AstrBot 内置 websearch tool）。需要 AstrBot WebUI 里配置过 websearch provider 和 key。",
+    "type": "bool",
+    "default": true
+  },
+  "nl_max_steps": {
+    "description": "自然语言订阅时 LLM agent run 最大步数。超过会强制终止。",
+    "type": "int",
+    "default": 8
+  },
+  "nl_confirm_max_steps": {
+    "description": "用户回复 '同意/拒绝' 时 LLM 二次判定的 agent run 最大步数。",
+    "type": "int",
+    "default": 4
+  },
+  "nl_pending_ttl_seconds": {
+    "description": "预览卡片推送后，等待用户引用/回复的秒数。超时静默过期。",
+    "type": "int",
+    "default": 600
+  },
+  "nl_rate_limit_seconds": {
+    "description": "自然语言订阅每群最小调用间隔秒数。",
+    "type": "int",
+    "default": 30
+  },
+  "nl_debug_log": {
+    "description": "调试开关：开启后每次 LLM agent run 的 prompt、tool 调用、final response 都会写到日志（level=info）。实际跑通后可关闭。",
+    "type": "bool",
+    "default": false
   }
 }

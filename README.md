@@ -1,9 +1,5 @@
-# helloworld
+# astrbot_plugin_myrss
 
-AstrBot 插件模板
-
-A template plugin for AstrBot plugin feature
-
-# 支持
-
-- [插件开发文档](https://docs.astrbot.app/dev/star/plugin-new.html)
+AstrBot RSS 订阅插件（LLM 增强版）。详见仓库内：
+- [NATURAL_LANGUAGE_SUBSCRIBE.md](NATURAL_LANGUAGE_SUBSCRIBE.md) — v1.4.0 自然语言订阅设计
+- [TWO_TOOL_AUDIT.md](TWO_TOOL_AUDIT.md) / [DEAD_CODE_AUDIT.md](DEAD_CODE_AUDIT.md) / [交接文档.md](交接文档.md) — 历史记录
