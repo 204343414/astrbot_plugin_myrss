@@ -2468,6 +2468,14 @@ class MyRssPlugin(Star):
         except Exception:
             pass
 
+        # 关键修复: 跳过 /myrss 命令消息。
+        # 触发订阅的命令本身 (/myrss + 订阅...) 含"订阅"关键词, 且第一次 LLM run
+        # 建立 pending 后, 同一条命令消息会被本钩子异步再处理一次, 导致"没等用户
+        # 同意就自动 approve"。确认回复(同意/拒绝/不是这个)绝不会以 /myrss 开头。
+        cmd_text = (event.message_str or "").strip()
+        if cmd_text.startswith("/myrss") or cmd_text.lstrip().startswith("/"):
+            return
+
         pending = self.nl_pending.peek(origin)
         if pending is None:
             return
