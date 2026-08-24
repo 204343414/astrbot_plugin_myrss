@@ -407,23 +407,23 @@ def _make_preview_card_tool(plugin) -> FunctionTool:
             return "错误：仅在群聊中可用。"
 
         if not feed_url:
-            return "错误：feed_url 不能为空。"
+            return await _send_err(plugin, origin, "feed_url 不能为空。")
 
         # 1) 解析成完整 RSS URL
         full_url, route, error = plugin._resolve_feed_url(feed_url)
         if not full_url:
-            return f"错误：{error}"
+            return await _send_err(plugin, origin, f"{error}（可直接发送 /myrss + 主页链接或 / 开头路由）")
 
         # 2) 拉 RSS
         raw = await plugin._fetch(full_url)
         if not raw:
-            return "错误：无法访问该 RSS 源。"
+            return await _send_err(plugin, origin, "无法访问该 RSS 源，请稍后再试或换个源。")
 
         # 3) 解析频道信息
         try:
             title, description, avatar = plugin.dh.parse_channel_info(raw)
         except Exception as exc:
-            return f"错误：频道解析失败: {exc}"
+            return await _send_err(plugin, origin, f"频道解析失败: {exc}")
 
         # 3.5) 先写入临时 dh.data entry（必须在 _poll 之前！）。
         # 之前写在 _poll 之后，导致 _poll 时 full_url 尚不在 dh.data，
@@ -441,7 +441,7 @@ def _make_preview_card_tool(plugin) -> FunctionTool:
             # 4) 拉最新一条
             items = await plugin._poll(full_url, num=1)
             if not items:
-                return "错误：该源没有可审核的最新动态。"
+                return await _send_err(plugin, origin, "该源目前没有可审核的动态。")
 
             # 5) 全量内容审核
             status = await plugin._check_content_safe(items[0])
@@ -462,7 +462,7 @@ def _make_preview_card_tool(plugin) -> FunctionTool:
             # 6) 渲染预览卡片
             card_b64 = await plugin._make_card_b64(items[0])
             if not card_b64:
-                return "错误：卡片渲染失败（browserless 不可用）。"
+                return await _send_err(plugin, origin, "卡片渲染失败（browserless 不可用），无法生成预览。")
 
             # 7) 计算 summary (供二次 LLM 用)
             summary = (
@@ -504,7 +504,7 @@ def _make_preview_card_tool(plugin) -> FunctionTool:
             if not send_ok:
                 plugin.nl_pending.pop(origin)
                 error_text = plugin._target_last_send_error.get(origin, "发送失败")
-                return f"错误：卡片发送失败 ({error_text})。请确认本群 Bot 已开启主动消息权限。"
+                return await _send_err(plugin, origin, f"卡片发送失败 ({error_text})。请确认本群 Bot 已开启主动消息权限。")
 
             if plugin.nl_debug_log:
                 logger.info("[NL][preview_card] sent, summary=%s", summary)
@@ -758,6 +758,15 @@ def _plain_chain(text: str) -> "MessageChain":
     chain = MessageChain()
     chain.chain.append(Plain(text))
     return chain
+
+
+async def _send_err(plugin, origin: str, text: str) -> str:
+    """把错误直接发给当前群并返回给 LLM 的字符串。
+    不依赖 LLM 用 myrss_emit_result 转达——否则 LLM 直接 terminate 时
+    用户收不到任何报错原因，表现为"静默失败"。
+    """
+    await plugin._send_message_guarded(origin, _plain_chain(f"❌ {text}"))
+    return f"ERROR: {text}"
 
 
 # ============================================================
