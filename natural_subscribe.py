@@ -425,34 +425,11 @@ def _make_preview_card_tool(plugin) -> FunctionTool:
         except Exception as exc:
             return f"错误：频道解析失败: {exc}"
 
-        # 4) 拉最新一条
-        items = await plugin._poll(full_url, num=1)
-        if not items:
-            return "错误：该源没有可审核的最新动态。"
-
-        # 5) 全量内容审核
-        status = await plugin._check_content_safe(items[0])
-        if status != "SAFE":
-            vision = plugin._vision_cache.get(plugin._item_cache_key(items[0]), {})
-            reason = vision.get("description", "") if isinstance(vision, dict) else ""
-            detail = (reason or f"内容安全审核未通过（{status}）")[:80]
-            # 直接发消息，不依赖 LLM 用 myrss_emit_result 转达。
-            # 否则 LLM 若直接调 myrss_terminate 会导致"没发任何消息就静默结束"。
-            await plugin._send_message_guarded(
-                origin,
-                _plain_chain(f"⛔ 该订阅源最新动态未通过内容安全审核，未创建订阅。\n（{detail}）"),
-            )
-            return (
-                f"action=rejected_preview|reason={status}|detail={detail}。已直接向群发送审核未通过提示。"
-            )
-
-        # 6) 渲染预览卡片
-        card_b64 = await plugin._make_card_b64(items[0])
-        if not card_b64:
-            return "错误：卡片渲染失败（browserless 不可用）。"
-
-        # 7) 写入 _nl_pending
-        # 临时把 feed_url / title / avatar 等存到 dh.data，否则 _make_comps 等会找不到
+        # 3.5) 先写入临时 dh.data entry（必须在 _poll 之前！）。
+        # 之前写在 _poll 之后，导致 _poll 时 full_url 尚不在 dh.data，
+        # item.chan_title 变成 "未知"，_make_card_b64 因此跳过头像下载、
+        # _get_avatar_url 也匹配不到 -> 预览卡片缺头像/名字（而 /myrss eye
+        # 是先写库再 poll，所以正常）。
         old_entry = plugin.dh.data.get(full_url)
         if old_entry is None:
             plugin.dh.data[full_url] = {
@@ -460,52 +437,84 @@ def _make_preview_card_tool(plugin) -> FunctionTool:
                 "info": {"title": title, "description": description, "avatar": avatar},
             }
 
-        # 8) 计算 summary (供二次 LLM 用)
-        summary = (
-            f"title={title}\nplatform={_platform_from_route(route)}\n"
-            f"handle={_handle_from_url_or_route(feed_url, route)}\nroute={route}"
-        )
-
-        # 9) 写入 store
         try:
-            creator_openid = str(event.get_sender_id())
-        except Exception:
-            creator_openid = ""
-        try:
-            creator_name = str(event.get_sender_name() or "")
-        except Exception:
-            creator_name = ""
+            # 4) 拉最新一条
+            items = await plugin._poll(full_url, num=1)
+            if not items:
+                return "错误：该源没有可审核的最新动态。"
 
-        card = IntentCard(
-            feed_url=full_url,
-            route=route,
-            platform=_platform_from_route(route),
-            handle=_handle_from_url_or_route(feed_url, route),
-            title=title or "",
-            description=description or "",
-            image_b64=card_b64,
-            pub_date=items[0].pubDate or "",
-            card_b64=card_b64,
-            summary=summary,
-            creator_openid=creator_openid,
-            creator_name=creator_name,
-        )
-        plugin.nl_pending.put(origin, card, ttl=plugin.nl_pending_ttl)
+            # 5) 全量内容审核
+            status = await plugin._check_content_safe(items[0])
+            if status != "SAFE":
+                vision = plugin._vision_cache.get(plugin._item_cache_key(items[0]), {})
+                reason = vision.get("description", "") if isinstance(vision, dict) else ""
+                detail = (reason or f"内容安全审核未通过（{status}）")[:80]
+                # 直接发消息，不依赖 LLM 用 myrss_emit_result 转达。
+                # 否则 LLM 若直接调 myrss_terminate 会导致"没发任何消息就静默结束"。
+                await plugin._send_message_guarded(
+                    origin,
+                    _plain_chain(f"⛔ 该订阅源最新动态未通过内容安全审核，未创建订阅。\n（{detail}）"),
+                )
+                return (
+                    f"action=rejected_preview|reason={status}|detail={detail}。已直接向群发送审核未通过提示。"
+                )
 
-        # 10) 发卡片到群
-        send_ok = await plugin._send_message_guarded(
-            origin,
-            _build_preview_message(card, plugin),
-        )
-        if not send_ok:
-            plugin.nl_pending.pop(origin)
-            error_text = plugin._target_last_send_error.get(origin, "发送失败")
-            return f"错误：卡片发送失败 ({error_text})。请确认本群 Bot 已开启主动消息权限。"
+            # 6) 渲染预览卡片
+            card_b64 = await plugin._make_card_b64(items[0])
+            if not card_b64:
+                return "错误：卡片渲染失败（browserless 不可用）。"
 
-        if plugin.nl_debug_log:
-            logger.info("[NL][preview_card] sent, summary=%s", summary)
+            # 7) 计算 summary (供二次 LLM 用)
+            summary = (
+                f"title={title}\nplatform={_platform_from_route(route)}\n"
+                f"handle={_handle_from_url_or_route(feed_url, route)}\nroute={route}"
+            )
 
-        return "预览卡片已发送到当前群。等用户引用本卡片回复'同意/拒绝/不是这个'。"
+            # 8) 写入 store
+            try:
+                creator_openid = str(event.get_sender_id())
+            except Exception:
+                creator_openid = ""
+            try:
+                creator_name = str(event.get_sender_name() or "")
+            except Exception:
+                creator_name = ""
+
+            card = IntentCard(
+                feed_url=full_url,
+                route=route,
+                platform=_platform_from_route(route),
+                handle=_handle_from_url_or_route(feed_url, route),
+                title=title or "",
+                description=description or "",
+                image_b64=card_b64,
+                pub_date=items[0].pubDate or "",
+                card_b64=card_b64,
+                summary=summary,
+                creator_openid=creator_openid,
+                creator_name=creator_name,
+            )
+            plugin.nl_pending.put(origin, card, ttl=plugin.nl_pending_ttl)
+
+            # 9) 发卡片到群
+            send_ok = await plugin._send_message_guarded(
+                origin,
+                _build_preview_message(card, plugin),
+            )
+            if not send_ok:
+                plugin.nl_pending.pop(origin)
+                error_text = plugin._target_last_send_error.get(origin, "发送失败")
+                return f"错误：卡片发送失败 ({error_text})。请确认本群 Bot 已开启主动消息权限。"
+
+            if plugin.nl_debug_log:
+                logger.info("[NL][preview_card] sent, summary=%s", summary)
+
+            return "预览卡片已发送到当前群。等用户引用本卡片回复'同意/拒绝/不是这个'。"
+        finally:
+            # 清理：仅当这是我们临时创建的 entry 且尚未产生订阅关系时移除，
+            # 避免残留空 subscribers 的孤儿 entry。
+            if old_entry is None and not plugin.dh.data.get(full_url, {}).get("subscribers"):
+                plugin.dh.data.pop(full_url, None)
 
     tool = FunctionTool(
         name=TOOL_PREVIEW_CARD,
