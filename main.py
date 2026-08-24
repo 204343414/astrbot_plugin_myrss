@@ -29,6 +29,14 @@ import astrbot.api.message_components as Comp
 
 from .web import MyRssWebController
 from . import qq_group_event_bridge
+from .natural_subscribe import (
+    NLIntentStore,
+    build_nl_tool_set,
+    build_confirm_tool_set,
+    NAT_LANG_SYSTEM_PROMPT,
+    NAT_LANG_CONFIRM_PROMPT,
+    looks_like_nl_confirm_reply,
+)
 
 PLUGIN_NAME = "astrbot_plugin_myrss"
 
@@ -638,7 +646,7 @@ class CardGen:
 
 
 
-@register("astrbot_plugin_myrss", "MyRSS", "RSS订阅插件(LLM增强版)", "1.3.0", "")
+@register("astrbot_plugin_myrss", "MyRSS", "RSS订阅插件(LLM增强版)", "1.4.0", "")
 class MyRssPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -700,6 +708,19 @@ class MyRssPlugin(Star):
         self.pic = PicHandler(self.adjust_pic)
         self.browserless_url = config.get("browserless_url", "http://browserless:3000")
         self.card = CardGen(browserless_url=self.browserless_url)
+
+        # 自然语言订阅（v1.4.0 新增）
+        self.nl_enabled = bool(config.get("enable_natural_language_subscribe", False))
+        self.nl_provider_id = str(config.get("nl_provider_id", "") or "")
+        self.nl_enable_websearch = bool(config.get("nl_enable_websearch", True))
+        self.nl_max_steps = max(int(config.get("nl_max_steps", 8)), 1)
+        self.nl_confirm_max_steps = max(int(config.get("nl_confirm_max_steps", 4)), 1)
+        self.nl_pending_ttl = max(int(config.get("nl_pending_ttl_seconds", 600)), 60)
+        self.nl_rate_limit_seconds = max(int(config.get("nl_rate_limit_seconds", 30)), 1)
+        self.nl_debug_log = bool(config.get("nl_debug_log", False))
+        self.nl_pending = NLIntentStore(ttl_seconds=self.nl_pending_ttl)
+        self._nl_rate_limit: dict = {}  # origin -> last_ts
+        self._nl_gc_started = False
 
 
         # 防并发锁，key = (url, user)
@@ -2264,7 +2285,11 @@ class MyRssPlugin(Star):
 
     @myrss.command("+", alias={"add"})
     async def cmd_add_current_group(self, event: AstrMessageEvent, url: str = ""):
-        """安全订阅当前群。用法：/myrss + <URL或RSSHub路由>"""
+        """
+        安全订阅当前群。两种用法：
+          1. /myrss + <URL或RSSHub路由>   ← 旧的纯指令路径
+          2. /myrss + <自然语言>           ← v1.4.0 新增，需开启 enable_natural_language_subscribe
+        """
         origin = event.unified_msg_origin
         if "GroupMessage" not in origin:
             yield event.plain_result("此命令只能在需要接收推送的群内使用。")
@@ -2273,9 +2298,40 @@ class MyRssPlugin(Star):
         match = re.search(r"(?:^|\s)\+\s+(.+)$", raw)
         value = (match.group(1) if match else url or "").strip()
         if not value:
-            yield event.plain_result("用法：/myrss + <账号网页URL或/开头的RSSHub路由>")
+            yield event.plain_result(
+                "用法：\n"
+                " /myrss + <账号主页 URL 或 / 开头的 RSSHub 路由>\n"
+                " /myrss + 自然语言，例如：帮我订阅 OpenAI 的推特\n"
+                "（自然语言订阅需在 WebUI 开启 'enable_natural_language_subscribe'）"
+            )
             return
         self._ready_group_sessions.add(origin)
+        self._start_nl_gc_if_needed()
+
+        # 路径 1: 显式 URL / 路由 → 旧逻辑
+        if value.startswith(("http://", "https://", "/")):
+            async for r in self._cmd_add_explicit_url(event, origin, value):
+                yield r
+            return
+
+        # 路径 2: 自然语言 → 调 LLM
+        if not self.nl_enabled:
+            yield event.plain_result(
+                "自然语言订阅未启用。请在 WebUI 配置页开启 'enable_natural_language_subscribe'，"
+                "或直接使用 URL / 路由格式：\n"
+                f" /myrss + https://x.com/OpenAI"
+            )
+            return
+
+        if not self._check_nl_rate_limit(origin):
+            yield event.plain_result("本群自然语言订阅请求过于频繁，请稍后再试。")
+            return
+
+        async for r in self._run_natural_subscribe(event, origin, value):
+            yield r
+
+    async def _cmd_add_explicit_url(self, event: AstrMessageEvent, origin: str, value: str):
+        """旧的纯 URL / 路由订阅路径（v1.3.0 行为）。"""
         try:
             result = await self.add_subscription_from_ui(
                 origin,
@@ -2294,6 +2350,165 @@ class MyRssPlugin(Star):
                 )
         except Exception as exc:
             yield event.plain_result(f"❌ 订阅失败：{exc}")
+
+    def _check_nl_rate_limit(self, origin: str) -> bool:
+        now = time.time()
+        last = self._nl_rate_limit.get(origin, 0)
+        if now - last < self.nl_rate_limit_seconds:
+            return False
+        self._nl_rate_limit[origin] = now
+        return True
+
+    def _start_nl_gc_if_needed(self) -> None:
+        """启动 _nl_pending GC 后台协程（一个进程一次）。"""
+        if self._nl_gc_started:
+            return
+        self._nl_gc_started = True
+
+        async def _gc_loop():
+            while True:
+                try:
+                    await asyncio.sleep(300)  # 5 分钟扫一次
+                    n = self.nl_pending.gc()
+                    if n and self.nl_debug_log:
+                        self.logger.info("[NL] GC 清理过期 pending: %d", n)
+                except asyncio.CancelledError:
+                    break
+                except Exception as exc:
+                    self.logger.warning("[NL] GC loop error: %s", exc)
+
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = None
+        if loop is not None and loop.is_running():
+            loop.create_task(_gc_loop())
+        else:
+            try:
+                asyncio.ensure_future(_gc_loop())
+            except Exception as exc:
+                self.logger.warning("[NL] 无法启动 GC 协程: %s", exc)
+
+    async def _run_natural_subscribe(self, event: AstrMessageEvent, origin: str, user_text: str):
+        """自然语言订阅主流程。起一次 tool_loop_agent，让 LLM 调 5 个 myrss_* tool。"""
+        # 1) 主动消息权限检查（Q3 决定：明文拒绝，不探针）
+        ready, reason = self._target_readiness(origin)
+        if not ready:
+            yield event.plain_result(
+                "本群 Bot 尚未具备主动推送条件。\n"
+                "请先在 QQ 群设置中开启『机器人主动在群聊内发言』，"
+                "并由群内任意成员发送一条消息激活 Bot 后再试。\n"
+                f"（内部原因: {reason}）"
+            )
+            return
+
+        # 2) 解析 provider
+        provider_id = self.nl_provider_id or await self._get_provider_id()
+        if not provider_id:
+            self.logger.warning("[NL] no provider available for natural language subscribe")
+            yield event.plain_result("服务器暂忙，请稍后再试。")
+            return
+
+        # 3) 装 tool set
+        try:
+            tools = build_nl_tool_set(self)
+        except Exception as exc:
+            self.logger.error("[NL] build_nl_tool_set failed: %s", exc)
+            yield event.plain_result("服务器暂忙，请稍后再试。")
+            return
+
+        # 4) 起 LLM
+        prompt = (
+            f"用户在群 ({origin}) 发送的自然语言订阅请求: \n"
+            f">>> {user_text} <<<\n\n"
+            f"请用工具完成意图识别 → 预览 → 等待用户确认。\n"
+            f"完成后必须调 myrss_terminate 结束。"
+        )
+        if self.nl_debug_log:
+            self.logger.info("[NL] tool_loop_agent prompt: %s", prompt)
+        try:
+            resp = await self.ctx.tool_loop_agent(
+                event=event,
+                chat_provider_id=provider_id,
+                prompt=prompt,
+                system_prompt=NAT_LANG_SYSTEM_PROMPT,
+                tools=tools,
+                max_steps=self.nl_max_steps,
+                tool_call_timeout=60,
+            )
+        except Exception as exc:
+            self.logger.warning("[NL] tool_loop_agent failed: %s", exc)
+            yield event.plain_result("服务器暂忙，请稍后再试。")
+            return
+
+        if self.nl_debug_log:
+            self.logger.info(
+                "[NL] tool_loop_agent finished, completion_text=%r",
+                (resp.completion_text or "")[:300],
+            )
+        # 卡片/文案已在 tool handler 里直接发给群。Bot 这里不再 yield。
+        # 但 _on_message_for_nl_confirm 钩子已就位, 等待用户引用卡片回复。
+
+    @filter.event_message_type(filter.EventMessageType.ALL)
+    async def _on_message_for_nl_confirm(self, event: AstrMessageEvent):
+        """
+        监听群消息，触发自然语言订阅的二次 LLM 判定。
+        触发条件: 群里有未过期的 _nl_pending, 且新消息含"同意/拒绝/订阅/取消/不是这个"等关键词。
+        """
+        if not self.nl_enabled:
+            return
+        origin = getattr(event, "unified_msg_origin", "")
+        if not origin or "GroupMessage" not in origin:
+            return
+        # 过滤 bot 自己发的消息, 避免"已订阅"卡片被当成确认
+        try:
+            sender_id = str(event.get_sender_id() or "")
+            if self.bot_qq and sender_id == str(self.bot_qq):
+                return
+        except Exception:
+            pass
+
+        pending = self.nl_pending.peek(origin)
+        if pending is None:
+            return
+        if not looks_like_nl_confirm_reply(event):
+            return
+
+        # 二次 LLM 判定
+        provider_id = self.nl_provider_id or await self._get_provider_id()
+        if not provider_id:
+            return
+
+        user_text = (event.message_str or "").strip()
+        prompt = (
+            f"上一条自然语言订阅请求触发的预览卡片摘要: \n{pending.summary}\n"
+            f"feed_url: {pending.feed_url}\n\n"
+            f"用户本次回复: \n>>> {user_text} <<<"
+        )
+        tools = build_confirm_tool_set(self, pending)
+        if self.nl_debug_log:
+            self.logger.info("[NL][confirm] prompt: %s", prompt)
+        try:
+            resp = await self.ctx.tool_loop_agent(
+                event=event,
+                chat_provider_id=provider_id,
+                prompt=prompt,
+                system_prompt=NAT_LANG_CONFIRM_PROMPT,
+                tools=tools,
+                max_steps=self.nl_confirm_max_steps,
+                tool_call_timeout=30,
+            )
+        except Exception as exc:
+            self.logger.warning("[NL][confirm] tool_loop_agent failed: %s", exc)
+            yield event.plain_result("服务器暂忙，请稍后再试。")
+            return
+        if self.nl_debug_log:
+            self.logger.info(
+                "[NL][confirm] finished, completion_text=%r",
+                (resp.completion_text or "")[:300],
+            )
+        # LLM 工具会自己处理落订/取消/已读不回
+        # 不再 yield, 防止重复发消息
 
     @myrss.command("-", alias={"remove"})
     async def cmd_remove_current_group(self, event: AstrMessageEvent, selector: str = ""):
