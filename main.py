@@ -40,6 +40,24 @@ from .natural_subscribe import (
 
 PLUGIN_NAME = "astrbot_plugin_myrss"
 
+# 图片/头像下载用浏览器 UA。pbs.twimg.com 等 CDN 对无 UA 请求返回 403，
+# 浏览器(WebUI)能加载但 aiohttp 下载失败，导致卡片缺头像。
+_IMG_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+
+async def _download_bytes(url: str, timeout: int = 8) -> bytes | None:
+    """带浏览器 UA 下载图片字节；失败返回 None。"""
+    try:
+        conn = aiohttp.TCPConnector(ssl=False)
+        headers = {"User-Agent": _IMG_UA}
+        async with aiohttp.ClientSession(trust_env=True, connector=conn, headers=headers) as s:
+            async with s.get(url, timeout=aiohttp.ClientTimeout(total=timeout)) as r:
+                if r.status == 200:
+                    return await r.read()
+    except Exception:
+        pass
+    return None
+
 # [防冲突] 模块级变量追踪当前活跃的调度器
 # 插件热更新时新实例先通过此引用杀掉老调度器，避免新老并行双推
 _ACTIVE_SCHED = None
@@ -346,7 +364,8 @@ class PicHandler:
     async def to_base64(self, image_url):
         try:
             conn = aiohttp.TCPConnector(ssl=False)
-            async with aiohttp.ClientSession(trust_env=True, connector=conn) as s:
+            headers = {"User-Agent": _IMG_UA}
+            async with aiohttp.ClientSession(trust_env=True, connector=conn, headers=headers) as s:
                 async with s.get(image_url, timeout=aiohttp.ClientTimeout(total=15)) as r:
                     if r.status != 200:
                         return None
@@ -1652,7 +1671,7 @@ class MyRssPlugin(Star):
 
         downloaded = []
         try:
-            async with aiohttp.ClientSession(trust_env=True, connector=aiohttp.TCPConnector(ssl=False)) as session:
+            async with aiohttp.ClientSession(trust_env=True, connector=aiohttp.TCPConnector(ssl=False), headers={"User-Agent": _IMG_UA}) as session:
                 for image_url in item.pic_urls:
                     try:
                         async with session.get(image_url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
@@ -1878,36 +1897,21 @@ class MyRssPlugin(Star):
         return ""
 
     async def _make_card_b64(self, item: RSSItem) -> str:
-        # 下载频道头像
+        # 下载频道头像（带浏览器 UA，pbs.twimg.com 等 CDN 无 UA 会 403）
         avt_data = None
         if item.chan_title and item.chan_title != "未知":
             avt_url = self._get_avatar_url(item)
             if avt_url:
-                try:
-                    conn = aiohttp.TCPConnector(ssl=False)
-                    async with aiohttp.ClientSession(trust_env=True, connector=conn) as s:
-                        async with s.get(avt_url, timeout=aiohttp.ClientTimeout(total=5)) as r:
-                            if r.status == 200:
-                                avt_data = await r.read()
-                except Exception:
-                    pass
+                avt_data = await _download_bytes(avt_url, timeout=8)
         tb = None
         if self.read_pic and item.pic_urls:
             # [修改] 遍历图片列表尝试下载，直到成功一个
             # 解决YouTube封面可能是404的问题
-            conn = aiohttp.TCPConnector(ssl=False)
-            async with aiohttp.ClientSession(trust_env=True, connector=conn) as s:
-                for pu in item.pic_urls:
-                    try:
-                        async with s.get(pu, timeout=aiohttp.ClientTimeout(total=5)) as r:
-                            if r.status == 200:
-                                data = await r.read()
-                                # 简单校验数据长度，防止下载到空的
-                                if len(data) > 100:
-                                    tb = data
-                                    break
-                    except Exception:
-                        continue
+            for pu in item.pic_urls:
+                data = await _download_bytes(pu, timeout=8)
+                if data and len(data) > 100:
+                    tb = data
+                    break
         # 生成锐评
         comment = ""
         bot_avt = None
@@ -1977,30 +1981,16 @@ class MyRssPlugin(Star):
         comps = []
         tb = None
         if self.read_pic and item.pic_urls:
-            conn = aiohttp.TCPConnector(ssl=False)
-            async with aiohttp.ClientSession(trust_env=True, connector=conn) as s:
-                for pu in item.pic_urls:
-                    try:
-                        async with s.get(pu, timeout=aiohttp.ClientTimeout(total=5)) as r:
-                            if r.status == 200:
-                                data = await r.read()
-                                if len(data) > 100:
-                                    tb = data
-                                    break
-                    except Exception:
-                        continue
-        # 下载频道头像
+            for pu in item.pic_urls:
+                data = await _download_bytes(pu, timeout=8)
+                if data and len(data) > 100:
+                    tb = data
+                    break
+        # 下载频道头像（带浏览器 UA）
         avt_data = None
         avt_url = self._get_avatar_url(item)
         if avt_url:
-            try:
-                conn2 = aiohttp.TCPConnector(ssl=False)
-                async with aiohttp.ClientSession(trust_env=True, connector=conn2) as s2:
-                    async with s2.get(avt_url, timeout=aiohttp.ClientTimeout(total=5)) as r2:
-                        if r2.status == 200:
-                            avt_data = await r2.read()
-            except Exception:
-                pass
+            avt_data = await _download_bytes(avt_url, timeout=8)
         # 生成锐评
         comment = ""
         bot_avt = None
