@@ -127,15 +127,20 @@ NAT_LANG_SYSTEM_PROMPT = """\
   2. 如果返回候选，调 myrss_preview_card 渲染预览卡片（这一步会真正发到群里）
   3. 调 myrss_terminate 结束，等待用户回复
 
+⚠️ 非常重要：调完 myrss_terminate 后，你必须在 final response（不是 tool call）里输出至少一句话。
+   AstrBot 框架在 tool loop 结束后会强制要求 LLM 输出 final text，content=None / 空字符串都会导致整个流程报错 EmptyModelOutputError。
+   简短即可，例如"完成"、"已发送预览卡片，请等待用户确认"、"未找到博主，已提示用户提供 URL"。
+   这一句话**不会**作为 Bot 消息发给用户（Bot 消息只来自 tool handler），但框架需要它。
+
 绝对禁止：
   - 跟用户闲聊、解释自己是什么、回应问候
-  - 输出 JSON / Markdown / "我理解你的需求..." 之类的话
   - 在 myrss_preview_card 之后再调任何其他 tool（除了 myrss_terminate）
   - 调本对话以外的任何 AstrBot 内置 tool（myrss_* 之外都视为越界，调用就视为失败，调 myrss_ignore）
 
 异常分支：
-  - myrss_lookup 返回"未找到"：
-      调 myrss_emit_result(action="not_found", free_text="< 80 字自然语言解释>")，然后 myrss_terminate
+  - myrss_lookup 返回"未找到"或"需要联网搜"：
+      优先调联网搜索工具（工具名形如 web_search_tavily / web_search_bocha / web_search_brave，如果可用）联网查，查完再次调 myrss_lookup
+      仍找不到就调 myrss_emit_result(action="not_found", free_text="< 80 字自然语言解释>")，然后 myrss_terminate
   - 用户说的是非订阅请求（闲聊/提问/调试）：
       调 myrss_ignore，然后 myrss_terminate
   - 任何 tool 内部报错：
@@ -332,9 +337,19 @@ def _make_lookup_tool(plugin) -> FunctionTool:
         # 2) 规则解析
         candidates = _parse_user_query_to_candidates(query)
         if not candidates:
+            # 没匹配上平台。提示 LLM 用 web_search 兜底 / 让用户提供 URL。
+            # 不直接判 not_found，避免 LLM 误以为流程结束。
             return (
-                "未找到匹配的博主。可识别的平台关键词: X/推特, YouTube, B站, 微博, 知乎, GitHub, Telegram。"
-                "也支持直接贴 URL，如 /myrss + https://x.com/OpenAI"
+                "未识别到平台关键词（X/推特/YouTube/B站/微博/知乎/GitHub/Telegram）。\n"
+                "请按以下顺序尝试：\n"
+                "  1) 如果联网搜索工具可用(工具名形如 web_search_tavily/web_search_bocha/web_search_brave), 调它搜 '"
+                + query[:30]
+                + " site:x.com 官方账号' 或 '"
+                + query[:30]
+                + " 官方 账号 平台', 然后再调 myrss_lookup 传入搜到的 URL\n"
+                "  2) 仍找不到, 调 myrss_emit_result(action=\"not_found\", free_text=\"< 80 字提示用户给 URL>\") + myrss_terminate\n"
+                "  3) 用户已经贴了 URL, 直接用 URL 调 myrss_lookup 再调 myrss_preview_card\n"
+                "用户原话: " + query
             )
 
         # 3) 检查 handle 合法性
