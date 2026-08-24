@@ -164,6 +164,10 @@ NAT_LANG_CONFIRM_PROMPT = """\
 调完上述任一 tool 后，调 myrss_terminate 结束。
 不要发任何文字给用户（myrss_confirm_subscribe 和 myrss_ignore 内部会处理）。
 不要解释自己做了什么。
+
+⚠️ 非常重要：调完 myrss_terminate 后，你必须在 final response（不是 tool call）里输出至少一句话，例如"完成"。
+   AstrBot 框架在 tool loop 结束后会强制要求 LLM 输出 final text，content=None / 空字符串会报 EmptyModelOutputError。
+   这一句话不会作为 Bot 消息发给用户（用户可见内容只来自 tool handler），但框架需要它。
 """
 
 
@@ -577,11 +581,15 @@ def _make_confirm_subscribe_tool(plugin, pending_card: IntentCard) -> FunctionTo
         origin = event.unified_msg_origin
 
         if decision == "approve":
-            # 走 add_subscription_from_ui 复用全部安全不变量
+            # 走 add_subscription_from_ui 复用全部安全不变量。
+            # 关键：必须传 route（/twitter/user/OpenAI），而不是 pending_card.feed_url。
+            # feed_url 在 preview_card 里已被解析成完整 RSSHub URL（https://rsshub.app/...），
+            # 而 add_subscription_from_ui -> _resolve_feed_url 只认原始平台域名或 / 开头路由，
+            # 传 RSSHub URL 会让 URLMapper.match 失败 -> "未收录此平台"。
             try:
                 result = await plugin.add_subscription_from_ui(
                     origin=origin,
-                    value=pending_card.feed_url,
+                    value=pending_card.route,
                     creator_openid=pending_card.creator_openid or str(event.get_sender_id() or ""),
                     creator_name=pending_card.creator_name or str(event.get_sender_name() or ""),
                     creator_source="natural_language",
