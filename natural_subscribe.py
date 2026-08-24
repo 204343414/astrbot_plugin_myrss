@@ -434,9 +434,16 @@ def _make_preview_card_tool(plugin) -> FunctionTool:
         status = await plugin._check_content_safe(items[0])
         if status != "SAFE":
             vision = plugin._vision_cache.get(plugin._item_cache_key(items[0]), {})
-            reason = vision.get("description", "综合内容审核未通过") if isinstance(vision, dict) else "综合内容审核未通过"
+            reason = vision.get("description", "") if isinstance(vision, dict) else ""
+            detail = (reason or f"内容安全审核未通过（{status}）")[:80]
+            # 直接发消息，不依赖 LLM 用 myrss_emit_result 转达。
+            # 否则 LLM 若直接调 myrss_terminate 会导致"没发任何消息就静默结束"。
+            await plugin._send_message_guarded(
+                origin,
+                _plain_chain(f"⛔ 该订阅源最新动态未通过内容安全审核，未创建订阅。\n（{detail}）"),
+            )
             return (
-                f"action=rejected_preview|reason={status}|detail={reason[:80]}"
+                f"action=rejected_preview|reason={status}|detail={detail}。已直接向群发送审核未通过提示。"
             )
 
         # 6) 渲染预览卡片
