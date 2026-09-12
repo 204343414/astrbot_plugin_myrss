@@ -14,6 +14,12 @@
     "type": "int",
     "default": 5
   },
+  "max_subscriptions_per_group": {
+    "description": "每个群最大允许订阅数（0表示不设上限）",
+    "type": "int",
+    "default": 5,
+    "min": 0
+  },
   "t2i": {
     "description": "是否使用文字转图片",
     "type": "bool",

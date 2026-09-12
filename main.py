@@ -716,7 +716,7 @@ class MyRssPlugin(Star):
         self._target_last_send = {}
         self._target_last_send_error = {}
         self._delivery_test_cooldown = {}
-        self.max_subscriptions_per_group = 5
+        self.max_subscriptions_per_group = int(config.get("max_subscriptions_per_group", 5))
         self._official_send_delay_min = 5.0
         self._official_send_delay_max = 10.0
         
@@ -965,7 +965,7 @@ class MyRssPlugin(Star):
                 "route": route,
                 "message": "本群已经订阅该源",
             }
-        if self._subscription_count(origin) >= self.max_subscriptions_per_group:
+        if self.max_subscriptions_per_group > 0 and self._subscription_count(origin) >= self.max_subscriptions_per_group:
             raise ValueError(
                 f"当前群最多订阅 {self.max_subscriptions_per_group} 个动态源，请先用 /myrss - 退订一个。"
             )
@@ -1009,7 +1009,7 @@ class MyRssPlugin(Star):
                 self.dh.data = self.dh._load()
                 if origin in self.dh.data.get(full_url, {}).get("subscribers", {}):
                     return {"created": False, "title": title, "route": route, "message": "本群已经订阅该源"}
-                if self._subscription_count(origin) >= self.max_subscriptions_per_group:
+                if self.max_subscriptions_per_group > 0 and self._subscription_count(origin) >= self.max_subscriptions_per_group:
                     raise ValueError(
                         f"当前群最多订阅 {self.max_subscriptions_per_group} 个动态源，请先退订一个。"
                     )
