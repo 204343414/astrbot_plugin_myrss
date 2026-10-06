@@ -1,4 +1,9 @@
 {
+  "push_requires_group_activity": {
+    "description": "是否要求「群里有人说过话」才允许主动推送（活跃检测/休眠机制）。true=保持原行为：Bot 本次启动后没收到过群消息的群视为未就绪，定时任务拉取前直接跳过该目标，等群内有人发言后自动恢复；false=关闭该限制，QQ 官方平台在跑且该群已订阅即可推送，无需等群友发言、Bot 重启后也能照常推送。两种取值都不会跳过主动消息权限：发送被 QQ 明确拒绝「主动消息失败/无权限」时，仍会自动退订当前源。",
+    "type": "bool",
+    "default": true
+  },
   "title_max_length": {
     "description": "标题最大长度",
     "type": "int",

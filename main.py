@@ -665,7 +665,7 @@ class CardGen:
 
 
 
-@register("astrbot_plugin_myrss", "MyRSS", "RSS订阅插件(LLM增强版)", "1.4.0", "")
+@register("astrbot_plugin_myrss", "MyRSS", "RSS订阅插件(LLM增强版)", "1.4.1", "")
 class MyRssPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -711,6 +711,12 @@ class MyRssPlugin(Star):
         self.image_caption_provider_id = config.get("image_caption_provider_id", "")
         self.max_vision_images = 9
         self._ready_group_sessions = set()  # 本次进程启动后实际观察到消息的群会话
+        # 「群里有人说过话才算就绪」这道闸门的开关。默认 true 保持既有行为；
+        # 关掉以后不再看群活跃度，QQ 官方平台在跑 + 该群已订阅就直接推。
+        # 注意：这不等于跳过主动消息权限 —— 发送被 QQ 明确拒绝时仍会自动退订。
+        self.require_group_activity = bool(
+            config.get("push_requires_group_activity", True)
+        )
         self._eye_cooldown = {}
         self._target_send_locks = {}
         self._target_last_send = {}
@@ -777,6 +783,12 @@ class MyRssPlugin(Star):
         self.sched.start()
         self._reload_jobs()
         qq_group_event_bridge.install(PLUGIN_NAME, self._on_group_del_robot)
+        self.logger.info(
+            "MyRSS: 群活跃检查: %s",
+            "开启（仅向本轮启动后有人发言的群推送）"
+            if self.require_group_activity
+            else "关闭（不检查群活跃，有主动消息权限即推送）",
+        )
     
     def _is_current_runtime(self) -> bool:
         runtime = builtins._ASTRBOT_MYRSS_RUNTIME
@@ -811,6 +823,11 @@ class MyRssPlugin(Star):
         if platform.get("name") == "qq_official" and "GroupMessage" in str(origin):
             if origin in self._ready_group_sessions:
                 return True, "ready"
+            if not self.require_group_activity:
+                # 活动闸门已关闭：平台在跑、目标是群会话，就认为可以投递。
+                # 刻意不写入 _ready_group_sessions —— 那是"真实观察到消息"的记录，
+                # 面板的群列表也读它；运行中把开关改回 true 时不能留下假记录。
+                return True, "ready_activity_check_disabled"
             # 插件热重载会清空自身集合，但 QQ Official 平台实例通常仍保留已观察群场景。
             # 读取 AstrBot v4.26.x 适配器维护的 _session_scene，避免误判必须重新发言。
             session_id = str(origin).split(":", 2)[-1]

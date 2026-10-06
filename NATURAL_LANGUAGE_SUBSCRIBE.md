@@ -570,6 +570,9 @@ Handler: 写一条审计日志, 返回 `"OK"`, 啥也不发。
 ## 9. 风险与已知坑
 
 1. **`_target_readiness` 漏检**: 插件刚启动时 `_ready_group_sessions` 为空, 第一次发 `/myrss +` 该群从未发言 → 返回 False → 拒绝。这是**预期行为**, 提示用户"先发一条消息激活"。**不主动探针** (用户 Q3 选 plain_text_refuse)。
+   > v1.4.1 起这道门槛可配置: `push_requires_group_activity=false` 时 `_target_readiness()` 直接返回
+   > `(True, "ready_activity_check_disabled")`, 不再依赖群内发言。自然语言订阅的入口检查因此一并放开,
+   > 但后续的主动消息探针 / 安全审核 / 退订逻辑完全不变。详见 README。
 
 2. **"引用 bot 卡片" 的检测**: AstrBot 的 `event.message_obj.message` 里 `Reply` 组件的 `id` 字段是引用消息的 ID, 我们没存消息 ID → 只能用 `Reply.chain` 内容匹配上次推送的卡片 hash。**简化方案**: 不做精确"引用 bot 上一条"检测, 而是:
    - 检测群里**任何一条消息**含"同意 / 拒绝 / 不是这个 / 订阅 / 取消" 关键词
