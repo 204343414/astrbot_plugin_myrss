@@ -47,6 +47,22 @@ def method():
     raise AssertionError("main.py 里找不到 _target_readiness")
 
 
+@pytest.fixture(scope="module")
+def config_bool():
+    tree = ast.parse((ROOT / "main.py").read_text("utf-8"))
+    function = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_config_bool")
+    namespace = {}
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[function], type_ignores=[])), "main.py", "exec"), namespace)
+    return namespace["_config_bool"]
+
+
+def test_string_false_really_disables_group_activity(config_bool):
+    assert config_bool("false", True) is False
+    assert config_bool("关闭", True) is False
+    assert config_bool("true", False) is True
+
+
+
 class FakePlugin:
     """只带 _target_readiness 所需属性的最小替身。"""
 
