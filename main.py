@@ -27,6 +27,22 @@ from astrbot.api.star import Context, Star, register
 from astrbot.api import AstrBotConfig
 import astrbot.api.message_components as Comp
 
+
+def _config_bool(value, default: bool) -> bool:
+    """Parse WebUI values without treating the string ``"false"`` as true."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        normalized = value.strip().casefold()
+        if normalized in {"true", "1", "yes", "on", "enabled", "是", "开启", "打开"}:
+            return True
+        if normalized in {"false", "0", "no", "off", "disabled", "否", "关闭", "关"}:
+            return False
+    return default
+
+
 from .web import MyRssWebController
 from . import qq_group_event_bridge
 from .natural_subscribe import (
@@ -714,8 +730,8 @@ class MyRssPlugin(Star):
         # 「群里有人说过话才算就绪」这道闸门的开关。默认 true 保持既有行为；
         # 关掉以后不再看群活跃度，QQ 官方平台在跑 + 该群已订阅就直接推。
         # 注意：这不等于跳过主动消息权限 —— 发送被 QQ 明确拒绝时仍会自动退订。
-        self.require_group_activity = bool(
-            config.get("push_requires_group_activity", True)
+        self.require_group_activity = _config_bool(
+            config.get("push_requires_group_activity", True), True
         )
         self._eye_cooldown = {}
         self._target_send_locks = {}
