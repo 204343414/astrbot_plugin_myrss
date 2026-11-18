@@ -35,12 +35,75 @@ class MyRssWebController:
             ("/subscriptions/remove", self.remove_subscription, ["POST"], "Remove one group subscription"),
             ("/moderation/resolve", self.resolve_moderation, ["POST"], "Resolve a severe moderation review"),
             ("/moderation/unban", self.unban_creator, ["POST"], "Allow a creator to add subscriptions again"),
+            ("/vault/status", self.vault_status, ["GET"], "RSSHub vault: all platform credential states"),
+            ("/vault/ping", self.vault_ping, ["GET"], "RSSHub vault: helper reachability"),
+            ("/vault/import", self.vault_import, ["POST"], "RSSHub vault: import one platform from local Firefox"),
+            ("/vault/set", self.vault_set, ["POST"], "RSSHub vault: store a pasted token"),
+            ("/vault/verify", self.vault_verify, ["POST"], "RSSHub vault: verify one platform"),
+            ("/vault/check", self.vault_check, ["POST"], "RSSHub vault: run self-check"),
         ]
         for path, handler, methods, description in routes:
             self.context.register_web_api(
                 f"/{PLUGIN_NAME}{path}", self._wrap(handler), methods, description
             )
             self.registered_routes.append(path)
+
+    # ------------------------------------------------------------ 凭据维护（rsshub-vault）
+    # 说明：这一块只做「转发」。凭据内容由宿主侧的 rsshub-vault 负责读写，
+    # 插件全程不接触、不落盘、不写日志。前端也永远拿不到完整凭据。
+    async def vault_status(self) -> dict[str, Any]:
+        client = self._vault()
+        return await client.status()
+
+    async def vault_ping(self) -> dict[str, Any]:
+        client = self._vault()
+        return await client.ping()
+
+    async def vault_import(self) -> dict[str, Any]:
+        if quart_request is None:
+            raise RuntimeError("Web request framework is unavailable")
+        payload = await quart_request.get_json(force=True, silent=True) or {}
+        client = self._vault()
+        return await client.import_platform(str(payload.get("platform", "")))
+
+    async def vault_set(self) -> dict[str, Any]:
+        if quart_request is None:
+            raise RuntimeError("Web request framework is unavailable")
+        payload = await quart_request.get_json(force=True, silent=True) or {}
+        client = self._vault()
+        return await client.set_value(
+            str(payload.get("platform", "")),
+            str(payload.get("value", "")),
+            str(payload.get("kind", "")),
+        )
+
+    async def vault_verify(self) -> dict[str, Any]:
+        if quart_request is None:
+            raise RuntimeError("Web request framework is unavailable")
+        payload = await quart_request.get_json(force=True, silent=True) or {}
+        client = self._vault()
+        return await client.verify(str(payload.get("platform", "")))
+
+    async def vault_check(self) -> dict[str, Any]:
+        if quart_request is None:
+            raise RuntimeError("Web request framework is unavailable")
+        payload = await quart_request.get_json(force=True, silent=True) or {}
+        client = self._vault()
+        return await client.check(bool(payload.get("sync", True)))
+
+    def _vault(self):
+        """惰性构造客户端；配置项缺失时退回默认地址，不让页面 500。"""
+        from .vault_client import VaultClient  # 局部导入，避免影响插件启动
+
+        if getattr(self, "_vault_client", None) is None:
+            base = ""
+            try:
+                conf = self.plugin.context.get_config() if hasattr(self.plugin, "context") else {}
+                base = str((conf or {}).get("vault_helper_url", "") or "")
+            except Exception:  # noqa: BLE001
+                base = ""
+            self._vault_client = VaultClient(base)
+        return self._vault_client
 
     async def ping(self) -> dict[str, Any]:
         return {"message": "pong", "data_path": self.plugin.dh.get_data_path()}

@@ -28,3 +28,37 @@ html,body{width:100%;min-width:0}
 .latest-preview.no-image{grid-template-columns:minmax(0,1fr)}
 .latest-preview.no-image>div{grid-column:1/-1;width:100%}
 .review-panel,.ban-panel{margin:0 0 18px;border-radius:14px;padding:16px}.review-panel{border:1px solid #f1b36b;background:#fffaf2}.ban-panel{border:1px solid #f2b4b4;background:#fff6f6}.review-panel h2,.ban-panel h2{margin:0 0 10px;font-size:17px}.review-list{display:grid;gap:10px}.review-item{display:grid;grid-template-columns:minmax(0,180px) minmax(0,1fr);gap:14px;padding:12px;background:#fff;border:1px solid #f2d6b4;border-radius:10px}.review-item>img{width:100%;height:140px;object-fit:contain;background:#f3f4f6;border-radius:8px}.review-item h3,.review-item p{margin:0 0 7px}.review-item a{color:#2563eb}.review-actions{display:flex;gap:8px;flex-wrap:wrap}.warn-button{background:#fff7ed;color:#b45309;border:1px solid #fdba74}.ban-item{padding:10px;margin-top:8px;background:#fff;border:1px solid #f1cccc;border-radius:9px;overflow-wrap:anywhere}@media(max-width:700px){.review-item{grid-template-columns:1fr}}
+
+/* ===== 凭据维护面板（rsshub-vault）新增样式 ===== */
+.vault-section { margin: 14px 0; }
+.vault-section details { border: 1px solid rgba(127,127,127,.28); border-radius: 10px; padding: 10px 14px; }
+.vault-section summary { cursor: pointer; display: flex; gap: 10px; align-items: baseline; }
+.vault-section summary small { opacity: .65; font-weight: 400; }
+.vault-toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 10px 0; }
+.vault-chip { font-size: 12px; padding: 2px 8px; border-radius: 999px; background: rgba(127,127,127,.14); }
+.vault-chip-ok { background: rgba(46,160,67,.18); }
+.vault-chip-bad { background: rgba(218,54,51,.18); }
+.vault-notice { margin: 8px 0; padding: 8px 10px; border-radius: 8px; font-size: 13px; }
+.vault-notice-ok { background: rgba(46,160,67,.14); }
+.vault-notice-warn { background: rgba(210,153,34,.16); }
+.vault-notice-bad { background: rgba(218,54,51,.14); }
+.vault-block { margin-top: 12px; }
+.vault-block h3 { font-size: 14px; margin: 0 0 6px; }
+.vault-hint { font-weight: 400; opacity: .6; font-size: 12px; margin-left: 6px; }
+.vault-list { display: flex; flex-direction: column; gap: 6px; }
+.vault-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: space-between;
+  padding: 7px 10px; border-radius: 8px; background: rgba(127,127,127,.07); }
+.vault-row.busy { opacity: .6; }
+.vault-row-main { display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline; min-width: 0; }
+.vault-row-main small { opacity: .65; font-size: 12px; }
+.vault-row-actions { display: flex; gap: 6px; }
+.vault-state { font-size: 12px; padding: 1px 7px; border-radius: 999px; }
+.st-ok { background: rgba(46,160,67,.18); }
+.st-idle { background: rgba(127,127,127,.16); }
+.st-warn { background: rgba(210,153,34,.20); }
+.st-bad { background: rgba(218,54,51,.20); }
+.vault-setbox { flex-basis: 100%; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 6px; }
+.vault-setbox p { flex-basis: 100%; margin: 0; font-size: 12px; opacity: .7; }
+.vault-setbox input { flex: 1 1 260px; padding: 5px 8px; border-radius: 6px;
+  border: 1px solid rgba(127,127,127,.35); background: transparent; color: inherit; }
+.hidden { display: none !important; }

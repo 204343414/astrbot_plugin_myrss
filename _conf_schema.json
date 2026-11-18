@@ -1,178 +1,196 @@
 {
-  "push_requires_group_activity": {
-    "description": "是否要求「群里有人说过话」才允许主动推送（活跃检测/休眠机制）。true=保持原行为：Bot 本次启动后没收到过群消息的群视为未就绪，定时任务拉取前直接跳过该目标，等群内有人发言后自动恢复；false=关闭该限制，QQ 官方平台在跑且该群已订阅即可推送，无需等群友发言、Bot 重启后也能照常推送。两种取值都不会跳过主动消息权限：发送被 QQ 明确拒绝「主动消息失败/无权限」时，仍会自动退订当前源。",
-    "type": "bool",
-    "default": true
-  },
-  "title_max_length": {
-    "description": "标题最大长度",
-    "type": "int",
-    "default": 60
-  },
-  "description_max_length": {
-    "description": "描述最大长度",
-    "type": "int",
-    "default": 200
-  },
-  "max_items_per_poll": {
-    "description": "每次轮询最大条目数",
-    "type": "int",
-    "default": 5
-  },
-  "max_subscriptions_per_group": {
-    "description": "每个群最大允许订阅数（0表示不设上限）",
-    "type": "int",
-    "default": 5,
-    "min": 0
-  },
-  "t2i": {
-    "description": "是否使用文字转图片",
-    "type": "bool",
-    "default": false
-  },
-  "is_hide_url": {
-    "description": "是否隐藏链接",
-    "type": "bool",
-    "default": false
-  },
-  "is_read_pic": {
-    "description": "是否读取图片",
-    "type": "bool",
-    "default": true
-  },
-  "is_adjust_pic": {
-    "description": "图片防和谐",
-    "type": "bool",
-    "default": false
-  },
-  "max_pic_item": {
-    "description": "最大图片数(-1不限)",
-    "type": "int",
-    "default": 3
-  },
-  "compose": {
-    "description": "QQ平台合并转发",
-    "type": "bool",
-    "default": true
-  },
-  "enable_comment": {
-    "description": "是否开启AI锐评（推送时bot用人设评论动态内容）",
-    "type": "bool",
-    "default": true
-  },
-  "comment_provider_id": {
-    "description": "锐评用的LLM提供商（留空则用默认）",
-    "type": "string",
-    "default": "",
-    "_special": "select_provider"
-  },
-  "comment_persona": {
-    "description": "锐评用的人格（留空则用默认人格）",
-    "type": "string",
-    "default": "",
-    "_special": "select_persona"
-  },
-  "comment_max_length": {
-    "description": "锐评最大字数",
-    "type": "int",
-    "default": 80
-  },
-  "bot_qq": {
-    "description": "Bot的QQ号（用于显示头像）",
-    "type": "string",
-    "default": ""
-  },
-  "bot_provider_name": {
-    "description": "Bot使用的服务商名称（显示在锐评旁边）",
-    "type": "string",
-    "default": ""
-  },
-  "filter_provider_id": {
-    "description": "内容过滤用的LLM（建议选便宜快速的）",
-    "type": "string",
-    "default": "",
-    "_special": "select_provider"
-  },
-  "image_caption_provider_id": {
-    "description": "融合图片识别用的多模态LLM（留空则依次使用审核模型、锐评/默认模型）",
-    "type": "string",
-    "default": "",
-    "_special": "select_provider"
-  },
-  "push_delay_min": {
-    "description": "推送间隔最小秒数（防风控）",
-    "type": "float",
-    "default": 5.0
-  },
-  "push_delay_max": {
-    "description": "推送间隔最大秒数（防风控）",
-    "type": "float",
-    "default": 8.0
-  },
-  "browserless_url": {
-    "description": "Browserless 截图服务地址（Docker容器名:端口）",
-    "type": "string",
-    "default": "http://browserless:3000"
-  },
-  "seen_links_max_days": {
-    "description": "seen_links 缓存保留天数（防膨胀兜底）。默认365≈关闭此功能，不会干扰月更/年更博主。设为较小值(如7)可自动清理长期不更新的订阅缓存。",
-    "type": "int",
-    "default": 365
-  },
-  "custom_data_dir": {
-    "description": "可选自定义持久化目录。留空时使用 AstrBot 官方 data/plugin_data/astrbot_plugin_myrss；不要填写插件源码目录。Docker 用户须确保 AstrBot data 目录已挂载到宿主机。",
-    "type": "string",
-    "default": ""
-  },
-  "force_reset_without_poll": {
-    "description": "reset 命令是否默认使用强制模式（不依赖拉取最新RSS，直接用当前 latest_link 重置为单条）。推荐开启，解决 poll 失败导致 reset 无效的问题。",
-    "type": "bool",
-    "default": true
-  },
-  "moderation_strike_threshold": {
-    "description": "管理员确认严重违规达到多少次后，禁止该OpenID在当前群新增订阅",
-    "type": "int",
-    "default": 2
-  },
-  "enable_natural_language_subscribe": {
-    "description": "启用自然语言订阅（v1.4.0 新增）。开启后，/myrss + 后面可以跟自然语言（如 '帮我订阅 OpenAI 的推特'），插件会临时起一个 LLM agent run 来识别意图。关闭时仅支持显式 URL / 路由。",
-    "type": "bool",
-    "default": false
-  },
-  "nl_provider_id": {
-    "description": "自然语言订阅用的 LLM 提供商 ID（留空则用当前会话 provider）。建议选便宜快速的模型。",
-    "type": "string",
-    "default": "",
-    "_special": "select_provider"
-  },
-  "nl_enable_websearch": {
-    "description": "自然语言订阅时是否允许 LLM 调联网搜索（AstrBot 内置 websearch tool）。需要 AstrBot WebUI 里配置过 websearch provider 和 key。",
-    "type": "bool",
-    "default": true
-  },
-  "nl_max_steps": {
-    "description": "自然语言订阅时 LLM agent run 最大步数。超过会强制终止。",
-    "type": "int",
-    "default": 8
-  },
-  "nl_confirm_max_steps": {
-    "description": "用户回复 '同意/拒绝' 时 LLM 二次判定的 agent run 最大步数。",
-    "type": "int",
-    "default": 4
-  },
-  "nl_pending_ttl_seconds": {
-    "description": "预览卡片推送后，等待用户引用/回复的秒数。超时静默过期。",
-    "type": "int",
-    "default": 600
-  },
-  "nl_rate_limit_seconds": {
-    "description": "自然语言订阅每群最小调用间隔秒数。",
-    "type": "int",
-    "default": 30
-  },
-  "nl_debug_log": {
-    "description": "调试开关：开启后每次 LLM agent run 的 prompt、tool 调用、final response 都会写到日志（level=info）。实际跑通后可关闭。",
-    "type": "bool",
-    "default": false
-  }
+    "push_requires_group_activity": {
+        "description": "是否要求「群里有人说过话」才允许主动推送（活跃检测/休眠机制）。true=保持原行为：Bot 本次启动后没收到过群消息的群视为未就绪，定时任务拉取前直接跳过该目标，等群内有人发言后自动恢复；false=关闭该限制，QQ 官方平台在跑且该群已订阅即可推送，无需等群友发言、Bot 重启后也能照常推送。两种取值都不会跳过主动消息权限：发送被 QQ 明确拒绝「主动消息失败/无权限」时，仍会自动退订当前源。",
+        "type": "bool",
+        "default": true
+    },
+    "title_max_length": {
+        "description": "标题最大长度",
+        "type": "int",
+        "default": 60
+    },
+    "description_max_length": {
+        "description": "描述最大长度",
+        "type": "int",
+        "default": 200
+    },
+    "max_items_per_poll": {
+        "description": "每次轮询最大条目数",
+        "type": "int",
+        "default": 5
+    },
+    "max_subscriptions_per_group": {
+        "description": "每个群最大允许订阅数（0表示不设上限）",
+        "type": "int",
+        "default": 5,
+        "min": 0
+    },
+    "t2i": {
+        "description": "是否使用文字转图片",
+        "type": "bool",
+        "default": false
+    },
+    "is_hide_url": {
+        "description": "是否隐藏链接",
+        "type": "bool",
+        "default": false
+    },
+    "is_read_pic": {
+        "description": "是否读取图片",
+        "type": "bool",
+        "default": true
+    },
+    "is_adjust_pic": {
+        "description": "图片防和谐",
+        "type": "bool",
+        "default": false
+    },
+    "max_pic_item": {
+        "description": "最大图片数(-1不限)",
+        "type": "int",
+        "default": 3
+    },
+    "compose": {
+        "description": "QQ平台合并转发",
+        "type": "bool",
+        "default": true
+    },
+    "enable_comment": {
+        "description": "是否开启AI锐评（推送时bot用人设评论动态内容）",
+        "type": "bool",
+        "default": true
+    },
+    "comment_provider_id": {
+        "description": "锐评用的LLM提供商（留空则用默认）",
+        "type": "string",
+        "default": "",
+        "_special": "select_provider"
+    },
+    "comment_persona": {
+        "description": "锐评用的人格（留空则用默认人格）",
+        "type": "string",
+        "default": "",
+        "_special": "select_persona"
+    },
+    "comment_max_length": {
+        "description": "锐评最大字数",
+        "type": "int",
+        "default": 80
+    },
+    "bot_qq": {
+        "description": "Bot的QQ号（用于显示头像）",
+        "type": "string",
+        "default": ""
+    },
+    "bot_provider_name": {
+        "description": "Bot使用的服务商名称（显示在锐评旁边）",
+        "type": "string",
+        "default": ""
+    },
+    "filter_provider_id": {
+        "description": "内容过滤用的LLM（建议选便宜快速的）",
+        "type": "string",
+        "default": "",
+        "_special": "select_provider"
+    },
+    "image_caption_provider_id": {
+        "description": "融合图片识别用的多模态LLM（留空则依次使用审核模型、锐评/默认模型）",
+        "type": "string",
+        "default": "",
+        "_special": "select_provider"
+    },
+    "push_delay_min": {
+        "description": "推送间隔最小秒数（防风控）",
+        "type": "float",
+        "default": 5.0
+    },
+    "push_delay_max": {
+        "description": "推送间隔最大秒数（防风控）",
+        "type": "float",
+        "default": 8.0
+    },
+    "browserless_url": {
+        "description": "Browserless 截图服务地址（Docker容器名:端口）",
+        "type": "string",
+        "default": "http://browserless:3000"
+    },
+    "seen_links_max_days": {
+        "description": "seen_links 缓存保留天数（防膨胀兜底）。默认365≈关闭此功能，不会干扰月更/年更博主。设为较小值(如7)可自动清理长期不更新的订阅缓存。",
+        "type": "int",
+        "default": 365
+    },
+    "custom_data_dir": {
+        "description": "可选自定义持久化目录。留空时使用 AstrBot 官方 data/plugin_data/astrbot_plugin_myrss；不要填写插件源码目录。Docker 用户须确保 AstrBot data 目录已挂载到宿主机。",
+        "type": "string",
+        "default": ""
+    },
+    "force_reset_without_poll": {
+        "description": "reset 命令是否默认使用强制模式（不依赖拉取最新RSS，直接用当前 latest_link 重置为单条）。推荐开启，解决 poll 失败导致 reset 无效的问题。",
+        "type": "bool",
+        "default": true
+    },
+    "moderation_strike_threshold": {
+        "description": "管理员确认严重违规达到多少次后，禁止该OpenID在当前群新增订阅",
+        "type": "int",
+        "default": 2
+    },
+    "enable_natural_language_subscribe": {
+        "description": "启用自然语言订阅（v1.4.0 新增）。开启后，/myrss + 后面可以跟自然语言（如 '帮我订阅 OpenAI 的推特'），插件会临时起一个 LLM agent run 来识别意图。关闭时仅支持显式 URL / 路由。",
+        "type": "bool",
+        "default": false
+    },
+    "nl_provider_id": {
+        "description": "自然语言订阅用的 LLM 提供商 ID（留空则用当前会话 provider）。建议选便宜快速的模型。",
+        "type": "string",
+        "default": "",
+        "_special": "select_provider"
+    },
+    "nl_enable_websearch": {
+        "description": "自然语言订阅时是否允许 LLM 调联网搜索（AstrBot 内置 websearch tool）。需要 AstrBot WebUI 里配置过 websearch provider 和 key。",
+        "type": "bool",
+        "default": true
+    },
+    "nl_max_steps": {
+        "description": "自然语言订阅时 LLM agent run 最大步数。超过会强制终止。",
+        "type": "int",
+        "default": 8
+    },
+    "nl_confirm_max_steps": {
+        "description": "用户回复 '同意/拒绝' 时 LLM 二次判定的 agent run 最大步数。",
+        "type": "int",
+        "default": 4
+    },
+    "nl_pending_ttl_seconds": {
+        "description": "预览卡片推送后，等待用户引用/回复的秒数。超时静默过期。",
+        "type": "int",
+        "default": 600
+    },
+    "nl_rate_limit_seconds": {
+        "description": "自然语言订阅每群最小调用间隔秒数。",
+        "type": "int",
+        "default": 30
+    },
+    "nl_debug_log": {
+        "description": "调试开关：开启后每次 LLM agent run 的 prompt、tool 调用、final response 都会写到日志（level=info）。实际跑通后可关闭。",
+        "type": "bool",
+        "default": false
+    },
+    "vault_helper_url": {
+        "description": "凭据维护服务地址",
+        "type": "string",
+        "default": "http://172.18.0.1:18100",
+        "hint": "宿主上 rsshub-vault 的地址；改了端口才需要动"
+    },
+    "vault_autocheck": {
+        "description": "每天自动自检凭据",
+        "type": "bool",
+        "default": true,
+        "hint": "关掉后只保留手动「立即自检」"
+    },
+    "vault_alert_days": {
+        "description": "凭据剩余多少天开始提醒",
+        "type": "int",
+        "default": 14,
+        "hint": "到期前这么多天会私聊提醒管理员"
+    }
 }

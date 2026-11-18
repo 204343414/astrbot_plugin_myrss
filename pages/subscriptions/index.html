@@ -17,11 +17,39 @@
     <section id="banPanel" class="ban-panel hidden"></section>
     <section id="safetyPanel" class="safety-panel hidden"></section>
     <section id="testStatus" class="test-status hidden" aria-live="polite"></section>
+    <!-- ↓↓↓ 凭据维护（rsshub-vault）新增块：加在 testStatus 之后、workspace 之前 ↓↓↓ -->
+    <section id="vaultSection" class="vault-section">
+      <details>
+        <summary>
+          <span>🔐 凭据维护</span>
+          <small id="vaultSummary">点击展开：一键从 Firefox 导入各平台登录态</small>
+        </summary>
+        <div id="vaultBody">
+          <div class="vault-toolbar">
+            <span id="vaultHelper" class="vault-chip">维护服务：检测中…</span>
+            <span id="vaultRsshub" class="vault-chip">rsshub：检测中…</span>
+            <button id="vaultRefresh" type="button">刷新</button>
+            <button id="vaultCheck" type="button">立即自检</button>
+          </div>
+          <p id="vaultNotice" class="vault-notice hidden"></p>
+          <div class="vault-block">
+            <h3>一键导入<span class="vault-hint">（登录态就在本机 Firefox 里，点一下就同步）</span></h3>
+            <div id="vaultListA" class="vault-list"></div>
+          </div>
+          <div class="vault-block">
+            <h3>需要 token 的平台<span class="vault-hint">（按步骤取一次，粘贴保存）</span></h3>
+            <div id="vaultListB" class="vault-list"></div>
+          </div>
+        </div>
+      </details>
+    </section>
+    <!-- ↑↑↑ 新增块结束 ↑↑↑ -->
     <section class="workspace">
       <aside><input id="search" placeholder="筛选群号、平台" /><div id="groups" class="groups"></div></aside>
       <article id="detail"><div class="empty">选择左侧订阅群查看数据</div></article>
     </section>
   </main>
   <script type="module" src="./app.js"></script>
+  <script type="module" src="./vault.js"></script>
 </body>
 </html>
